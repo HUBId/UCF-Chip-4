@@ -371,7 +371,7 @@ pub fn verify_and_commit(
 }
 
 fn key_epoch_payload_digest(req: &PvgsCommitRequest) -> Option<[u8; 32]> {
-    req.payload_digests.get(0).copied()
+    req.payload_digests.first().copied()
 }
 
 fn validate_key_epoch_update(
