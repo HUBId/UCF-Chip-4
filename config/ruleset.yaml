@@ -1,0 +1,3 @@
+# Placeholder ruleset configuration for PVGS/SEP.
+# Populate with validation logic and thresholds when implementing the system.
+validation: {}

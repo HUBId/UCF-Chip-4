@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "wire",
+    "pvgs",
+    "receipts",
+    "vrf",
+    "sep",
+    "cbv",
+    "keys",
+    "query",
+    "app",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+
+[workspace.dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = { version = "0.9" }

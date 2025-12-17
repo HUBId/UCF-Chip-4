@@ -1,0 +1,10 @@
+[package]
+name = "pvgs"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
+wire = { path = "../wire" }

@@ -1,0 +1,16 @@
+[package]
+name = "query"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
+pvgs = { path = "../pvgs" }
+receipts = { path = "../receipts" }
+sep = { path = "../sep" }
+vrf = { path = "../vrf" }
+cbv = { path = "../cbv" }
+keys = { path = "../keys" }
+wire = { path = "../wire" }

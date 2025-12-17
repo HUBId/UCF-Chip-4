@@ -1,0 +1,14 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+pvgs = { path = "../pvgs" }
+receipts = { path = "../receipts" }
+vrf = { path = "../vrf" }
+sep = { path = "../sep" }
+cbv = { path = "../cbv" }
+keys = { path = "../keys" }
+wire = { path = "../wire" }
+query = { path = "../query" }
