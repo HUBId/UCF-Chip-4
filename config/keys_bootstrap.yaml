@@ -1,0 +1,3 @@
+# Placeholder bootstrap keys for VRF and epoch management.
+# Replace with generated keys and rotation policies during implementation.
+keys: []
