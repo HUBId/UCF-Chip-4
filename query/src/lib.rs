@@ -2,10 +2,10 @@
 
 use cbv::CharacterBaselineVector;
 use keys::KeyEpoch;
-use pvgs::{PvgsCommitRequest, PvgsVerificationResult};
-use receipts::{ProofReceipt, PvgsReceipt};
-use sep::SepEvent;
+use pvgs::PvgsCommitRequest;
+use sep::SepEventInternal;
 use thiserror::Error;
+use ucf_protocol::ucf::v1::{PVGSReceipt, ProofReceipt};
 use vrf::{VrfInput, VrfOutput};
 use wire::{AuthContext, Envelope};
 
@@ -23,10 +23,10 @@ pub struct QueryRequest {
 pub struct QueryResult {
     pub auth: Option<AuthContext>,
     pub baseline: Option<CharacterBaselineVector>,
-    pub last_commit: Option<PvgsReceipt>,
+    pub last_commit: Option<PVGSReceipt>,
     pub last_verification: Option<ProofReceipt>,
     pub current_epoch: Option<KeyEpoch>,
-    pub latest_event: Option<SepEvent>,
+    pub latest_event: Option<SepEventInternal>,
     pub recent_vrf: Option<(VrfInput, VrfOutput)>,
 }
 
@@ -35,7 +35,7 @@ pub trait QueryInspector {
     fn prepare_commit(&self, envelope: Envelope) -> Result<PvgsCommitRequest, QueryError>;
     fn summarize_verification(
         &self,
-        verification: PvgsVerificationResult,
+        verification: ProofReceipt,
     ) -> Result<ProofReceipt, QueryError>;
 }
 

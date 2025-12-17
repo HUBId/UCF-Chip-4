@@ -2,12 +2,11 @@
 
 use cbv::CharacterBaselineVector;
 use keys::KeyEpoch;
-use pvgs::{
-    PvgsCommitRequest, PvgsCommitResponse, PvgsVerificationRequest, PvgsVerificationResult,
-};
+use pvgs::{CommitBindings, CommitType, PvgsCommitRequest, RequiredCheck};
 use query::{QueryRequest, QueryResult};
-use receipts::{ProofReceipt, PvgsReceipt};
-use sep::SepEvent;
+use receipts::issue_receipt;
+use sep::{SepEventInternal, SepEventType, SepLog};
+use ucf_protocol::ucf::v1::{Digest32, ProofReceipt, ReceiptStatus};
 use vrf::{VrfInput, VrfOutput};
 use wire::{AuthContext, Envelope};
 
@@ -18,29 +17,28 @@ fn main() {
     };
 
     let commit_request = PvgsCommitRequest {
-        envelope: envelope.clone(),
-        correlation_id: "boot-seed".into(),
+        commit_id: "boot-seed".into(),
+        commit_type: CommitType::ReceiptRequest,
+        bindings: CommitBindings {
+            action_digest: Some([1u8; 32]),
+            decision_digest: Some([2u8; 32]),
+            grant_id: Some("grant".into()),
+            charter_version_digest: "charter".into(),
+            policy_version_digest: "policy".into(),
+            prev_record_digest: [0u8; 32],
+            profile_digest: [0u8; 32],
+            tool_profile_digest: None,
+        },
+        required_checks: vec![RequiredCheck::IntegrityOk],
+        payload_digests: vec![[3u8; 32]],
+        epoch_id: 0,
     };
 
-    let commit_response = PvgsCommitResponse { accepted: true };
-
-    let verification_request = PvgsVerificationRequest {
-        commitment_id: commit_request.correlation_id.clone(),
-    };
-
-    let verification_result = PvgsVerificationResult {
-        verified: true,
-        notes: vec![format!("Processed {}", verification_request.commitment_id)],
-    };
-
-    let pvgs_receipt = PvgsReceipt {
-        request_id: commit_request.correlation_id.clone(),
-        commit: commit_response,
-    };
+    let pvgs_receipt = issue_receipt(&commit_request, ReceiptStatus::Accepted, Vec::new());
 
     let proof_receipt = ProofReceipt {
-        receipt_id: verification_request.commitment_id.clone(),
-        verification: verification_result.clone(),
+        receipt_digest: pvgs_receipt.receipt_digest.clone(),
+        proof_digest: Digest32([0u8; 32]),
     };
 
     let baseline = CharacterBaselineVector {
@@ -52,11 +50,13 @@ fn main() {
         public_key: Vec::new(),
     };
 
-    let sep_event = SepEvent {
-        id: "event-0".into(),
-        kind: "boot".into(),
-        payload: "boot event".into(),
-    };
+    let mut sep_log = SepLog::default();
+    let sep_event: SepEventInternal = sep_log.append_event(
+        "boot-session".into(),
+        SepEventType::EvDecision,
+        pvgs_receipt.receipt_digest.0,
+        Vec::new(),
+    );
 
     let vrf_input = VrfInput {
         message: envelope.payload.clone(),
@@ -80,7 +80,7 @@ fn main() {
     let _query_result = QueryResult {
         auth: Some(auth),
         baseline: Some(baseline),
-        last_commit: Some(pvgs_receipt),
+        last_commit: Some(pvgs_receipt.clone()),
         last_verification: Some(proof_receipt),
         current_epoch: Some(current_epoch),
         latest_event: Some(sep_event),
@@ -88,5 +88,5 @@ fn main() {
     };
 
     println!("boot ok: {}", query_request.subject);
-    println!("next: {:?}", verification_result.notes);
+    println!("next receipt digest: {:?}", pvgs_receipt.receipt_digest.0);
 }

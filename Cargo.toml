@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "wire",
+    "ucf-protocol",
     "pvgs",
     "receipts",
     "vrf",
@@ -19,3 +20,4 @@ edition = "2021"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = { version = "0.9" }
+blake3 = "1"
