@@ -29,6 +29,7 @@ pub mod ucf {
             RecoveryUpdate,
             PevUpdate,
             CbvUpdate,
+            KeyEpochUpdate,
         }
 
         /// Required checks requested by the caller.
@@ -126,6 +127,15 @@ pub mod ucf {
             pub const GE_GRANT_MISSING: &'static str = "RC.GE.GRANT.MISSING";
             pub const TH_INTEGRITY_COMPROMISE: &'static str = "RC.TH.INTEGRITY.COMPROMISE";
             pub const GV_KEY_EPOCH_ROTATED: &'static str = "RC.GV.KEY_EPOCH.ROTATED";
+            pub const GV_KEY_EPOCH_UNKNOWN: &'static str = "RC.GV.KEY_EPOCH.UNKNOWN";
+            pub const GV_KEY_EPOCH_SIGNATURE_INVALID: &'static str =
+                "RC.GV.KEY_EPOCH.SIGNATURE_INVALID";
+            pub const GV_KEY_EPOCH_DUPLICATE: &'static str = "RC.GV.KEY_EPOCH.DUPLICATE";
+            pub const GV_KEY_EPOCH_NON_MONOTONIC: &'static str = "RC.GV.KEY_EPOCH.NON_MONOTONIC";
+            pub const GV_KEY_EPOCH_REQUIRED_CHECK: &'static str =
+                "RC.GV.KEY_EPOCH.REQUIRED_CHECK_MISSING";
+            pub const GV_KEY_EPOCH_PAYLOAD_INVALID: &'static str =
+                "RC.GV.KEY_EPOCH.PAYLOAD_INVALID";
         }
 
         /// Lightweight reference type for future graph links.

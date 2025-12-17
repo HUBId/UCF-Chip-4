@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use cbv::CharacterBaselineVector;
-use pvgs::PvgsCommitRequest;
+use pvgs::{PvgsCommitRequest, PvgsStore};
 use sep::SepEventInternal;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{PVGSKeyEpoch, PVGSReceipt, ProofReceipt};
@@ -43,4 +43,91 @@ pub enum QueryError {
     Lookup(String),
     #[error("construction failed: {0}")]
     Construction(String),
+}
+
+/// Return the latest committed key epoch if present.
+pub fn get_current_key_epoch(store: &PvgsStore) -> Option<PVGSKeyEpoch> {
+    store.key_epoch_history.current().cloned()
+}
+
+/// List all key epochs in insertion order.
+pub fn list_key_epochs(store: &PvgsStore) -> Vec<PVGSKeyEpoch> {
+    store.key_epoch_history.list().to_vec()
+}
+
+/// Retrieve a specific key epoch by id.
+pub fn get_key_epoch(store: &PvgsStore, epoch_id: u64) -> Option<PVGSKeyEpoch> {
+    store
+        .key_epoch_history
+        .list()
+        .iter()
+        .find(|epoch| epoch.key_epoch_id == epoch_id)
+        .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keys::KeyStore;
+    use std::collections::HashSet;
+    use vrf::VrfEngine;
+
+    fn store_with_epochs() -> (PvgsStore, PVGSKeyEpoch, PVGSKeyEpoch) {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+        let mut known_profiles = HashSet::new();
+        known_profiles.insert([1u8; 32]);
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            known_charter_versions,
+            known_policy_versions,
+            known_profiles,
+        );
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let first =
+            keystore.make_key_epoch_proto(1, 10, vrf_engine.vrf_public_key().to_vec(), None);
+        let second = keystore.make_key_epoch_proto(
+            2,
+            20,
+            vrf_engine.vrf_public_key().to_vec(),
+            Some(first.announcement_digest.0),
+        );
+
+        store.key_epoch_history.push(first.clone()).unwrap();
+        store.key_epoch_history.push(second.clone()).unwrap();
+        store
+            .committed_payload_digests
+            .insert(first.announcement_digest.0);
+        store
+            .committed_payload_digests
+            .insert(second.announcement_digest.0);
+
+        (store, first, second)
+    }
+
+    #[test]
+    fn queries_return_clones() {
+        let (store, first, second) = store_with_epochs();
+        let current = get_current_key_epoch(&store).expect("missing current");
+        assert_eq!(current.key_epoch_id, second.key_epoch_id);
+
+        let listed = list_key_epochs(&store);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].announcement_digest, first.announcement_digest);
+
+        let fetched = get_key_epoch(&store, first.key_epoch_id).expect("missing epoch one");
+        assert_eq!(fetched.announcement_digest, first.announcement_digest);
+
+        let mut mutated = fetched;
+        mutated.attestation_key_id.push_str("-mut");
+        assert_ne!(
+            mutated.attestation_key_id,
+            store.key_epoch_history.list()[0].attestation_key_id
+        );
+    }
 }

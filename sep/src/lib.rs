@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub enum SepEventType {
     EvDecision,
     EvRecoveryGov,
+    EvKeyEpoch,
 }
 
 impl SepEventType {
@@ -19,6 +20,7 @@ impl SepEventType {
         match self {
             SepEventType::EvDecision => "EV_DECISION",
             SepEventType::EvRecoveryGov => "EV_RECOVERY_GOV",
+            SepEventType::EvKeyEpoch => "EV_KEY_EPOCH",
         }
     }
 }
