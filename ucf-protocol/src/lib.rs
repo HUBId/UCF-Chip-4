@@ -52,7 +52,7 @@ pub mod ucf {
             pub charter_version_digest: String,
             pub policy_version_digest: String,
             pub prev_record_digest: Digest32,
-            pub profile_digest: Digest32,
+            pub profile_digest: Option<Digest32>,
             pub tool_profile_digest: Option<Digest32>,
         }
 

@@ -33,7 +33,7 @@ pub fn compute_receipt_digest(
     hasher.update(req.bindings.charter_version_digest.as_bytes());
     hasher.update(req.bindings.policy_version_digest.as_bytes());
     hasher.update(&req.bindings.prev_record_digest.0);
-    hasher.update(&req.bindings.profile_digest.0);
+    update_optional_digest_hasher(&mut hasher, &req.bindings.profile_digest);
     update_optional_digest_hasher(&mut hasher, &req.bindings.tool_profile_digest);
 
     for check in &req.required_checks {
@@ -188,7 +188,10 @@ fn pvgs_attestation_preimage(receipt: &PVGSReceipt) -> Vec<u8> {
     preimage.extend_from_slice(receipt.bindings.charter_version_digest.as_bytes());
     preimage.extend_from_slice(receipt.bindings.policy_version_digest.as_bytes());
     preimage.extend_from_slice(&receipt.bindings.prev_record_digest.0);
-    preimage.extend_from_slice(&receipt.bindings.profile_digest.0);
+    update_optional_digest(
+        &mut preimage,
+        &receipt.bindings.profile_digest.as_ref().map(|d| d.0),
+    );
     update_optional_digest(
         &mut preimage,
         &receipt.bindings.tool_profile_digest.as_ref().map(|d| d.0),
@@ -333,7 +336,7 @@ mod tests {
                 charter_version_digest: "charter".to_string(),
                 policy_version_digest: "policy".to_string(),
                 prev_record_digest: Digest32([3u8; 32]),
-                profile_digest: Digest32([4u8; 32]),
+                profile_digest: Some(Digest32([4u8; 32])),
                 tool_profile_digest: None,
             },
             required_checks: vec![RequiredCheck::SchemaOk],

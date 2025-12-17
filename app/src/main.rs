@@ -24,9 +24,10 @@ fn main() {
             charter_version_digest: "charter".into(),
             policy_version_digest: "policy".into(),
             prev_record_digest: [0u8; 32],
-            profile_digest: [0u8; 32],
+            profile_digest: Some([0u8; 32]),
             tool_profile_digest: None,
         },
+        required_receipt_kind: pvgs::RequiredReceiptKind::Read,
         required_checks: vec![RequiredCheck::IntegrityOk],
         payload_digests: vec![[3u8; 32]],
         epoch_id: 0,
@@ -57,7 +58,10 @@ fn main() {
         &keystore,
     );
 
-    let verified_fields_digest = compute_verified_fields_digest(&commit_request.bindings);
+    let verified_fields_digest = compute_verified_fields_digest(
+        &commit_request.bindings,
+        commit_request.required_receipt_kind,
+    );
     let record_digest = pvgs::compute_record_digest(
         verified_fields_digest,
         commit_request.bindings.prev_record_digest,
@@ -67,7 +71,7 @@ fn main() {
         commit_request.bindings.prev_record_digest,
         record_digest,
         &commit_request.bindings.charter_version_digest,
-        commit_request.bindings.profile_digest,
+        commit_request.bindings.profile_digest.unwrap_or([0u8; 32]),
         commit_request.epoch_id,
     );
 
