@@ -124,9 +124,11 @@ mod tests {
 
     #[test]
     fn integrity_failure_wins() {
-        let mut rsv = RsvState::default();
-        rsv.integrity = IntegrityState::Fail;
-        rsv.receipt_failures = LevelClass::High;
+        let rsv = RsvState {
+            integrity: IntegrityState::Fail,
+            receipt_failures: LevelClass::High,
+            ..Default::default()
+        };
 
         let control = decide(&rsv, 1);
 
