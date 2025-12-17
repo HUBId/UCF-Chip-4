@@ -29,23 +29,12 @@ impl Profile {
 
 /// Overlay toggles applied to outbound control frames.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Overlays {
     pub export_lock: bool,
     pub novelty_lock: bool,
     pub simulate_first: bool,
     pub deescalation_lock: bool,
-}
-
-impl Default for Overlays {
-    fn default() -> Self {
-        Self {
-            export_lock: false,
-            novelty_lock: false,
-            simulate_first: false,
-            deescalation_lock: false,
-        }
-    }
 }
 
 /// Control frame emitted by the decision engine.
