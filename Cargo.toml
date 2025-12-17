@@ -10,6 +10,9 @@ members = [
     "keys",
     "query",
     "app",
+    "rsv",
+    "profiles",
+    "engine",
 ]
 resolver = "2"
 

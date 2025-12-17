@@ -1,0 +1,9 @@
+[package]
+name = "profiles"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+engine = { path = "../engine" }
+rsv = { path = "../rsv" }
+ucf-protocol = { path = "../ucf-protocol" }

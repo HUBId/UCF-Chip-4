@@ -106,6 +106,7 @@ pub mod ucf {
             pub const PB_DENY_CHARTER_SCOPE: &'static str = "RC.PB.DENY.CHARTER_SCOPE";
             pub const PB_DENY_INTEGRITY_REQUIRED: &'static str = "RC.PB.DENY.INTEGRITY_REQUIRED";
             pub const GE_GRANT_MISSING: &'static str = "RC.GE.GRANT.MISSING";
+            pub const TH_INTEGRITY_COMPROMISE: &'static str = "RC.TH.INTEGRITY.COMPROMISE";
         }
 
         /// Lightweight reference type for future graph links.
@@ -113,6 +114,30 @@ pub mod ucf {
         #[derive(Clone, Debug, PartialEq, Eq)]
         pub struct Ref {
             pub id: String,
+        }
+
+        /// Integrity classifications for RSV state.
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum IntegrityState {
+            Pass,
+            Fail,
+        }
+
+        /// Rolling receipt statistics reported by the client.
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct ReceiptStats {
+            pub receipt_missing_count: u32,
+            pub receipt_invalid_count: u32,
+        }
+
+        /// A signal frame emitted by the client with optional receipt stats.
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct SignalFrame {
+            pub integrity: IntegrityState,
+            pub receipt_stats: Option<ReceiptStats>,
         }
     }
 }
