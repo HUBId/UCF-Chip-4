@@ -12,6 +12,7 @@ pub struct KeyEpoch {
     pub epoch_id: u64,
     pub key_id: String,
     pub public_key: [u8; 32],
+    pub vrf_public_key: Option<Vec<u8>>,
 }
 
 /// In-memory keystore tracking the current signing key and historical epochs.
@@ -67,6 +68,7 @@ impl KeyStore {
             epoch_id: self.current_epoch,
             key_id: self.current_key_id.clone(),
             public_key: current_public,
+            vrf_public_key: None,
         };
         self.epochs.push(archived);
 
@@ -82,6 +84,7 @@ impl KeyStore {
             epoch_id: new_epoch_id,
             key_id: current_key_id,
             public_key: self.secret_key.verifying_key().to_bytes(),
+            vrf_public_key: None,
         }
     }
 

@@ -7,3 +7,7 @@ edition.workspace = true
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
+blake3.workspace = true
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+sha2 = "0.10"
