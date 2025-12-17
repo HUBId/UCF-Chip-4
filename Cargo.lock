@@ -186,6 +186,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "ucf-protocol",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -283,6 +292,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "profiles"
+version = "0.1.0"
+dependencies = [
+ "engine",
+ "rsv",
+ "ucf-protocol",
+]
+
+[[package]]
 name = "pvgs"
 version = "0.1.0"
 dependencies = [
@@ -339,6 +357,14 @@ dependencies = [
  "keys",
  "serde",
  "serde_yaml",
+ "ucf-protocol",
+]
+
+[[package]]
+name = "rsv"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "ucf-protocol",
 ]
 
