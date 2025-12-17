@@ -48,8 +48,20 @@ pub struct CommitBindings {
     pub charter_version_digest: String,
     pub policy_version_digest: String,
     pub prev_record_digest: [u8; 32],
-    pub profile_digest: [u8; 32],
+    pub profile_digest: Option<[u8; 32]>,
     pub tool_profile_digest: Option<[u8; 32]>,
+}
+
+/// Receipt kinds indicating the action class required by the caller.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequiredReceiptKind {
+    Read,
+    Transform,
+    Write,
+    Execute,
+    Export,
+    Persist,
 }
 
 /// A PVGS commit request encompassing bindings and payload digests.
@@ -59,6 +71,7 @@ pub struct PvgsCommitRequest {
     pub commit_id: String,
     pub commit_type: CommitType,
     pub bindings: CommitBindings,
+    pub required_receipt_kind: RequiredReceiptKind,
     pub required_checks: Vec<RequiredCheck>,
     pub payload_digests: Vec<[u8; 32]>,
     pub epoch_id: u64,
@@ -106,7 +119,10 @@ pub fn compute_ruleset_digest(charter_digest: &[u8], policy_digest: &[u8]) -> [u
 }
 
 /// Compute the digest of fields verified during PVGS evaluation.
-pub fn compute_verified_fields_digest(bindings: &CommitBindings) -> [u8; 32] {
+pub fn compute_verified_fields_digest(
+    bindings: &CommitBindings,
+    required_receipt_kind: RequiredReceiptKind,
+) -> [u8; 32] {
     let mut hasher = Hasher::new();
     hasher.update(b"UCF:PVGS:VERIFIED_FIELDS");
 
@@ -116,8 +132,9 @@ pub fn compute_verified_fields_digest(bindings: &CommitBindings) -> [u8; 32] {
     hasher.update(bindings.charter_version_digest.as_bytes());
     hasher.update(bindings.policy_version_digest.as_bytes());
     hasher.update(&bindings.prev_record_digest);
-    hasher.update(&bindings.profile_digest);
+    update_optional_digest(&mut hasher, &bindings.profile_digest);
     update_optional_digest(&mut hasher, &bindings.tool_profile_digest);
+    hasher.update(required_receipt_kind_label(&required_receipt_kind).as_bytes());
 
     *hasher.finalize().as_bytes()
 }
@@ -276,6 +293,36 @@ pub fn verify_and_commit(
         );
     }
 
+    if req.commit_type == CommitType::ReceiptRequest
+        && matches!(
+            req.required_receipt_kind,
+            RequiredReceiptKind::Write
+                | RequiredReceiptKind::Execute
+                | RequiredReceiptKind::Export
+                | RequiredReceiptKind::Persist
+        )
+    {
+        if req.bindings.tool_profile_digest.is_none() {
+            reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+        }
+
+        if req.bindings.profile_digest.is_none() {
+            reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+        }
+
+        if !reject_reason_codes.is_empty() {
+            return finalize_receipt(
+                &req,
+                &receipt_input,
+                ReceiptStatus::Rejected,
+                reject_reason_codes,
+                store,
+                keystore,
+                key_epoch_event_digest,
+            );
+        }
+    }
+
     let mut key_epoch_context: Option<(PVGSKeyEpoch, [u8; 32])> = None;
 
     if req.commit_type == CommitType::KeyEpochUpdate {
@@ -307,7 +354,8 @@ pub fn verify_and_commit(
                 ),
             ),
             _ => {
-                let verified_fields_digest = compute_verified_fields_digest(&req.bindings);
+                let verified_fields_digest =
+                    compute_verified_fields_digest(&req.bindings, req.required_receipt_kind);
                 (
                     verified_fields_digest,
                     compute_record_digest(
@@ -330,7 +378,7 @@ pub fn verify_and_commit(
         req.bindings.prev_record_digest,
         record_digest,
         &req.bindings.charter_version_digest,
-        req.bindings.profile_digest,
+        req.bindings.profile_digest.unwrap_or([0u8; 32]),
         req.epoch_id,
     );
 
@@ -495,6 +543,17 @@ fn update_optional_string(hasher: &mut Hasher, value: &Option<String>) {
     }
 }
 
+fn required_receipt_kind_label(kind: &RequiredReceiptKind) -> &'static str {
+    match kind {
+        RequiredReceiptKind::Read => "READ",
+        RequiredReceiptKind::Transform => "TRANSFORM",
+        RequiredReceiptKind::Write => "WRITE",
+        RequiredReceiptKind::Execute => "EXECUTE",
+        RequiredReceiptKind::Export => "EXPORT",
+        RequiredReceiptKind::Persist => "PERSIST",
+    }
+}
+
 impl From<CommitType> for protocol::CommitType {
     fn from(value: CommitType) -> Self {
         match value {
@@ -531,7 +590,7 @@ impl From<&CommitBindings> for protocol::CommitBindings {
             charter_version_digest: value.charter_version_digest.clone(),
             policy_version_digest: value.policy_version_digest.clone(),
             prev_record_digest: Digest32(value.prev_record_digest),
-            profile_digest: Digest32(value.profile_digest),
+            profile_digest: value.profile_digest.map(Digest32),
             tool_profile_digest: value.tool_profile_digest.map(Digest32),
         }
     }
@@ -541,6 +600,7 @@ impl From<&CommitBindings> for protocol::CommitBindings {
 mod tests {
     use super::*;
     use protocol::ReasonCodes;
+    use receipts::verify_pvgs_receipt_attestation;
     use vrf::VrfEngine;
 
     fn base_store(prev_digest: [u8; 32]) -> PvgsStore {
@@ -570,9 +630,10 @@ mod tests {
                 charter_version_digest: "charter".to_string(),
                 policy_version_digest: "policy".to_string(),
                 prev_record_digest: prev,
-                profile_digest: [9u8; 32],
+                profile_digest: Some([9u8; 32]),
                 tool_profile_digest: Some([3u8; 32]),
             },
+            required_receipt_kind: RequiredReceiptKind::Read,
             required_checks: vec![RequiredCheck::BindingOk],
             payload_digests: vec![[4u8; 32]],
             epoch_id: 1,
@@ -606,9 +667,10 @@ mod tests {
                     charter_version_digest: "charter".to_string(),
                     policy_version_digest: "policy".to_string(),
                     prev_record_digest: store.current_head_record_digest,
-                    profile_digest: [9u8; 32],
+                    profile_digest: Some([9u8; 32]),
                     tool_profile_digest: None,
                 },
+                required_receipt_kind: RequiredReceiptKind::Read,
                 required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
                 payload_digests: vec![epoch.announcement_digest.0],
                 epoch_id: keystore.current_epoch(),
@@ -632,6 +694,103 @@ mod tests {
         let proof = proof.expect("proof receipt missing");
         assert_ne!(proof.vrf_digest, Digest32::zero());
         assert_eq!(store.sep_log.events.len(), 1);
+    }
+
+    #[test]
+    fn side_effect_requires_tool_profile_digest() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let mut req = make_request(prev);
+        req.required_receipt_kind = RequiredReceiptKind::Export;
+        req.bindings.tool_profile_digest = None;
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert_eq!(
+            receipt.reject_reason_codes,
+            vec![ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string()]
+        );
+        assert!(proof.is_none());
+    }
+
+    #[test]
+    fn side_effect_requires_profile_digest() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let mut req = make_request(prev);
+        req.required_receipt_kind = RequiredReceiptKind::Write;
+        req.bindings.profile_digest = None;
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert_eq!(
+            receipt.reject_reason_codes,
+            vec![ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string()]
+        );
+        assert!(proof.is_none());
+    }
+
+    #[test]
+    fn side_effect_accepts_when_all_digests_present() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let mut req = make_request(prev);
+        req.required_receipt_kind = RequiredReceiptKind::Export;
+        req.bindings.tool_profile_digest = Some([5u8; 32]);
+        req.bindings.profile_digest = Some([6u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let (receipt, proof) = verify_and_commit(req.clone(), &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(receipt.reject_reason_codes.is_empty());
+        assert_eq!(
+            receipt.bindings.profile_digest,
+            req.bindings.profile_digest.map(Digest32)
+        );
+        assert_eq!(
+            receipt.bindings.tool_profile_digest,
+            req.bindings.tool_profile_digest.map(Digest32)
+        );
+        let pubkey = keystore
+            .public_key_for_epoch(keystore.current_epoch())
+            .unwrap();
+        assert!(verify_pvgs_receipt_attestation(&receipt, pubkey));
+
+        let proof = proof.expect("missing proof receipt");
+        assert_ne!(proof.vrf_digest, Digest32::zero());
+        let expected_verified_fields =
+            compute_verified_fields_digest(&req.bindings, req.required_receipt_kind);
+        assert_eq!(
+            proof.verified_fields_digest,
+            Digest32(expected_verified_fields)
+        );
+    }
+
+    #[test]
+    fn receipts_remain_deterministic_with_new_bindings() {
+        let prev = [8u8; 32];
+        let mut req = make_request(prev);
+        req.required_receipt_kind = RequiredReceiptKind::Export;
+        let keystore = KeyStore::new_dev_keystore(1);
+
+        let mut store_one = base_store(prev);
+        let vrf_one = VrfEngine::new_dev(1);
+        let (receipt_one, _) = verify_and_commit(req.clone(), &mut store_one, &keystore, &vrf_one);
+
+        let mut store_two = base_store(prev);
+        let vrf_two = VrfEngine::new_dev(1);
+        let (receipt_two, _) = verify_and_commit(req, &mut store_two, &keystore, &vrf_two);
+
+        assert_eq!(receipt_one.receipt_digest, receipt_two.receipt_digest);
+        assert_eq!(
+            receipt_one.pvgs_attestation_sig,
+            receipt_two.pvgs_attestation_sig
+        );
     }
 
     #[test]
@@ -746,9 +905,10 @@ mod tests {
                 charter_version_digest: "charter".to_string(),
                 policy_version_digest: "policy".to_string(),
                 prev_record_digest: store.current_head_record_digest,
-                profile_digest: [9u8; 32],
+                profile_digest: Some([9u8; 32]),
                 tool_profile_digest: None,
             },
+            required_receipt_kind: RequiredReceiptKind::Read,
             required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
             payload_digests: vec![backward_epoch.announcement_digest.0],
             epoch_id: keystore.current_epoch(),
@@ -802,9 +962,10 @@ mod tests {
                 charter_version_digest: "charter".to_string(),
                 policy_version_digest: "policy".to_string(),
                 prev_record_digest: store.current_head_record_digest,
-                profile_digest: [9u8; 32],
+                profile_digest: Some([9u8; 32]),
                 tool_profile_digest: None,
             },
+            required_receipt_kind: RequiredReceiptKind::Read,
             required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
             payload_digests: vec![epoch.announcement_digest.0],
             epoch_id: keystore.current_epoch(),
