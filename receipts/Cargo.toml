@@ -6,5 +6,7 @@ edition.workspace = true
 [dependencies]
 serde = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
-pvgs = { path = "../pvgs" }
 ucf-protocol = { path = "../ucf-protocol" }
+keys = { path = "../keys" }
+blake3.workspace = true
+ed25519-dalek.workspace = true

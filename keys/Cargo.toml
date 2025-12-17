@@ -7,3 +7,5 @@ edition.workspace = true
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand_core = { workspace = true, features = ["getrandom"] }

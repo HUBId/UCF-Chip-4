@@ -1,12 +1,15 @@
 #![forbid(unsafe_code)]
 
 use cbv::CharacterBaselineVector;
-use keys::KeyEpoch;
-use pvgs::{CommitBindings, CommitType, PvgsCommitRequest, RequiredCheck};
+use keys::{KeyEpoch, KeyStore};
+use pvgs::{
+    compute_ruleset_digest, compute_verified_fields_digest, CommitBindings, CommitType,
+    PvgsCommitRequest, RequiredCheck,
+};
 use query::{QueryRequest, QueryResult};
-use receipts::issue_receipt;
+use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
 use sep::{SepEventInternal, SepEventType, SepLog};
-use ucf_protocol::ucf::v1::{Digest32, ProofReceipt, ReceiptStatus};
+use ucf_protocol::ucf::v1::ReceiptStatus;
 use vrf::{VrfInput, VrfOutput};
 use wire::{AuthContext, Envelope};
 
@@ -34,20 +37,46 @@ fn main() {
         epoch_id: 0,
     };
 
-    let pvgs_receipt = issue_receipt(&commit_request, ReceiptStatus::Accepted, Vec::new());
-
-    let proof_receipt = ProofReceipt {
-        receipt_digest: pvgs_receipt.receipt_digest.clone(),
-        proof_digest: Digest32([0u8; 32]),
+    let keystore = KeyStore::new_dev_keystore(0);
+    let receipt_input = ReceiptInput {
+        commit_id: commit_request.commit_id.clone(),
+        commit_type: commit_request.commit_type.into(),
+        bindings: (&commit_request.bindings).into(),
+        required_checks: commit_request
+            .required_checks
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect(),
+        payload_digests: commit_request.payload_digests.clone(),
+        epoch_id: commit_request.epoch_id,
     };
+
+    let pvgs_receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        Vec::new(),
+        &keystore,
+    );
+
+    let proof_receipt = issue_proof_receipt(
+        compute_ruleset_digest(
+            commit_request.bindings.charter_version_digest.as_bytes(),
+            commit_request.bindings.policy_version_digest.as_bytes(),
+        ),
+        compute_verified_fields_digest(&commit_request.bindings),
+        [0u8; 32],
+        &keystore,
+    );
 
     let baseline = CharacterBaselineVector {
         dimensions: vec!["baseline".into()],
     };
 
     let current_epoch = KeyEpoch {
-        epoch: 0,
-        public_key: Vec::new(),
+        epoch_id: keystore.current_epoch(),
+        key_id: keystore.current_key_id().to_string(),
+        public_key: keystore.verifying_key().to_bytes(),
     };
 
     let mut sep_log = SepLog::default();
@@ -60,12 +89,12 @@ fn main() {
 
     let vrf_input = VrfInput {
         message: envelope.payload.clone(),
-        epoch: current_epoch.epoch,
+        epoch: current_epoch.epoch_id,
     };
 
     let vrf_output = VrfOutput {
         proof: Vec::new(),
-        public: current_epoch.public_key.clone(),
+        public: current_epoch.public_key.to_vec(),
     };
 
     let auth = AuthContext {
