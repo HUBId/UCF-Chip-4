@@ -245,6 +245,7 @@ fn commit_type_label(commit_type: &protocol::CommitType) -> &'static str {
         protocol::CommitType::RecoveryUpdate => "RecoveryUpdate",
         protocol::CommitType::PevUpdate => "PevUpdate",
         protocol::CommitType::CbvUpdate => "CbvUpdate",
+        protocol::CommitType::KeyEpochUpdate => "KeyEpochUpdate",
     }
 }
 

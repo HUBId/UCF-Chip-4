@@ -30,6 +30,7 @@ fn main() {
         required_checks: vec![RequiredCheck::IntegrityOk],
         payload_digests: vec![[3u8; 32]],
         epoch_id: 0,
+        key_epoch: None,
     };
 
     let keystore = KeyStore::new_dev_keystore(0);
