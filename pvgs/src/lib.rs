@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hasher;
+use keys::KeyStore;
+use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
 use sep::{SepEventType, SepLog};
 use std::collections::HashSet;
-use ucf_protocol::ucf::v1::{self as protocol, Digest32, PVGSReceipt, ReceiptStatus};
+use ucf_protocol::ucf::v1::{self as protocol, Digest32, PVGSReceipt, ProofReceipt, ReceiptStatus};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -65,7 +67,6 @@ pub struct PvgsStore {
     pub known_charter_versions: HashSet<String>,
     pub known_policy_versions: HashSet<String>,
     pub known_profiles: HashSet<[u8; 32]>,
-    pub epoch_id_current: u64,
     pub sep_log: SepLog,
 }
 
@@ -75,70 +76,97 @@ impl PvgsStore {
         known_charter_versions: HashSet<String>,
         known_policy_versions: HashSet<String>,
         known_profiles: HashSet<[u8; 32]>,
-        epoch_id_current: u64,
     ) -> Self {
         Self {
             current_head_record_digest,
             known_charter_versions,
             known_policy_versions,
             known_profiles,
-            epoch_id_current,
             sep_log: SepLog::default(),
         }
     }
 }
 
-/// Compute the receipt digest for a given request, status, and reason codes.
-pub fn compute_receipt_digest(
-    req: &PvgsCommitRequest,
-    status: ReceiptStatus,
-    reject_reason_codes: &[String],
-) -> [u8; 32] {
+/// Compute a digest over the ruleset inputs (charter + policy).
+pub fn compute_ruleset_digest(charter_digest: &[u8], policy_digest: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new();
-    hasher.update(b"UCF:PVGS:RECEIPT");
-    hasher.update(req.commit_id.as_bytes());
-    hasher.update(commit_type_label(req.commit_type).as_bytes());
+    hasher.update(b"UCF:HASH:RULESET");
+    hasher.update(charter_digest);
+    hasher.update(policy_digest);
+    *hasher.finalize().as_bytes()
+}
 
-    // Bindings in fixed order.
-    update_optional_digest(&mut hasher, &req.bindings.action_digest);
-    update_optional_digest(&mut hasher, &req.bindings.decision_digest);
-    update_optional_string(&mut hasher, &req.bindings.grant_id);
-    hasher.update(req.bindings.charter_version_digest.as_bytes());
-    hasher.update(req.bindings.policy_version_digest.as_bytes());
-    hasher.update(&req.bindings.prev_record_digest);
-    hasher.update(&req.bindings.profile_digest);
-    update_optional_digest(&mut hasher, &req.bindings.tool_profile_digest);
+/// Compute the digest of fields verified during PVGS evaluation.
+pub fn compute_verified_fields_digest(bindings: &CommitBindings) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(b"UCF:PVGS:VERIFIED_FIELDS");
 
-    // Required checks and payloads.
-    for check in &req.required_checks {
-        hasher.update(required_check_label(*check).as_bytes());
-    }
-
-    for digest in &req.payload_digests {
-        hasher.update(digest);
-    }
-
-    hasher.update(status_label(status).as_bytes());
-    for rc in reject_reason_codes {
-        hasher.update(rc.as_bytes());
-    }
-    hasher.update(&req.epoch_id.to_le_bytes());
+    update_optional_digest(&mut hasher, &bindings.action_digest);
+    update_optional_digest(&mut hasher, &bindings.decision_digest);
+    update_optional_string(&mut hasher, &bindings.grant_id);
+    hasher.update(bindings.charter_version_digest.as_bytes());
+    hasher.update(bindings.policy_version_digest.as_bytes());
+    hasher.update(&bindings.prev_record_digest);
+    hasher.update(&bindings.profile_digest);
+    update_optional_digest(&mut hasher, &bindings.tool_profile_digest);
 
     *hasher.finalize().as_bytes()
 }
 
-/// Verify a commit request and emit a PVGS receipt.
-pub fn verify_and_commit(req: PvgsCommitRequest, store: &mut PvgsStore) -> PVGSReceipt {
+fn event_type_for_commit(commit_type: CommitType) -> SepEventType {
+    match commit_type {
+        CommitType::ReceiptRequest => SepEventType::EvDecision,
+        _ => SepEventType::EvRecoveryGov,
+    }
+}
+
+fn to_receipt_input(req: &PvgsCommitRequest) -> ReceiptInput {
+    ReceiptInput {
+        commit_id: req.commit_id.clone(),
+        commit_type: req.commit_type.into(),
+        bindings: (&req.bindings).into(),
+        required_checks: req
+            .required_checks
+            .iter()
+            .copied()
+            .map(Into::into)
+            .collect(),
+        payload_digests: req.payload_digests.clone(),
+        epoch_id: req.epoch_id,
+    }
+}
+
+/// Verify a commit request and emit attested receipts.
+pub fn verify_and_commit(
+    req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let receipt_input = to_receipt_input(&req);
     let mut reject_reason_codes = Vec::new();
 
-    if req.epoch_id != store.epoch_id_current {
+    if req.epoch_id != keystore.current_epoch() {
         reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
-        return make_receipt(req, ReceiptStatus::Rejected, reject_reason_codes);
+        return finalize_receipt(
+            &req,
+            &receipt_input,
+            ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+        );
     }
 
     if req.bindings.prev_record_digest != store.current_head_record_digest {
         reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
-        return make_receipt(req, ReceiptStatus::Rejected, reject_reason_codes);
+        return finalize_receipt(
+            &req,
+            &receipt_input,
+            ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+        );
     }
 
     if !store
@@ -146,7 +174,14 @@ pub fn verify_and_commit(req: PvgsCommitRequest, store: &mut PvgsStore) -> PVGSR
         .contains(&req.bindings.charter_version_digest)
     {
         reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_CHARTER_SCOPE.to_string());
-        return make_receipt(req, ReceiptStatus::Rejected, reject_reason_codes);
+        return finalize_receipt(
+            &req,
+            &receipt_input,
+            ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+        );
     }
 
     if !store
@@ -154,7 +189,14 @@ pub fn verify_and_commit(req: PvgsCommitRequest, store: &mut PvgsStore) -> PVGSR
         .contains(&req.bindings.policy_version_digest)
     {
         reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_INTEGRITY_REQUIRED.to_string());
-        return make_receipt(req, ReceiptStatus::Rejected, reject_reason_codes);
+        return finalize_receipt(
+            &req,
+            &receipt_input,
+            ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+        );
     }
 
     if req.commit_type == CommitType::ReceiptRequest
@@ -163,28 +205,56 @@ pub fn verify_and_commit(req: PvgsCommitRequest, store: &mut PvgsStore) -> PVGSR
             || req.bindings.grant_id.is_none())
     {
         reject_reason_codes.push(protocol::ReasonCodes::GE_GRANT_MISSING.to_string());
-        return make_receipt(req, ReceiptStatus::Rejected, reject_reason_codes);
+        return finalize_receipt(
+            &req,
+            &receipt_input,
+            ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+        );
     }
 
-    let receipt = make_receipt(req.clone(), ReceiptStatus::Accepted, reject_reason_codes);
-    let event_type = match req.commit_type {
-        CommitType::ReceiptRequest => SepEventType::EvDecision,
-        _ => SepEventType::EvRecoveryGov,
-    };
+    let receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        reject_reason_codes.clone(),
+        keystore,
+    );
+
+    let vrf_digest_placeholder = [0u8; 32];
+
+    let mut proof_receipt = issue_proof_receipt(
+        compute_ruleset_digest(
+            req.bindings.charter_version_digest.as_bytes(),
+            req.bindings.policy_version_digest.as_bytes(),
+        ),
+        compute_verified_fields_digest(&req.bindings),
+        vrf_digest_placeholder,
+        keystore,
+    );
+    proof_receipt.receipt_digest = receipt.receipt_digest.clone();
+
+    let event_type = event_type_for_commit(req.commit_type);
+
     store.sep_log.append_event(
         req.commit_id.clone(),
         event_type,
         receipt.receipt_digest.0,
-        Vec::new(),
+        receipt.reject_reason_codes.clone(),
     );
-    receipt
+
+    (receipt, Some(proof_receipt))
 }
 
-fn make_receipt(
-    req: PvgsCommitRequest,
+fn finalize_receipt(
+    req: &PvgsCommitRequest,
+    receipt_input: &ReceiptInput,
     status: ReceiptStatus,
     mut reject_reason_codes: Vec<String>,
-) -> PVGSReceipt {
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
     if matches!(status, ReceiptStatus::Rejected) && reject_reason_codes.is_empty() {
         reject_reason_codes.push(protocol::ReasonCodes::GE_GRANT_MISSING.to_string());
     }
@@ -193,48 +263,17 @@ fn make_receipt(
         reject_reason_codes.clear();
     }
 
-    let digest = compute_receipt_digest(&req, status, &reject_reason_codes);
+    let receipt = issue_receipt(receipt_input, status, reject_reason_codes, keystore);
+    let event_type = event_type_for_commit(req.commit_type);
 
-    PVGSReceipt {
-        commit_id: req.commit_id,
-        commit_type: req.commit_type.into(),
-        bindings: (&req.bindings).into(),
-        required_checks: req.required_checks.into_iter().map(Into::into).collect(),
-        payload_digests: req.payload_digests.into_iter().map(Digest32).collect(),
-        epoch_id: req.epoch_id,
-        status,
-        reject_reason_codes,
-        receipt_digest: Digest32(digest),
-    }
-}
+    store.sep_log.append_event(
+        req.commit_id.clone(),
+        event_type,
+        receipt.receipt_digest.0,
+        receipt.reject_reason_codes.clone(),
+    );
 
-fn commit_type_label(commit_type: CommitType) -> &'static str {
-    match commit_type {
-        CommitType::ReceiptRequest => "ReceiptRequest",
-        CommitType::RecordAppend => "RecordAppend",
-        CommitType::MilestoneAppend => "MilestoneAppend",
-        CommitType::CharterUpdate => "CharterUpdate",
-        CommitType::ToolRegistryUpdate => "ToolRegistryUpdate",
-        CommitType::RecoveryUpdate => "RecoveryUpdate",
-        CommitType::PevUpdate => "PevUpdate",
-        CommitType::CbvUpdate => "CbvUpdate",
-    }
-}
-
-fn required_check_label(check: RequiredCheck) -> &'static str {
-    match check {
-        RequiredCheck::SchemaOk => "SchemaOk",
-        RequiredCheck::BindingOk => "BindingOk",
-        RequiredCheck::TightenOnly => "TightenOnly",
-        RequiredCheck::IntegrityOk => "IntegrityOk",
-    }
-}
-
-fn status_label(status: ReceiptStatus) -> &'static str {
-    match status {
-        ReceiptStatus::Accepted => "ACCEPTED",
-        ReceiptStatus::Rejected => "REJECTED",
-    }
+    (receipt, None)
 }
 
 fn update_optional_digest(hasher: &mut Hasher, digest: &Option<[u8; 32]>) {
@@ -320,7 +359,6 @@ mod tests {
             known_charter_versions,
             known_policy_versions,
             known_profiles,
-            1,
         )
     }
 
@@ -349,10 +387,12 @@ mod tests {
         let prev = [8u8; 32];
         let mut store = base_store(prev);
         let req = make_request(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
 
-        let receipt = verify_and_commit(req, &mut store);
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore);
         assert_eq!(receipt.status, ReceiptStatus::Accepted);
         assert!(receipt.reject_reason_codes.is_empty());
+        assert!(proof.is_some());
         assert_eq!(store.sep_log.events.len(), 1);
     }
 
@@ -360,14 +400,16 @@ mod tests {
     fn receipt_rejected_wrong_prev() {
         let mut store = base_store([7u8; 32]);
         let req = make_request([6u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
 
-        let receipt = verify_and_commit(req, &mut store);
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore);
         assert_eq!(receipt.status, ReceiptStatus::Rejected);
         assert_eq!(
             receipt.reject_reason_codes,
             vec![ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string()]
         );
-        assert!(store.sep_log.events.is_empty());
+        assert!(proof.is_none());
+        assert_eq!(store.sep_log.events.len(), 1);
     }
 
     #[test]
@@ -376,12 +418,31 @@ mod tests {
         let mut store = base_store(prev);
         let mut req = make_request(prev);
         req.bindings.charter_version_digest = "unknown".to_string();
+        let keystore = KeyStore::new_dev_keystore(1);
 
-        let receipt = verify_and_commit(req, &mut store);
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore);
         assert_eq!(receipt.status, ReceiptStatus::Rejected);
         assert_eq!(
             receipt.reject_reason_codes,
             vec![ReasonCodes::PB_DENY_CHARTER_SCOPE.to_string()]
         );
+        assert!(proof.is_none());
+    }
+
+    #[test]
+    fn epoch_mismatch_rejects() {
+        let prev = [1u8; 32];
+        let mut store = base_store(prev);
+        let mut req = make_request(prev);
+        req.epoch_id = 2;
+        let keystore = KeyStore::new_dev_keystore(1);
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore);
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert_eq!(
+            receipt.reject_reason_codes,
+            vec![ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()]
+        );
+        assert!(proof.is_none());
     }
 }

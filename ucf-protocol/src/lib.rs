@@ -76,14 +76,25 @@ pub mod ucf {
             pub status: ReceiptStatus,
             pub reject_reason_codes: Vec<String>,
             pub receipt_digest: Digest32,
+            pub receipt_id: String,
+            pub pvgs_attestation_key_id: String,
+            pub pvgs_attestation_sig: Vec<u8>,
         }
 
         /// Placeholder ProofReceipt for future use.
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
         #[derive(Clone, Debug, PartialEq, Eq)]
         pub struct ProofReceipt {
+            pub proof_receipt_id: String,
             pub receipt_digest: Digest32,
-            pub proof_digest: Digest32,
+            pub ruleset_digest: Digest32,
+            pub verified_fields_digest: Digest32,
+            pub vrf_digest: Digest32,
+            pub timestamp_ms: u64,
+            pub epoch_id: u64,
+            pub proof_receipt_digest: Digest32,
+            pub proof_attestation_key_id: String,
+            pub proof_attestation_sig: Vec<u8>,
         }
 
         /// Reason code constants for PVGS and SEP operations.

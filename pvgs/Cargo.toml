@@ -9,3 +9,5 @@ serde = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
 sep = { path = "../sep" }
 ucf-protocol = { path = "../ucf-protocol" }
+receipts = { path = "../receipts" }
+keys = { path = "../keys" }
