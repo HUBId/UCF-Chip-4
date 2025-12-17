@@ -6,6 +6,7 @@ use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
 use sep::{SepEventType, SepLog};
 use std::collections::HashSet;
 use ucf_protocol::ucf::v1::{self as protocol, Digest32, PVGSReceipt, ProofReceipt, ReceiptStatus};
+use vrf::VrfEngine;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -113,6 +114,20 @@ pub fn compute_verified_fields_digest(bindings: &CommitBindings) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Compute a deterministic record digest suitable for VRF input.
+pub fn compute_record_digest(
+    verified_fields_digest: [u8; 32],
+    prev_record_digest: [u8; 32],
+    commit_id: &str,
+) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(b"UCF:PVGS:RECORD_DIGEST");
+    hasher.update(&verified_fields_digest);
+    hasher.update(&prev_record_digest);
+    hasher.update(commit_id.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 fn event_type_for_commit(commit_type: CommitType) -> SepEventType {
     match commit_type {
         CommitType::ReceiptRequest => SepEventType::EvDecision,
@@ -141,6 +156,7 @@ pub fn verify_and_commit(
     req: PvgsCommitRequest,
     store: &mut PvgsStore,
     keystore: &KeyStore,
+    vrf_engine: &VrfEngine,
 ) -> (PVGSReceipt, Option<ProofReceipt>) {
     let receipt_input = to_receipt_input(&req);
     let mut reject_reason_codes = Vec::new();
@@ -215,6 +231,8 @@ pub fn verify_and_commit(
         );
     }
 
+    let verified_fields_digest = compute_verified_fields_digest(&req.bindings);
+
     let receipt = issue_receipt(
         &receipt_input,
         ReceiptStatus::Accepted,
@@ -222,15 +240,26 @@ pub fn verify_and_commit(
         keystore,
     );
 
-    let vrf_digest_placeholder = [0u8; 32];
+    let record_digest = compute_record_digest(
+        verified_fields_digest,
+        req.bindings.prev_record_digest,
+        &req.commit_id,
+    );
+    let vrf_digest = vrf_engine.eval_record_vrf(
+        req.bindings.prev_record_digest,
+        record_digest,
+        &req.bindings.charter_version_digest,
+        req.bindings.profile_digest,
+        req.epoch_id,
+    );
 
     let mut proof_receipt = issue_proof_receipt(
         compute_ruleset_digest(
             req.bindings.charter_version_digest.as_bytes(),
             req.bindings.policy_version_digest.as_bytes(),
         ),
-        compute_verified_fields_digest(&req.bindings),
-        vrf_digest_placeholder,
+        verified_fields_digest,
+        vrf_digest,
         keystore,
     );
     proof_receipt.receipt_digest = receipt.receipt_digest.clone();
@@ -345,6 +374,7 @@ impl From<&CommitBindings> for protocol::CommitBindings {
 mod tests {
     use super::*;
     use protocol::ReasonCodes;
+    use vrf::VrfEngine;
 
     fn base_store(prev_digest: [u8; 32]) -> PvgsStore {
         let mut known_charter_versions = HashSet::new();
@@ -388,11 +418,13 @@ mod tests {
         let mut store = base_store(prev);
         let req = make_request(prev);
         let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
 
-        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore);
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
         assert_eq!(receipt.status, ReceiptStatus::Accepted);
         assert!(receipt.reject_reason_codes.is_empty());
-        assert!(proof.is_some());
+        let proof = proof.expect("proof receipt missing");
+        assert_ne!(proof.vrf_digest, Digest32::zero());
         assert_eq!(store.sep_log.events.len(), 1);
     }
 
@@ -401,8 +433,9 @@ mod tests {
         let mut store = base_store([7u8; 32]);
         let req = make_request([6u8; 32]);
         let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
 
-        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore);
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
         assert_eq!(receipt.status, ReceiptStatus::Rejected);
         assert_eq!(
             receipt.reject_reason_codes,
@@ -419,8 +452,9 @@ mod tests {
         let mut req = make_request(prev);
         req.bindings.charter_version_digest = "unknown".to_string();
         let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
 
-        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore);
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
         assert_eq!(receipt.status, ReceiptStatus::Rejected);
         assert_eq!(
             receipt.reject_reason_codes,
@@ -436,8 +470,9 @@ mod tests {
         let mut req = make_request(prev);
         req.epoch_id = 2;
         let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
 
-        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore);
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
         assert_eq!(receipt.status, ReceiptStatus::Rejected);
         assert_eq!(
             receipt.reject_reason_codes,

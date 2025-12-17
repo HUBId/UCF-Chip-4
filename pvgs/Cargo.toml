@@ -11,3 +11,4 @@ sep = { path = "../sep" }
 ucf-protocol = { path = "../ucf-protocol" }
 receipts = { path = "../receipts" }
 keys = { path = "../keys" }
+vrf = { path = "../vrf" }

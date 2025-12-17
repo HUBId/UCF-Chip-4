@@ -6,7 +6,6 @@ use pvgs::PvgsCommitRequest;
 use sep::SepEventInternal;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{PVGSReceipt, ProofReceipt};
-use vrf::{VrfInput, VrfOutput};
 use wire::{AuthContext, Envelope};
 
 #[cfg(feature = "serde")]
@@ -27,7 +26,7 @@ pub struct QueryResult {
     pub last_verification: Option<ProofReceipt>,
     pub current_epoch: Option<KeyEpoch>,
     pub latest_event: Option<SepEventInternal>,
-    pub recent_vrf: Option<(VrfInput, VrfOutput)>,
+    pub recent_vrf_digest: Option<[u8; 32]>,
 }
 
 pub trait QueryInspector {

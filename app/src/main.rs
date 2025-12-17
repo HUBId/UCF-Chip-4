@@ -10,15 +10,10 @@ use query::{QueryRequest, QueryResult};
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
 use sep::{SepEventInternal, SepEventType, SepLog};
 use ucf_protocol::ucf::v1::ReceiptStatus;
-use vrf::{VrfInput, VrfOutput};
-use wire::{AuthContext, Envelope};
+use vrf::VrfEngine;
+use wire::AuthContext;
 
 fn main() {
-    let envelope = Envelope {
-        payload: b"boot".to_vec(),
-        signature: None,
-    };
-
     let commit_request = PvgsCommitRequest {
         commit_id: "boot-seed".into(),
         commit_type: CommitType::ReceiptRequest,
@@ -38,6 +33,7 @@ fn main() {
     };
 
     let keystore = KeyStore::new_dev_keystore(0);
+    let vrf_engine = VrfEngine::new_dev(keystore.current_epoch());
     let receipt_input = ReceiptInput {
         commit_id: commit_request.commit_id.clone(),
         commit_type: commit_request.commit_type.into(),
@@ -59,13 +55,27 @@ fn main() {
         &keystore,
     );
 
+    let verified_fields_digest = compute_verified_fields_digest(&commit_request.bindings);
+    let record_digest = pvgs::compute_record_digest(
+        verified_fields_digest,
+        commit_request.bindings.prev_record_digest,
+        &commit_request.commit_id,
+    );
+    let vrf_digest = vrf_engine.eval_record_vrf(
+        commit_request.bindings.prev_record_digest,
+        record_digest,
+        &commit_request.bindings.charter_version_digest,
+        commit_request.bindings.profile_digest,
+        commit_request.epoch_id,
+    );
+
     let proof_receipt = issue_proof_receipt(
         compute_ruleset_digest(
             commit_request.bindings.charter_version_digest.as_bytes(),
             commit_request.bindings.policy_version_digest.as_bytes(),
         ),
-        compute_verified_fields_digest(&commit_request.bindings),
-        [0u8; 32],
+        verified_fields_digest,
+        vrf_digest,
         &keystore,
     );
 
@@ -77,6 +87,7 @@ fn main() {
         epoch_id: keystore.current_epoch(),
         key_id: keystore.current_key_id().to_string(),
         public_key: keystore.verifying_key().to_bytes(),
+        vrf_public_key: Some(vrf_engine.vrf_public_key().to_vec()),
     };
 
     let mut sep_log = SepLog::default();
@@ -86,16 +97,6 @@ fn main() {
         pvgs_receipt.receipt_digest.0,
         Vec::new(),
     );
-
-    let vrf_input = VrfInput {
-        message: envelope.payload.clone(),
-        epoch: current_epoch.epoch_id,
-    };
-
-    let vrf_output = VrfOutput {
-        proof: Vec::new(),
-        public: current_epoch.public_key.to_vec(),
-    };
 
     let auth = AuthContext {
         subject: "bootstrap".into(),
@@ -113,7 +114,7 @@ fn main() {
         last_verification: Some(proof_receipt),
         current_epoch: Some(current_epoch),
         latest_event: Some(sep_event),
-        recent_vrf: Some((vrf_input, vrf_output)),
+        recent_vrf_digest: Some(vrf_digest),
     };
 
     println!("boot ok: {}", query_request.subject);
