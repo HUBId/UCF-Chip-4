@@ -4,7 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-thiserror.workspace = true
+blake3.workspace = true
 serde = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
-wire = { path = "../wire" }
+sep = { path = "../sep" }
+ucf-protocol = { path = "../ucf-protocol" }

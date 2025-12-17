@@ -12,3 +12,4 @@ cbv = { path = "../cbv" }
 keys = { path = "../keys" }
 wire = { path = "../wire" }
 query = { path = "../query" }
+ucf-protocol = { path = "../ucf-protocol" }

@@ -1,31 +1,211 @@
 #![forbid(unsafe_code)]
 
+use blake3::Hasher;
 use thiserror::Error;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+/// SEP event type enumeration.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SepEvent {
-    pub id: String,
-    pub kind: String,
-    pub payload: String,
+pub enum SepEventType {
+    EvDecision,
+    EvRecoveryGov,
 }
 
-pub trait SepEventLog {
-    fn append(&self, event: SepEvent) -> Result<(), SepError>;
-    fn events(&self) -> Result<Vec<SepEvent>, SepError>;
+impl SepEventType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SepEventType::EvDecision => "EV_DECISION",
+            SepEventType::EvRecoveryGov => "EV_RECOVERY_GOV",
+        }
+    }
 }
 
-pub trait SepGraphIndex {
-    fn connect(&self, parent: &SepEvent, child: &SepEvent) -> Result<(), SepError>;
+/// Internal representation of SEP events with digests.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SepEventInternal {
+    pub session_id: String,
+    pub event_type: SepEventType,
+    pub object_digest: [u8; 32],
+    pub reason_codes: Vec<String>,
+    pub prev_event_digest: [u8; 32],
+    pub event_digest: [u8; 32],
 }
 
-#[derive(Debug, Error)]
+/// Append-only SEP log.
+#[derive(Debug, Default, Clone)]
+pub struct SepLog {
+    pub events: Vec<SepEventInternal>,
+}
+
+impl SepLog {
+    /// Append a new event to the log, computing the chained digest.
+    pub fn append_event(
+        &mut self,
+        session_id: String,
+        event_type: SepEventType,
+        object_digest: [u8; 32],
+        reason_codes: Vec<String>,
+    ) -> SepEventInternal {
+        let prev_event_digest = self
+            .events
+            .last()
+            .map(|e| e.event_digest)
+            .unwrap_or([0u8; 32]);
+        let event_digest = compute_event_digest(
+            &session_id,
+            &event_type,
+            &object_digest,
+            &reason_codes,
+            prev_event_digest,
+        );
+
+        let event = SepEventInternal {
+            session_id,
+            event_type,
+            object_digest,
+            reason_codes,
+            prev_event_digest,
+            event_digest,
+        };
+
+        self.events.push(event.clone());
+        event
+    }
+
+    /// Validate the entire event chain for tamper evidence.
+    pub fn validate_chain(&self) -> Result<(), SepError> {
+        for idx in 0..self.events.len() {
+            let event = &self.events[idx];
+            if idx == 0 {
+                if event.prev_event_digest != [0u8; 32] {
+                    return Err(SepError::ChainBroken(idx));
+                }
+            } else {
+                let prev = &self.events[idx - 1];
+                if event.prev_event_digest != prev.event_digest {
+                    return Err(SepError::ChainBroken(idx));
+                }
+            }
+
+            let computed = compute_event_digest(
+                &event.session_id,
+                &event.event_type,
+                &event.object_digest,
+                &event.reason_codes,
+                event.prev_event_digest,
+            );
+            if computed != event.event_digest {
+                return Err(SepError::ChainBroken(idx));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Session seal capturing the final event digest.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSeal {
+    pub session_id: String,
+    pub final_event_digest: [u8; 32],
+    pub created_at_ms: u64,
+}
+
+/// Create a session seal using the last event digest for the given session.
+pub fn seal(session_id: &str, log: &SepLog) -> SessionSeal {
+    let final_event_digest = log
+        .events
+        .iter()
+        .rev()
+        .find(|e| e.session_id == session_id)
+        .map(|e| e.event_digest)
+        .unwrap_or([0u8; 32]);
+
+    let created_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    SessionSeal {
+        session_id: session_id.to_string(),
+        final_event_digest,
+        created_at_ms,
+    }
+}
+
+fn compute_event_digest(
+    session_id: &str,
+    event_type: &SepEventType,
+    object_digest: &[u8; 32],
+    reason_codes: &[String],
+    prev_event_digest: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(b"UCF:SEP:EVENT");
+    hasher.update(session_id.as_bytes());
+    hasher.update(event_type.as_str().as_bytes());
+    hasher.update(object_digest);
+    for rc in reason_codes {
+        hasher.update(rc.as_bytes());
+    }
+    hasher.update(&prev_event_digest);
+    *hasher.finalize().as_bytes()
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum SepError {
-    #[error("io error: {0}")]
-    Io(String),
-    #[error("graph error: {0}")]
-    Graph(String),
+    #[error("event chain broken at index {0}")]
+    ChainBroken(usize),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_sep_chain() {
+        let mut log = SepLog::default();
+        let e1 = log.append_event("s".to_string(), SepEventType::EvDecision, [1u8; 32], vec![]);
+        let _ = log.append_event(
+            "s".to_string(),
+            SepEventType::EvRecoveryGov,
+            [2u8; 32],
+            vec![],
+        );
+        let _ = log.append_event("s".to_string(), SepEventType::EvDecision, [3u8; 32], vec![]);
+
+        assert!(log.validate_chain().is_ok());
+
+        // Tamper with prev digest
+        let mut tampered = log.clone();
+        tampered.events[1].prev_event_digest = e1.prev_event_digest;
+        assert!(tampered.validate_chain().is_err());
+    }
+
+    #[test]
+    fn seal_uses_last_event_digest() {
+        let mut log = SepLog::default();
+        log.append_event(
+            "session-1".to_string(),
+            SepEventType::EvDecision,
+            [1u8; 32],
+            vec![],
+        );
+        log.append_event(
+            "session-1".to_string(),
+            SepEventType::EvDecision,
+            [9u8; 32],
+            vec![],
+        );
+
+        let seal = seal("session-1", &log);
+        assert_eq!(
+            seal.final_event_digest,
+            log.events.last().unwrap().event_digest
+        );
+    }
 }
