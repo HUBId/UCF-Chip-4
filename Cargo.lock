@@ -259,11 +259,14 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 name = "keys"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "ed25519-dalek",
  "rand_core",
+ "sep",
  "serde",
  "serde_yaml",
  "thiserror",
+ "ucf-protocol",
 ]
 
 [[package]]

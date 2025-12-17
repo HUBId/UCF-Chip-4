@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use cbv::CharacterBaselineVector;
-use keys::{KeyEpoch, KeyStore};
+use keys::{KeyEpochHistory, KeyStore};
 use pvgs::{
     compute_ruleset_digest, compute_verified_fields_digest, CommitBindings, CommitType,
     PvgsCommitRequest, RequiredCheck,
@@ -34,6 +34,7 @@ fn main() {
 
     let keystore = KeyStore::new_dev_keystore(0);
     let vrf_engine = VrfEngine::new_dev(keystore.current_epoch());
+    let mut history = KeyEpochHistory::default();
     let receipt_input = ReceiptInput {
         commit_id: commit_request.commit_id.clone(),
         commit_type: commit_request.commit_type.into(),
@@ -83,12 +84,17 @@ fn main() {
         dimensions: vec!["baseline".into()],
     };
 
-    let current_epoch = KeyEpoch {
-        epoch_id: keystore.current_epoch(),
-        key_id: keystore.current_key_id().to_string(),
-        public_key: keystore.verifying_key().to_bytes(),
-        vrf_public_key: Some(vrf_engine.vrf_public_key().to_vec()),
-    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let current_epoch = keystore.make_key_epoch_proto(
+        keystore.current_epoch(),
+        now_ms,
+        vrf_engine.vrf_public_key().to_vec(),
+        None,
+    );
+    history.push(current_epoch.clone()).expect("history push");
 
     let mut sep_log = SepLog::default();
     let sep_event: SepEventInternal = sep_log.append_event(

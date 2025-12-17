@@ -1,11 +1,10 @@
 #![forbid(unsafe_code)]
 
 use cbv::CharacterBaselineVector;
-use keys::KeyEpoch;
 use pvgs::PvgsCommitRequest;
 use sep::SepEventInternal;
 use thiserror::Error;
-use ucf_protocol::ucf::v1::{PVGSReceipt, ProofReceipt};
+use ucf_protocol::ucf::v1::{PVGSKeyEpoch, PVGSReceipt, ProofReceipt};
 use wire::{AuthContext, Envelope};
 
 #[cfg(feature = "serde")]
@@ -24,7 +23,7 @@ pub struct QueryResult {
     pub baseline: Option<CharacterBaselineVector>,
     pub last_commit: Option<PVGSReceipt>,
     pub last_verification: Option<ProofReceipt>,
-    pub current_epoch: Option<KeyEpoch>,
+    pub current_epoch: Option<PVGSKeyEpoch>,
     pub latest_event: Option<SepEventInternal>,
     pub recent_vrf_digest: Option<[u8; 32]>,
 }

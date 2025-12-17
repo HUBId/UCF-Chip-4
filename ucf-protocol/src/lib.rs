@@ -97,6 +97,24 @@ pub mod ucf {
             pub proof_attestation_sig: Vec<u8>,
         }
 
+        /// Published key epoch announcement for PVGS attestation and VRF verification.
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct PVGSKeyEpoch {
+            pub key_epoch_id: u64,
+            pub attestation_key_id: String,
+            pub attestation_public_key: Vec<u8>,
+            pub vrf_key_id: String,
+            pub vrf_public_key: Vec<u8>,
+            pub created_at_ms: u64,
+            pub prev_key_epoch_digest: Option<Digest32>,
+            pub announcement_digest: Digest32,
+            pub announcement_signature: Vec<u8>,
+        }
+
+        /// Alias for PVGSKeyEpoch using Rust-style casing.
+        pub type PvgsKeyEpoch = PVGSKeyEpoch;
+
         /// Reason code constants for PVGS and SEP operations.
         pub struct ReasonCodes;
 
@@ -107,6 +125,7 @@ pub mod ucf {
             pub const PB_DENY_INTEGRITY_REQUIRED: &'static str = "RC.PB.DENY.INTEGRITY_REQUIRED";
             pub const GE_GRANT_MISSING: &'static str = "RC.GE.GRANT.MISSING";
             pub const TH_INTEGRITY_COMPROMISE: &'static str = "RC.TH.INTEGRITY.COMPROMISE";
+            pub const GV_KEY_EPOCH_ROTATED: &'static str = "RC.GV.KEY_EPOCH.ROTATED";
         }
 
         /// Lightweight reference type for future graph links.
