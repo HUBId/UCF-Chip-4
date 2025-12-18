@@ -19,7 +19,7 @@ jobs:
             ~/.rustup/toolchains
             ~/.rustup/update-hashes
           key: ${{ runner.os }}-rustup-stable-${{ runner.arch }}
-      - name: Set Rust toolchain
+      - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
       - name: Cache cargo
         uses: actions/cache@v4
