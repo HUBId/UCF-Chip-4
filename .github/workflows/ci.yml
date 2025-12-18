@@ -11,6 +11,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache rustup toolchains
+        id: rustup-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+          key: ${{ runner.os }}-rustup-stable-${{ runner.arch }}
       - name: Set Rust toolchain
         uses: ./.github/actions/rust-toolchain
       - name: Cache cargo
