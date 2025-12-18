@@ -11,10 +11,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
+      - name: Install Rust toolchain (attempt 1)
+        id: rust_toolchain
+        continue-on-error: true
+        uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           override: true
+          components: rustfmt, clippy
+      - name: Retry Rust toolchain install
+        if: steps.rust_toolchain.outcome == 'failure'
+        run: |
+          for i in 1 2 3; do
+            echo "Retry attempt ${i} for Rust toolchain installation"
+            if rustup toolchain install stable --profile minimal; then
+              rustup component add rustfmt clippy --toolchain stable
+              rustup default stable
+              break
+            fi
+            sleep 20
+          done
+          rustup show
       - name: Cache cargo
         uses: actions/cache@v4
         with:
