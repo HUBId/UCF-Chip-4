@@ -205,7 +205,7 @@ fn to_receipt_input(req: &PvgsCommitRequest) -> ReceiptInput {
             .copied()
             .map(Into::into)
             .collect(),
-        required_receipt_kind: req.required_receipt_kind.into(),
+        required_receipt_kind: req.required_receipt_kind,
         payload_digests: req.payload_digests.clone(),
         epoch_id: req.epoch_id,
     }
@@ -230,30 +230,30 @@ pub fn verify_and_commit(
 
     if req.epoch_id != keystore.current_epoch() {
         reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
-        return finalize_receipt(
-            &req,
-            &receipt_input,
-            ReceiptStatus::Rejected,
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
             reject_reason_codes,
             store,
             keystore,
-            frame_event_kind,
-            key_epoch_event_digest,
-        );
+            frame_kind: frame_event_kind,
+            event_object_digest: key_epoch_event_digest,
+        });
     }
 
     if req.bindings.prev_record_digest != store.current_head_record_digest {
         reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
-        return finalize_receipt(
-            &req,
-            &receipt_input,
-            ReceiptStatus::Rejected,
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
             reject_reason_codes,
             store,
             keystore,
-            frame_event_kind,
-            key_epoch_event_digest,
-        );
+            frame_kind: frame_event_kind,
+            event_object_digest: key_epoch_event_digest,
+        });
     }
 
     if !store
@@ -261,16 +261,16 @@ pub fn verify_and_commit(
         .contains(&req.bindings.charter_version_digest)
     {
         reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_CHARTER_SCOPE.to_string());
-        return finalize_receipt(
-            &req,
-            &receipt_input,
-            ReceiptStatus::Rejected,
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
             reject_reason_codes,
             store,
             keystore,
-            frame_event_kind,
-            key_epoch_event_digest,
-        );
+            frame_kind: frame_event_kind,
+            event_object_digest: key_epoch_event_digest,
+        });
     }
 
     if !store
@@ -278,16 +278,16 @@ pub fn verify_and_commit(
         .contains(&req.bindings.policy_version_digest)
     {
         reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_INTEGRITY_REQUIRED.to_string());
-        return finalize_receipt(
-            &req,
-            &receipt_input,
-            ReceiptStatus::Rejected,
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
             reject_reason_codes,
             store,
             keystore,
-            frame_event_kind,
-            key_epoch_event_digest,
-        );
+            frame_kind: frame_event_kind,
+            event_object_digest: key_epoch_event_digest,
+        });
     }
 
     if req.commit_type == CommitType::FrameEvidenceAppend {
@@ -306,16 +306,16 @@ pub fn verify_and_commit(
         }
 
         if !frame_reject_reason_codes.is_empty() {
-            return finalize_receipt(
-                &req,
-                &receipt_input,
-                ReceiptStatus::Rejected,
-                frame_reject_reason_codes,
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: frame_reject_reason_codes,
                 store,
                 keystore,
-                frame_event_kind,
-                key_epoch_event_digest,
-            );
+                frame_kind: frame_event_kind,
+                event_object_digest: key_epoch_event_digest,
+            });
         }
     }
 
@@ -325,16 +325,16 @@ pub fn verify_and_commit(
             || req.bindings.grant_id.is_none())
     {
         reject_reason_codes.push(protocol::ReasonCodes::GE_GRANT_MISSING.to_string());
-        return finalize_receipt(
-            &req,
-            &receipt_input,
-            ReceiptStatus::Rejected,
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
             reject_reason_codes,
             store,
             keystore,
-            frame_event_kind,
-            key_epoch_event_digest,
-        );
+            frame_kind: frame_event_kind,
+            event_object_digest: key_epoch_event_digest,
+        });
     }
 
     if req.commit_type == CommitType::ReceiptRequest
@@ -355,16 +355,16 @@ pub fn verify_and_commit(
         }
 
         if !reject_reason_codes.is_empty() {
-            return finalize_receipt(
-                &req,
-                &receipt_input,
-                ReceiptStatus::Rejected,
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
                 reject_reason_codes,
                 store,
                 keystore,
-                frame_event_kind,
-                key_epoch_event_digest,
-            );
+                frame_kind: frame_event_kind,
+                event_object_digest: key_epoch_event_digest,
+            });
         }
     }
 
@@ -375,16 +375,16 @@ pub fn verify_and_commit(
             Ok(ctx) => key_epoch_context = Some(ctx),
             Err(reasons) => {
                 reject_reason_codes = reasons;
-                return finalize_receipt(
-                    &req,
-                    &receipt_input,
-                    ReceiptStatus::Rejected,
+                return finalize_receipt(FinalizeReceiptArgs {
+                    req: &req,
+                    receipt_input: &receipt_input,
+                    status: ReceiptStatus::Rejected,
                     reject_reason_codes,
                     store,
                     keystore,
-                    frame_event_kind,
-                    key_epoch_payload_digest(&req),
-                );
+                    frame_kind: frame_event_kind,
+                    event_object_digest: key_epoch_payload_digest(&req),
+                });
             }
         }
     }
@@ -623,16 +623,28 @@ fn validate_key_epoch_update(
     }
 }
 
-fn finalize_receipt(
-    req: &PvgsCommitRequest,
-    receipt_input: &ReceiptInput,
+struct FinalizeReceiptArgs<'a> {
+    req: &'a PvgsCommitRequest,
+    receipt_input: &'a ReceiptInput,
     status: ReceiptStatus,
-    mut reject_reason_codes: Vec<String>,
-    store: &mut PvgsStore,
-    keystore: &KeyStore,
+    reject_reason_codes: Vec<String>,
+    store: &'a mut PvgsStore,
+    keystore: &'a KeyStore,
     frame_kind: Option<FrameEventKind>,
     event_object_digest: Option<[u8; 32]>,
-) -> (PVGSReceipt, Option<ProofReceipt>) {
+}
+
+fn finalize_receipt(args: FinalizeReceiptArgs) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let FinalizeReceiptArgs {
+        req,
+        receipt_input,
+        status,
+        mut reject_reason_codes,
+        store,
+        keystore,
+        frame_kind,
+        event_object_digest,
+    } = args;
     if matches!(status, ReceiptStatus::Rejected) && reject_reason_codes.is_empty() {
         reject_reason_codes.push(protocol::ReasonCodes::GE_GRANT_MISSING.to_string());
     }
