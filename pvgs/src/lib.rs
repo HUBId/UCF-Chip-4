@@ -1,15 +1,23 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hasher;
+use cbv::{
+    cbv_attestation_preimage, compute_cbv_verified_fields_digest, derive_next_cbv,
+    CbvDeriverConfig, CbvStore,
+};
+use ed25519_dalek::Signer;
 use keys::{verify_key_epoch_signature, KeyEpochHistory, KeyStore};
 use prost::Message;
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
 use sep::{FrameEventKind, SepEventType, SepLog};
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 use ucf_protocol::ucf::v1::{
-    self as protocol, Digest32, ExperienceRecord, FinalizationHeader, PVGSKeyEpoch, PVGSReceipt,
-    ProofReceipt, ReceiptStatus, RecordType, Ref,
+    self as protocol, CharacterBaselineVector, Digest32, ExperienceRecord, FinalizationHeader,
+    MacroMilestone, MacroMilestoneState, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReceiptStatus,
+    RecordType, Ref,
 };
 use vrf::VrfEngine;
 
@@ -41,6 +49,16 @@ pub enum RequiredCheck {
     BindingOk,
     TightenOnly,
     IntegrityOk,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CbvCommitError {
+    #[error("macro milestone not finalized")]
+    MacroNotFinalized,
+    #[error("cbv epoch is not monotonic")]
+    NonMonotonicEpoch,
+    #[error("cbv derivation failed: {0}")]
+    Derivation(String),
 }
 
 /// Commit binding data that feeds into receipts.
@@ -75,6 +93,14 @@ pub struct PvgsCommitRequest {
     pub experience_record_payload: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CbvCommitOutcome {
+    pub cbv: CharacterBaselineVector,
+    pub receipt: PVGSReceipt,
+    pub proof_receipt: ProofReceipt,
+    pub applied_updates: bool,
+}
+
 /// In-memory store tracking experience records and proof receipts.
 #[derive(Debug, Clone, Default)]
 pub struct ExperienceStore {
@@ -93,6 +119,7 @@ pub struct PvgsStore {
     pub known_policy_versions: HashSet<String>,
     pub known_profiles: HashSet<[u8; 32]>,
     pub key_epoch_history: KeyEpochHistory,
+    pub cbv_store: CbvStore,
     pub committed_payload_digests: HashSet<[u8; 32]>,
     pub sep_log: SepLog,
     pub receipt_gate_enabled: bool,
@@ -116,10 +143,15 @@ impl PvgsStore {
             known_policy_versions,
             known_profiles,
             key_epoch_history: KeyEpochHistory::default(),
+            cbv_store: CbvStore::default(),
             committed_payload_digests: HashSet::new(),
             sep_log: SepLog::default(),
             receipt_gate_enabled: false,
         }
+    }
+
+    pub fn get_latest_cbv(&self) -> Option<CharacterBaselineVector> {
+        self.cbv_store.latest().cloned()
     }
 
     pub fn append_record(
@@ -131,6 +163,131 @@ impl PvgsStore {
         self.current_head_record_digest = record_digest;
         self.experience_store
             .append(record, record_digest, proof_receipt);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_cbv_from_macro(
+        &mut self,
+        macro_milestone: &MacroMilestone,
+        keystore: &KeyStore,
+        vrf_engine: &VrfEngine,
+        charter_version_digest: &str,
+        policy_version_digest: &str,
+        pev_digest: Option<[u8; 32]>,
+        config: CbvDeriverConfig,
+    ) -> Result<CbvCommitOutcome, CbvCommitError> {
+        let state = MacroMilestoneState::try_from(macro_milestone.state)
+            .unwrap_or(MacroMilestoneState::Unknown);
+        if !matches!(state, MacroMilestoneState::Finalized) {
+            return Err(CbvCommitError::MacroNotFinalized);
+        }
+
+        let prev_cbv = self.cbv_store.latest().cloned();
+        let derived = derive_next_cbv(prev_cbv.as_ref(), macro_milestone, &config)
+            .map_err(|e| CbvCommitError::Derivation(e.to_string()))?;
+        let mut cbv = derived.cbv;
+
+        if let Some(prev) = prev_cbv.as_ref() {
+            if cbv.cbv_epoch <= prev.cbv_epoch {
+                return Err(CbvCommitError::NonMonotonicEpoch);
+            }
+        }
+
+        let prev_cbv_digest = prev_cbv
+            .as_ref()
+            .and_then(|c| c.cbv_digest.as_ref())
+            .and_then(|d| digest_from_bytes(d))
+            .unwrap_or([0u8; 32]);
+        let next_cbv_digest = cbv
+            .cbv_digest
+            .as_ref()
+            .and_then(|d| digest_from_bytes(d))
+            .unwrap_or([0u8; 32]);
+        let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap_or([0u8; 32]);
+
+        let verified_fields_digest = compute_cbv_verified_fields_digest(
+            prev_cbv_digest,
+            macro_digest,
+            next_cbv_digest,
+            cbv.cbv_epoch,
+        );
+
+        let ruleset_digest = compute_ruleset_digest(
+            charter_version_digest.as_bytes(),
+            policy_version_digest.as_bytes(),
+            pev_digest.as_ref().map(|d| d.as_slice()),
+        );
+
+        let vrf_digest = vrf_engine.eval_record_vrf(
+            prev_cbv_digest,
+            next_cbv_digest,
+            charter_version_digest,
+            [0u8; 32],
+            keystore.current_epoch(),
+        );
+
+        let proof_receipt =
+            issue_proof_receipt(ruleset_digest, verified_fields_digest, vrf_digest, keystore);
+
+        let bindings = CommitBindings {
+            action_digest: None,
+            decision_digest: None,
+            grant_id: None,
+            charter_version_digest: charter_version_digest.to_string(),
+            policy_version_digest: policy_version_digest.to_string(),
+            prev_record_digest: self.current_head_record_digest,
+            profile_digest: None,
+            tool_profile_digest: None,
+            pev_digest,
+        };
+
+        let receipt_input = ReceiptInput {
+            commit_id: macro_milestone.macro_id.clone(),
+            commit_type: CommitType::CbvUpdate.into(),
+            bindings: (&bindings).into(),
+            required_checks: vec![
+                RequiredCheck::TightenOnly.into(),
+                RequiredCheck::IntegrityOk.into(),
+            ],
+            required_receipt_kind: protocol::RequiredReceiptKind::Read,
+            payload_digests: vec![next_cbv_digest, macro_digest],
+            epoch_id: keystore.current_epoch(),
+        };
+
+        let receipt = issue_receipt(
+            &receipt_input,
+            ReceiptStatus::Accepted,
+            Vec::new(),
+            keystore,
+        );
+
+        cbv.proof_receipt_ref = Some(Ref {
+            id: proof_receipt.proof_receipt_id.clone(),
+        });
+        cbv.pvgs_attestation_key_id = keystore.current_key_id().to_string();
+        let signature = keystore.signing_key().sign(&cbv_attestation_preimage(&cbv));
+        cbv.pvgs_attestation_sig = signature.to_bytes().to_vec();
+
+        self.cbv_store.push(cbv.clone());
+
+        let mut reason_codes = vec![protocol::ReasonCodes::GV_CBV_UPDATED.to_string()];
+        if !derived.applied_updates {
+            reason_codes.push(protocol::ReasonCodes::GV_CBV_NO_CHANGE.to_string());
+        }
+
+        self.sep_log.append_event(
+            macro_milestone.macro_id.clone(),
+            SepEventType::EvRecoveryGov,
+            next_cbv_digest,
+            reason_codes,
+        );
+
+        Ok(CbvCommitOutcome {
+            cbv,
+            receipt,
+            proof_receipt,
+            applied_updates: derived.applied_updates,
+        })
     }
 }
 
@@ -1208,7 +1365,10 @@ mod tests {
     use super::*;
     use protocol::ReasonCodes;
     use receipts::verify_pvgs_receipt_attestation;
-    use ucf_protocol::ucf::v1::{GovernanceFrame, MetabolicFrame};
+    use ucf_protocol::ucf::v1::{
+        GovernanceFrame, MacroMilestoneState, MagnitudeClass, MetabolicFrame, TraitDirection,
+        TraitUpdate,
+    };
     use vrf::VrfEngine;
 
     fn base_store(prev_digest: [u8; 32]) -> PvgsStore {
@@ -1290,6 +1450,23 @@ mod tests {
             },
             epoch,
         )
+    }
+
+    fn cbv_update(name: &str, direction: TraitDirection, magnitude: MagnitudeClass) -> TraitUpdate {
+        TraitUpdate {
+            trait_name: name.to_string(),
+            direction: direction as i32,
+            magnitude_class: magnitude as i32,
+        }
+    }
+
+    fn macro_with_updates(id: &str, updates: Vec<TraitUpdate>) -> MacroMilestone {
+        MacroMilestone {
+            macro_id: id.to_string(),
+            macro_digest: vec![1u8; 32],
+            state: MacroMilestoneState::Finalized as i32,
+            trait_updates: updates,
+        }
     }
 
     fn perception_record(profile_digest: [u8; 32]) -> ExperienceRecord {
@@ -1870,5 +2047,175 @@ mod tests {
         assert!(result
             .reason_codes
             .contains(&ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()));
+    }
+
+    #[test]
+    fn cbv_commit_is_deterministic() {
+        let prev = [2u8; 32];
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let updates = vec![cbv_update(
+            "baseline_caution",
+            TraitDirection::IncreaseStrictness,
+            MagnitudeClass::Med,
+        )];
+
+        let macro_one = macro_with_updates("macro-one", updates.clone());
+        let macro_two = macro_one.clone();
+
+        let mut store_a = base_store(prev);
+        let mut store_b = base_store(prev);
+
+        let outcome_a = store_a
+            .commit_cbv_from_macro(
+                &macro_one,
+                &keystore,
+                &vrf_engine,
+                "charter",
+                "policy",
+                None,
+                CbvDeriverConfig::default(),
+            )
+            .expect("cbv commit a");
+        let outcome_b = store_b
+            .commit_cbv_from_macro(
+                &macro_two,
+                &keystore,
+                &vrf_engine,
+                "charter",
+                "policy",
+                None,
+                CbvDeriverConfig::default(),
+            )
+            .expect("cbv commit b");
+
+        assert_eq!(outcome_a.cbv.cbv_digest, outcome_b.cbv.cbv_digest);
+    }
+
+    #[test]
+    fn cbv_epoch_is_monotonic_and_queryable() {
+        let prev = [3u8; 32];
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let mut store = base_store(prev);
+
+        let first_macro = macro_with_updates(
+            "macro-1",
+            vec![cbv_update(
+                "baseline_caution",
+                TraitDirection::IncreaseStrictness,
+                MagnitudeClass::Low,
+            )],
+        );
+        let second_macro = macro_with_updates(
+            "macro-2",
+            vec![cbv_update(
+                "baseline_export_strictness",
+                TraitDirection::IncreaseStrictness,
+                MagnitudeClass::High,
+            )],
+        );
+
+        let first = store
+            .commit_cbv_from_macro(
+                &first_macro,
+                &keystore,
+                &vrf_engine,
+                "charter",
+                "policy",
+                None,
+                CbvDeriverConfig::default(),
+            )
+            .expect("first cbv commit");
+        let second = store
+            .commit_cbv_from_macro(
+                &second_macro,
+                &keystore,
+                &vrf_engine,
+                "charter",
+                "policy",
+                None,
+                CbvDeriverConfig::default(),
+            )
+            .expect("second cbv commit");
+
+        assert_eq!(first.cbv.cbv_epoch, 1);
+        assert_eq!(second.cbv.cbv_epoch, 2);
+        let latest = store.get_latest_cbv().expect("missing latest cbv");
+        assert_eq!(latest.cbv_epoch, 2);
+    }
+
+    #[test]
+    fn cbv_commit_logs_sep_event() {
+        let prev = [4u8; 32];
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let mut store = base_store(prev);
+        let macro_one = macro_with_updates(
+            "macro-log",
+            vec![cbv_update(
+                "chain_conservatism",
+                TraitDirection::IncreaseStrictness,
+                MagnitudeClass::Med,
+            )],
+        );
+
+        let outcome = store
+            .commit_cbv_from_macro(
+                &macro_one,
+                &keystore,
+                &vrf_engine,
+                "charter",
+                "policy",
+                None,
+                CbvDeriverConfig::default(),
+            )
+            .expect("cbv commit");
+
+        let last_event = store.sep_log.events.last().expect("missing event");
+        let cbv_digest = outcome
+            .cbv
+            .cbv_digest
+            .as_ref()
+            .and_then(|d| digest_from_bytes(d))
+            .expect("cbv digest missing");
+        assert_eq!(last_event.object_digest, cbv_digest);
+        assert!(last_event
+            .reason_codes
+            .contains(&ReasonCodes::GV_CBV_UPDATED.to_string()));
+    }
+
+    #[test]
+    fn cbv_commit_notes_no_change_when_only_decreases() {
+        let prev = [5u8; 32];
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let mut store = base_store(prev);
+        let macro_one = macro_with_updates(
+            "macro-no-change",
+            vec![cbv_update(
+                "baseline_caution",
+                TraitDirection::DecreaseStrictness,
+                MagnitudeClass::High,
+            )],
+        );
+
+        let outcome = store
+            .commit_cbv_from_macro(
+                &macro_one,
+                &keystore,
+                &vrf_engine,
+                "charter",
+                "policy",
+                None,
+                CbvDeriverConfig::default(),
+            )
+            .expect("cbv commit");
+
+        assert!(!outcome.applied_updates);
+        let last_event = store.sep_log.events.last().expect("missing event");
+        assert!(last_event
+            .reason_codes
+            .contains(&ReasonCodes::GV_CBV_NO_CHANGE.to_string()));
     }
 }
