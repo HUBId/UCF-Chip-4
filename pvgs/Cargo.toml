@@ -13,3 +13,6 @@ receipts = { path = "../receipts" }
 keys = { path = "../keys" }
 vrf = { path = "../vrf" }
 prost = { workspace = true }
+cbv = { path = "../cbv" }
+thiserror.workspace = true
+ed25519-dalek.workspace = true

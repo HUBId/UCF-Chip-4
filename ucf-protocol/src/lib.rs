@@ -172,6 +172,87 @@ pub mod ucf {
             Strict,
         }
 
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum MacroMilestoneState {
+            Unknown = 0,
+            Draft = 1,
+            Finalized = 2,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum TraitDirection {
+            IncreaseStrictness = 0,
+            DecreaseStrictness = 1,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum MagnitudeClass {
+            Low = 0,
+            Med = 1,
+            High = 2,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct TraitUpdate {
+            #[prost(string, tag = "1")]
+            pub trait_name: String,
+            #[prost(enumeration = "TraitDirection", tag = "2")]
+            pub direction: i32,
+            #[prost(enumeration = "MagnitudeClass", tag = "3")]
+            pub magnitude_class: i32,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct MacroMilestone {
+            #[prost(string, tag = "1")]
+            pub macro_id: String,
+            #[prost(bytes = "vec", tag = "2")]
+            pub macro_digest: Vec<u8>,
+            #[prost(enumeration = "MacroMilestoneState", tag = "3")]
+            pub state: i32,
+            #[prost(message, repeated, tag = "4")]
+            pub trait_updates: Vec<TraitUpdate>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct CharacterBaselineVector {
+            #[prost(uint64, tag = "1")]
+            pub cbv_epoch: u64,
+            #[prost(int32, tag = "2")]
+            pub baseline_caution_offset: i32,
+            #[prost(int32, tag = "3")]
+            pub baseline_novelty_dampening_offset: i32,
+            #[prost(int32, tag = "4")]
+            pub baseline_approval_strictness_offset: i32,
+            #[prost(int32, tag = "5")]
+            pub baseline_export_strictness_offset: i32,
+            #[prost(int32, tag = "6")]
+            pub baseline_chain_conservatism_offset: i32,
+            #[prost(uint32, tag = "7")]
+            pub baseline_cooldown_multiplier_class: u32,
+            #[prost(bytes = "vec", optional, tag = "8")]
+            pub cbv_digest: Option<Vec<u8>>,
+            #[prost(message, repeated, tag = "9")]
+            pub source_milestone_refs: Vec<Ref>,
+            #[prost(message, repeated, tag = "10")]
+            pub source_event_refs: Vec<Ref>,
+            #[prost(message, optional, tag = "11")]
+            pub proof_receipt_ref: Option<Ref>,
+            #[prost(string, tag = "12")]
+            pub pvgs_attestation_key_id: String,
+            #[prost(bytes = "vec", tag = "13")]
+            pub pvgs_attestation_sig: Vec<u8>,
+        }
+
         /// Control frame emitted by the engine with overlays and reasons.
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
         #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,6 +295,8 @@ pub mod ucf {
                 "RC.GV.FRAME_EVIDENCE.PAYLOAD_INVALID";
             pub const GE_VALIDATION_SCHEMA_INVALID: &'static str =
                 "RC.GE.VALIDATION.SCHEMA_INVALID";
+            pub const GV_CBV_UPDATED: &'static str = "RC.GV.CBV.UPDATED";
+            pub const GV_CBV_NO_CHANGE: &'static str = "RC.GV.CBV.NO_CHANGE";
         }
 
         /// Lightweight reference type for future graph links.

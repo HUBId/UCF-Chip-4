@@ -73,9 +73,12 @@ checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
 name = "cbv"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "prost",
  "serde",
  "serde_yaml",
  "thiserror",
+ "ucf-protocol",
 ]
 
 [[package]]
@@ -359,12 +362,15 @@ name = "pvgs"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "cbv",
+ "ed25519-dalek",
  "keys",
  "prost",
  "receipts",
  "sep",
  "serde",
  "serde_yaml",
+ "thiserror",
  "ucf-protocol",
  "vrf",
 ]

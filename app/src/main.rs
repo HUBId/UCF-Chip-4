@@ -90,7 +90,19 @@ fn main() {
     );
 
     let baseline = CharacterBaselineVector {
-        dimensions: vec!["baseline".into()],
+        cbv_epoch: 0,
+        baseline_caution_offset: 0,
+        baseline_novelty_dampening_offset: 0,
+        baseline_approval_strictness_offset: 0,
+        baseline_export_strictness_offset: 0,
+        baseline_chain_conservatism_offset: 0,
+        baseline_cooldown_multiplier_class: 0,
+        cbv_digest: None,
+        source_milestone_refs: Vec::new(),
+        source_event_refs: Vec::new(),
+        proof_receipt_ref: None,
+        pvgs_attestation_key_id: String::new(),
+        pvgs_attestation_sig: Vec::new(),
     };
 
     let now_ms = std::time::SystemTime::now()
