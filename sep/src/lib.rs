@@ -13,6 +13,8 @@ pub enum SepEventType {
     EvDecision,
     EvRecoveryGov,
     EvKeyEpoch,
+    EvControlFrame,
+    EvSignalFrame,
 }
 
 impl SepEventType {
@@ -21,8 +23,18 @@ impl SepEventType {
             SepEventType::EvDecision => "EV_DECISION",
             SepEventType::EvRecoveryGov => "EV_RECOVERY_GOV",
             SepEventType::EvKeyEpoch => "EV_KEY_EPOCH",
+            SepEventType::EvControlFrame => "EV_CONTROL_FRAME",
+            SepEventType::EvSignalFrame => "EV_SIGNAL_FRAME",
         }
     }
+}
+
+/// Frame event kind used for frame evidence logging.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameEventKind {
+    ControlFrame,
+    SignalFrame,
 }
 
 /// Internal representation of SEP events with digests.
@@ -76,6 +88,22 @@ impl SepLog {
 
         self.events.push(event.clone());
         event
+    }
+
+    /// Append a control or signal frame event to the log.
+    pub fn append_frame_event(
+        &mut self,
+        session_id: String,
+        kind: FrameEventKind,
+        frame_digest: [u8; 32],
+        reason_codes: Vec<String>,
+    ) -> SepEventInternal {
+        let event_type = match kind {
+            FrameEventKind::ControlFrame => SepEventType::EvControlFrame,
+            FrameEventKind::SignalFrame => SepEventType::EvSignalFrame,
+        };
+
+        self.append_event(session_id, event_type, frame_digest, reason_codes)
     }
 
     /// Validate the entire event chain for tamper evidence.

@@ -47,6 +47,7 @@ fn main() {
             .copied()
             .map(Into::into)
             .collect(),
+        required_receipt_kind: commit_request.required_receipt_kind.into(),
         payload_digests: commit_request.payload_digests.clone(),
         epoch_id: commit_request.epoch_id,
     };

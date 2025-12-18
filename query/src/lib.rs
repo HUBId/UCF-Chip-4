@@ -2,7 +2,7 @@
 
 use cbv::CharacterBaselineVector;
 use pvgs::{PvgsCommitRequest, PvgsStore};
-use sep::SepEventInternal;
+use sep::{SepEventInternal, SepEventType, SepLog};
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{PVGSKeyEpoch, PVGSReceipt, ProofReceipt};
 use wire::{AuthContext, Envelope};
@@ -65,10 +65,44 @@ pub fn get_key_epoch(store: &PvgsStore, epoch_id: u64) -> Option<PVGSKeyEpoch> {
         .cloned()
 }
 
+/// Return true if the SEP log contains a control frame event with the digest in the session.
+pub fn has_control_frame_digest(log: &SepLog, session_id: &str, digest: [u8; 32]) -> bool {
+    log.events.iter().any(|event| {
+        event.session_id == session_id
+            && matches!(event.event_type, SepEventType::EvControlFrame)
+            && event.object_digest == digest
+    })
+}
+
+/// List all control frame digests for the provided session.
+pub fn list_control_frames(log: &SepLog, session_id: &str) -> Vec<[u8; 32]> {
+    log.events
+        .iter()
+        .filter(|event| {
+            event.session_id == session_id
+                && matches!(event.event_type, SepEventType::EvControlFrame)
+        })
+        .map(|event| event.object_digest)
+        .collect()
+}
+
+/// List all signal frame digests for the provided session.
+pub fn list_signal_frames(log: &SepLog, session_id: &str) -> Vec<[u8; 32]> {
+    log.events
+        .iter()
+        .filter(|event| {
+            event.session_id == session_id
+                && matches!(event.event_type, SepEventType::EvSignalFrame)
+        })
+        .map(|event| event.object_digest)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use keys::KeyStore;
+    use sep::{FrameEventKind, SepLog};
     use std::collections::HashSet;
     use vrf::VrfEngine;
 
@@ -129,5 +163,34 @@ mod tests {
             mutated.attestation_key_id,
             store.key_epoch_history.list()[0].attestation_key_id
         );
+    }
+
+    #[test]
+    fn frame_queries_return_digests() {
+        let mut log = SepLog::default();
+        let control_digest = [7u8; 32];
+        let signal_digest = [8u8; 32];
+
+        log.append_frame_event(
+            "session-1".to_string(),
+            FrameEventKind::ControlFrame,
+            control_digest,
+            vec![],
+        );
+        log.append_frame_event(
+            "session-1".to_string(),
+            FrameEventKind::SignalFrame,
+            signal_digest,
+            vec![],
+        );
+
+        assert!(has_control_frame_digest(&log, "session-1", control_digest));
+        assert!(!has_control_frame_digest(&log, "session-1", signal_digest));
+
+        let controls = list_control_frames(&log, "session-1");
+        assert_eq!(controls, vec![control_digest]);
+
+        let signals = list_signal_frames(&log, "session-1");
+        assert_eq!(signals, vec![signal_digest]);
     }
 }

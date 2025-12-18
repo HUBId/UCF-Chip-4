@@ -12,6 +12,7 @@ pub struct ReceiptInput {
     pub commit_type: protocol::CommitType,
     pub bindings: protocol::CommitBindings,
     pub required_checks: Vec<protocol::RequiredCheck>,
+    pub required_receipt_kind: protocol::RequiredReceiptKind,
     pub payload_digests: Vec<[u8; 32]>,
     pub epoch_id: u64,
 }
@@ -35,6 +36,8 @@ pub fn compute_receipt_digest(
     hasher.update(&req.bindings.prev_record_digest.0);
     update_optional_digest_hasher(&mut hasher, &req.bindings.profile_digest);
     update_optional_digest_hasher(&mut hasher, &req.bindings.tool_profile_digest);
+
+    hasher.update(required_receipt_kind_label(&req.required_receipt_kind).as_bytes());
 
     for check in &req.required_checks {
         hasher.update(required_check_label(check).as_bytes());
@@ -81,6 +84,7 @@ pub fn issue_receipt(
         commit_type: req.commit_type.clone(),
         bindings: req.bindings.clone(),
         required_checks: req.required_checks.clone(),
+        required_receipt_kind: req.required_receipt_kind,
         payload_digests: req.payload_digests.iter().copied().map(Digest32).collect(),
         epoch_id: req.epoch_id,
         status,
@@ -249,6 +253,7 @@ fn commit_type_label(commit_type: &protocol::CommitType) -> &'static str {
         protocol::CommitType::PevUpdate => "PevUpdate",
         protocol::CommitType::CbvUpdate => "CbvUpdate",
         protocol::CommitType::KeyEpochUpdate => "KeyEpochUpdate",
+        protocol::CommitType::FrameEvidenceAppend => "FrameEvidenceAppend",
     }
 }
 
@@ -258,6 +263,17 @@ fn required_check_label(check: &protocol::RequiredCheck) -> &'static str {
         protocol::RequiredCheck::BindingOk => "BindingOk",
         protocol::RequiredCheck::TightenOnly => "TightenOnly",
         protocol::RequiredCheck::IntegrityOk => "IntegrityOk",
+    }
+}
+
+fn required_receipt_kind_label(kind: &protocol::RequiredReceiptKind) -> &'static str {
+    match kind {
+        protocol::RequiredReceiptKind::Read => "READ",
+        protocol::RequiredReceiptKind::Transform => "TRANSFORM",
+        protocol::RequiredReceiptKind::Write => "WRITE",
+        protocol::RequiredReceiptKind::Execute => "EXECUTE",
+        protocol::RequiredReceiptKind::Export => "EXPORT",
+        protocol::RequiredReceiptKind::Persist => "PERSIST",
     }
 }
 
@@ -323,7 +339,9 @@ fn current_timestamp_ms() -> u64 {
 mod tests {
     use super::*;
     use keys::KeyStore;
-    use ucf_protocol::ucf::v1::{CommitBindings, CommitType, Digest32, ReasonCodes, RequiredCheck};
+    use ucf_protocol::ucf::v1::{
+        CommitBindings, CommitType, Digest32, ReasonCodes, RequiredCheck, RequiredReceiptKind,
+    };
 
     fn sample_request() -> ReceiptInput {
         ReceiptInput {
@@ -339,6 +357,7 @@ mod tests {
                 profile_digest: Some(Digest32([4u8; 32])),
                 tool_profile_digest: None,
             },
+            required_receipt_kind: RequiredReceiptKind::Read,
             required_checks: vec![RequiredCheck::SchemaOk],
             payload_digests: vec![[5u8; 32]],
             epoch_id: 1,

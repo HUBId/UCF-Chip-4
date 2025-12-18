@@ -3,7 +3,7 @@
 use blake3::Hasher;
 use keys::{verify_key_epoch_signature, KeyEpochHistory, KeyStore};
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
-use sep::{SepEventType, SepLog};
+use sep::{FrameEventKind, SepEventType, SepLog};
 use std::collections::HashSet;
 use ucf_protocol::ucf::v1::{
     self as protocol, Digest32, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReceiptStatus,
@@ -26,6 +26,7 @@ pub enum CommitType {
     PevUpdate,
     CbvUpdate,
     KeyEpochUpdate,
+    FrameEvidenceAppend,
 }
 
 /// Required checks requested by the caller.
@@ -52,17 +53,7 @@ pub struct CommitBindings {
     pub tool_profile_digest: Option<[u8; 32]>,
 }
 
-/// Receipt kinds indicating the action class required by the caller.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequiredReceiptKind {
-    Read,
-    Transform,
-    Write,
-    Execute,
-    Export,
-    Persist,
-}
+pub use protocol::RequiredReceiptKind;
 
 /// A PVGS commit request encompassing bindings and payload digests.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -179,11 +170,27 @@ pub fn compute_key_epoch_record_digest(
     *hasher.finalize().as_bytes()
 }
 
-fn event_type_for_commit(commit_type: CommitType) -> SepEventType {
+fn event_type_for_commit(
+    commit_type: CommitType,
+    frame_kind: Option<FrameEventKind>,
+) -> SepEventType {
     match commit_type {
         CommitType::ReceiptRequest => SepEventType::EvDecision,
         CommitType::KeyEpochUpdate => SepEventType::EvKeyEpoch,
+        CommitType::FrameEvidenceAppend => match frame_kind {
+            Some(FrameEventKind::ControlFrame) => SepEventType::EvControlFrame,
+            Some(FrameEventKind::SignalFrame) => SepEventType::EvSignalFrame,
+            None => SepEventType::EvRecoveryGov,
+        },
         _ => SepEventType::EvRecoveryGov,
+    }
+}
+
+fn frame_event_kind_for_request(req: &PvgsCommitRequest) -> FrameEventKind {
+    if req.bindings.profile_digest.is_some() {
+        FrameEventKind::ControlFrame
+    } else {
+        FrameEventKind::SignalFrame
     }
 }
 
@@ -198,6 +205,7 @@ fn to_receipt_input(req: &PvgsCommitRequest) -> ReceiptInput {
             .copied()
             .map(Into::into)
             .collect(),
+        required_receipt_kind: req.required_receipt_kind.into(),
         payload_digests: req.payload_digests.clone(),
         epoch_id: req.epoch_id,
     }
@@ -217,6 +225,8 @@ pub fn verify_and_commit(
     } else {
         None
     };
+    let frame_event_kind = (req.commit_type == CommitType::FrameEvidenceAppend)
+        .then(|| frame_event_kind_for_request(&req));
 
     if req.epoch_id != keystore.current_epoch() {
         reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
@@ -227,6 +237,7 @@ pub fn verify_and_commit(
             reject_reason_codes,
             store,
             keystore,
+            frame_event_kind,
             key_epoch_event_digest,
         );
     }
@@ -240,6 +251,7 @@ pub fn verify_and_commit(
             reject_reason_codes,
             store,
             keystore,
+            frame_event_kind,
             key_epoch_event_digest,
         );
     }
@@ -256,6 +268,7 @@ pub fn verify_and_commit(
             reject_reason_codes,
             store,
             keystore,
+            frame_event_kind,
             key_epoch_event_digest,
         );
     }
@@ -272,8 +285,38 @@ pub fn verify_and_commit(
             reject_reason_codes,
             store,
             keystore,
+            frame_event_kind,
             key_epoch_event_digest,
         );
+    }
+
+    if req.commit_type == CommitType::FrameEvidenceAppend {
+        let mut frame_reject_reason_codes = Vec::new();
+        let has_required_checks = req.required_checks.contains(&RequiredCheck::SchemaOk)
+            && req.required_checks.contains(&RequiredCheck::BindingOk);
+
+        if !has_required_checks {
+            frame_reject_reason_codes
+                .push(protocol::ReasonCodes::GV_FRAME_EVIDENCE_REQUIRED_CHECK.to_string());
+        }
+
+        if req.payload_digests.len() != 1 {
+            frame_reject_reason_codes
+                .push(protocol::ReasonCodes::GV_FRAME_EVIDENCE_PAYLOAD_INVALID.to_string());
+        }
+
+        if !frame_reject_reason_codes.is_empty() {
+            return finalize_receipt(
+                &req,
+                &receipt_input,
+                ReceiptStatus::Rejected,
+                frame_reject_reason_codes,
+                store,
+                keystore,
+                frame_event_kind,
+                key_epoch_event_digest,
+            );
+        }
     }
 
     if req.commit_type == CommitType::ReceiptRequest
@@ -289,6 +332,7 @@ pub fn verify_and_commit(
             reject_reason_codes,
             store,
             keystore,
+            frame_event_kind,
             key_epoch_event_digest,
         );
     }
@@ -318,6 +362,7 @@ pub fn verify_and_commit(
                 reject_reason_codes,
                 store,
                 keystore,
+                frame_event_kind,
                 key_epoch_event_digest,
             );
         }
@@ -337,6 +382,7 @@ pub fn verify_and_commit(
                     reject_reason_codes,
                     store,
                     keystore,
+                    frame_event_kind,
                     key_epoch_payload_digest(&req),
                 );
             }
@@ -401,21 +447,111 @@ pub fn verify_and_commit(
         store.committed_payload_digests.insert(payload_digest);
     }
 
+    let frame_payload_digest = if req.commit_type == CommitType::FrameEvidenceAppend {
+        req.payload_digests.first().copied()
+    } else {
+        None
+    };
+
     let event_object_digest = if let Some((_, payload_digest)) = key_epoch_context.as_ref() {
         *payload_digest
+    } else if let Some(frame_digest) = frame_payload_digest {
+        frame_digest
     } else {
         receipt.receipt_digest.0
     };
-    let event_type = event_type_for_commit(req.commit_type);
+    let event_type = event_type_for_commit(req.commit_type, frame_event_kind);
 
-    store.sep_log.append_event(
-        req.commit_id.clone(),
-        event_type,
-        event_object_digest,
-        receipt.reject_reason_codes.clone(),
-    );
+    if matches!(req.commit_type, CommitType::FrameEvidenceAppend) {
+        let kind = frame_event_kind.unwrap_or(FrameEventKind::SignalFrame);
+        store.sep_log.append_frame_event(
+            req.commit_id.clone(),
+            kind,
+            event_object_digest,
+            receipt.reject_reason_codes.clone(),
+        );
+    } else {
+        store.sep_log.append_event(
+            req.commit_id.clone(),
+            event_type,
+            event_object_digest,
+            receipt.reject_reason_codes.clone(),
+        );
+    }
 
     (receipt, Some(proof_receipt))
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletenessStatus {
+    Pass,
+    Degraded,
+    Fail,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletenessResult {
+    pub status: CompletenessStatus,
+    pub reason_codes: Vec<String>,
+}
+
+impl CompletenessResult {
+    fn pass() -> Self {
+        Self {
+            status: CompletenessStatus::Pass,
+            reason_codes: Vec::new(),
+        }
+    }
+
+    fn degraded(reason_codes: Vec<String>) -> Self {
+        Self {
+            status: CompletenessStatus::Degraded,
+            reason_codes,
+        }
+    }
+}
+
+fn is_side_effecting(kind: &RequiredReceiptKind) -> bool {
+    matches!(
+        kind,
+        RequiredReceiptKind::Write
+            | RequiredReceiptKind::Execute
+            | RequiredReceiptKind::Export
+            | RequiredReceiptKind::Persist
+    )
+}
+
+/// Evaluate completeness rule CF1 ensuring control frame evidence exists for side-effect receipts.
+pub fn evaluate_completeness(receipt: &PVGSReceipt, sep_log: &SepLog) -> CompletenessResult {
+    if receipt.status != ReceiptStatus::Accepted {
+        return CompletenessResult::pass();
+    }
+
+    if !is_side_effecting(&receipt.required_receipt_kind) {
+        return CompletenessResult::pass();
+    }
+
+    let Some(profile_digest) = receipt.bindings.profile_digest.as_ref().map(|d| d.0) else {
+        return CompletenessResult::degraded(vec![
+            protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()
+        ]);
+    };
+
+    let found = sep_log.events.iter().any(|event| {
+        event.session_id == receipt.commit_id
+            && matches!(event.event_type, SepEventType::EvControlFrame)
+            && event.object_digest == profile_digest
+    });
+
+    if found {
+        CompletenessResult::pass()
+    } else {
+        CompletenessResult::degraded(vec![
+            protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()
+        ])
+    }
 }
 
 fn key_epoch_payload_digest(req: &PvgsCommitRequest) -> Option<[u8; 32]> {
@@ -494,6 +630,7 @@ fn finalize_receipt(
     mut reject_reason_codes: Vec<String>,
     store: &mut PvgsStore,
     keystore: &KeyStore,
+    frame_kind: Option<FrameEventKind>,
     event_object_digest: Option<[u8; 32]>,
 ) -> (PVGSReceipt, Option<ProofReceipt>) {
     if matches!(status, ReceiptStatus::Rejected) && reject_reason_codes.is_empty() {
@@ -505,16 +642,26 @@ fn finalize_receipt(
     }
 
     let receipt = issue_receipt(receipt_input, status, reject_reason_codes, keystore);
-    let event_type = event_type_for_commit(req.commit_type);
+    let event_type = event_type_for_commit(req.commit_type, frame_kind);
 
     let object_digest = event_object_digest.unwrap_or(receipt.receipt_digest.0);
 
-    store.sep_log.append_event(
-        req.commit_id.clone(),
-        event_type,
-        object_digest,
-        receipt.reject_reason_codes.clone(),
-    );
+    if matches!(req.commit_type, CommitType::FrameEvidenceAppend) {
+        let kind = frame_kind.unwrap_or(FrameEventKind::SignalFrame);
+        store.sep_log.append_frame_event(
+            req.commit_id.clone(),
+            kind,
+            object_digest,
+            receipt.reject_reason_codes.clone(),
+        );
+    } else {
+        store.sep_log.append_event(
+            req.commit_id.clone(),
+            event_type,
+            object_digest,
+            receipt.reject_reason_codes.clone(),
+        );
+    }
 
     (receipt, None)
 }
@@ -566,6 +713,7 @@ impl From<CommitType> for protocol::CommitType {
             CommitType::PevUpdate => protocol::CommitType::PevUpdate,
             CommitType::CbvUpdate => protocol::CommitType::CbvUpdate,
             CommitType::KeyEpochUpdate => protocol::CommitType::KeyEpochUpdate,
+            CommitType::FrameEvidenceAppend => protocol::CommitType::FrameEvidenceAppend,
         }
     }
 }
@@ -979,5 +1127,91 @@ mod tests {
             receipt.reject_reason_codes,
             vec![ReasonCodes::GV_KEY_EPOCH_DUPLICATE.to_string()]
         );
+    }
+
+    #[test]
+    fn frame_evidence_commit_logs_event() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let req = PvgsCommitRequest {
+            commit_id: "frame-commit".to_string(),
+            commit_type: CommitType::FrameEvidenceAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: prev,
+                profile_digest: Some([1u8; 32]),
+                tool_profile_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Write,
+            required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+            payload_digests: vec![[1u8; 32]],
+            epoch_id: 1,
+            key_epoch: None,
+        };
+
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof.is_some());
+
+        let last_event = store.sep_log.events.last().expect("missing frame event");
+        assert_eq!(last_event.event_type, SepEventType::EvControlFrame);
+        assert_eq!(last_event.object_digest, [1u8; 32]);
+    }
+
+    #[test]
+    fn completeness_rule_passes_when_control_frame_logged() {
+        let prev = [9u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let profile_digest = [4u8; 32];
+        store.sep_log.append_frame_event(
+            "session-pass".to_string(),
+            FrameEventKind::ControlFrame,
+            profile_digest,
+            vec![],
+        );
+
+        let mut req = make_request(prev);
+        req.commit_id = "session-pass".to_string();
+        req.required_receipt_kind = RequiredReceiptKind::Write;
+        req.bindings.profile_digest = Some(profile_digest);
+        req.bindings.tool_profile_digest = Some([5u8; 32]);
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        let result = evaluate_completeness(&receipt, &store.sep_log);
+
+        assert_eq!(result.status, CompletenessStatus::Pass);
+        assert!(result.reason_codes.is_empty());
+    }
+
+    #[test]
+    fn completeness_rule_degrades_when_missing_control_frame() {
+        let prev = [3u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let mut req = make_request(prev);
+        req.commit_id = "session-degraded".to_string();
+        req.required_receipt_kind = RequiredReceiptKind::Export;
+        req.bindings.profile_digest = Some([6u8; 32]);
+        req.bindings.tool_profile_digest = Some([7u8; 32]);
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        let result = evaluate_completeness(&receipt, &store.sep_log);
+
+        assert_eq!(result.status, CompletenessStatus::Degraded);
+        assert!(result
+            .reason_codes
+            .contains(&ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()));
     }
 }
