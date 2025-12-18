@@ -26,12 +26,14 @@ fn main() {
             prev_record_digest: [0u8; 32],
             profile_digest: Some([0u8; 32]),
             tool_profile_digest: None,
+            pev_digest: None,
         },
         required_receipt_kind: pvgs::RequiredReceiptKind::Read,
         required_checks: vec![RequiredCheck::IntegrityOk],
         payload_digests: vec![[3u8; 32]],
         epoch_id: 0,
         key_epoch: None,
+        experience_record_payload: None,
     };
 
     let keystore = KeyStore::new_dev_keystore(0);
@@ -80,6 +82,7 @@ fn main() {
         compute_ruleset_digest(
             commit_request.bindings.charter_version_digest.as_bytes(),
             commit_request.bindings.policy_version_digest.as_bytes(),
+            None,
         ),
         verified_fields_digest,
         vrf_digest,

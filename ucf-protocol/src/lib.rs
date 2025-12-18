@@ -3,6 +3,7 @@
 /// Protocol-level types for UCF interactions.
 pub mod ucf {
     pub mod v1 {
+        use prost::{Enumeration, Message};
         #[cfg(feature = "serde")]
         use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,20 @@ pub mod ucf {
             pub fn zero() -> Self {
                 Self([0u8; 32])
             }
+
+            pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+                if bytes.len() != 32 {
+                    return None;
+                }
+
+                let mut digest = [0u8; 32];
+                digest.copy_from_slice(bytes);
+                Some(Self(digest))
+            }
+
+            pub fn to_vec(&self) -> Vec<u8> {
+                self.0.to_vec()
+            }
         }
 
         /// Commit categories supported by the PVGS.
@@ -23,6 +38,7 @@ pub mod ucf {
         pub enum CommitType {
             ReceiptRequest,
             RecordAppend,
+            ExperienceRecordAppend,
             MilestoneAppend,
             CharterUpdate,
             ToolRegistryUpdate,
@@ -67,6 +83,7 @@ pub mod ucf {
             pub prev_record_digest: Digest32,
             pub profile_digest: Option<Digest32>,
             pub tool_profile_digest: Option<Digest32>,
+            pub pev_digest: Option<Digest32>,
         }
 
         /// Acceptance status for PVGS receipts.
@@ -184,12 +201,15 @@ pub mod ucf {
                 "RC.GV.FRAME_EVIDENCE.REQUIRED_CHECK";
             pub const GV_FRAME_EVIDENCE_PAYLOAD_INVALID: &'static str =
                 "RC.GV.FRAME_EVIDENCE.PAYLOAD_INVALID";
+            pub const GE_VALIDATION_SCHEMA_INVALID: &'static str =
+                "RC.GE.VALIDATION.SCHEMA_INVALID";
         }
 
         /// Lightweight reference type for future graph links.
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-        #[derive(Clone, Debug, PartialEq, Eq)]
+        #[derive(Clone, PartialEq, Eq, Message)]
         pub struct Ref {
+            #[prost(string, tag = "1")]
             pub id: String,
         }
 
@@ -215,6 +235,87 @@ pub mod ucf {
         pub struct SignalFrame {
             pub integrity: IntegrityState,
             pub receipt_stats: Option<ReceiptStats>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum RecordType {
+            Unspecified = 0,
+            RtActionExec = 1,
+            RtOutput = 2,
+            RtPerception = 3,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct CoreFrame {
+            #[prost(message, repeated, tag = "1")]
+            pub evidence_refs: Vec<Ref>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct MetabolicFrame {
+            #[prost(bytes = "vec", optional, tag = "1")]
+            pub profile_digest: Option<Vec<u8>>,
+            #[prost(message, repeated, tag = "2")]
+            pub outcome_refs: Vec<Ref>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct GovernanceFrame {
+            #[prost(message, repeated, tag = "1")]
+            pub policy_decision_refs: Vec<Ref>,
+            #[prost(message, optional, tag = "2")]
+            pub pvgs_receipt_ref: Option<Ref>,
+            #[prost(message, repeated, tag = "3")]
+            pub dlp_refs: Vec<Ref>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct FinalizationHeader {
+            #[prost(uint64, tag = "1")]
+            pub experience_id: u64,
+            #[prost(uint64, tag = "2")]
+            pub timestamp_ms: u64,
+            #[prost(bytes = "vec", tag = "3")]
+            pub prev_record_digest: Vec<u8>,
+            #[prost(bytes = "vec", tag = "4")]
+            pub record_digest: Vec<u8>,
+            #[prost(string, tag = "5")]
+            pub charter_version_digest: String,
+            #[prost(string, tag = "6")]
+            pub policy_version_digest: String,
+            #[prost(uint64, tag = "7")]
+            pub key_epoch_id: u64,
+            #[prost(message, optional, tag = "8")]
+            pub proof_receipt_ref: Option<Ref>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct ExperienceRecord {
+            #[prost(enumeration = "RecordType", tag = "1")]
+            pub record_type: i32,
+            #[prost(message, optional, tag = "2")]
+            pub core_frame: Option<CoreFrame>,
+            #[prost(message, optional, tag = "3")]
+            pub metabolic_frame: Option<MetabolicFrame>,
+            #[prost(message, optional, tag = "4")]
+            pub governance_frame: Option<GovernanceFrame>,
+            #[prost(message, optional, tag = "5")]
+            pub core_frame_ref: Option<Ref>,
+            #[prost(message, optional, tag = "6")]
+            pub metabolic_frame_ref: Option<Ref>,
+            #[prost(message, optional, tag = "7")]
+            pub governance_frame_ref: Option<Ref>,
+            #[prost(message, repeated, tag = "8")]
+            pub dlp_refs: Vec<Ref>,
+            #[prost(message, optional, tag = "9")]
+            pub finalization_header: Option<FinalizationHeader>,
         }
     }
 }

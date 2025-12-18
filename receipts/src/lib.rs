@@ -36,6 +36,7 @@ pub fn compute_receipt_digest(
     hasher.update(&req.bindings.prev_record_digest.0);
     update_optional_digest_hasher(&mut hasher, &req.bindings.profile_digest);
     update_optional_digest_hasher(&mut hasher, &req.bindings.tool_profile_digest);
+    update_optional_digest_hasher(&mut hasher, &req.bindings.pev_digest);
 
     hasher.update(required_receipt_kind_label(&req.required_receipt_kind).as_bytes());
 
@@ -200,6 +201,10 @@ fn pvgs_attestation_preimage(receipt: &PVGSReceipt) -> Vec<u8> {
         &mut preimage,
         &receipt.bindings.tool_profile_digest.as_ref().map(|d| d.0),
     );
+    update_optional_digest(
+        &mut preimage,
+        &receipt.bindings.pev_digest.as_ref().map(|d| d.0),
+    );
 
     let mut reason_codes = receipt.reject_reason_codes.clone();
     reason_codes.sort();
@@ -246,6 +251,7 @@ fn commit_type_label(commit_type: &protocol::CommitType) -> &'static str {
     match commit_type {
         protocol::CommitType::ReceiptRequest => "ReceiptRequest",
         protocol::CommitType::RecordAppend => "RecordAppend",
+        protocol::CommitType::ExperienceRecordAppend => "ExperienceRecordAppend",
         protocol::CommitType::MilestoneAppend => "MilestoneAppend",
         protocol::CommitType::CharterUpdate => "CharterUpdate",
         protocol::CommitType::ToolRegistryUpdate => "ToolRegistryUpdate",
@@ -356,6 +362,7 @@ mod tests {
                 prev_record_digest: Digest32([3u8; 32]),
                 profile_digest: Some(Digest32([4u8; 32])),
                 tool_profile_digest: None,
+                pev_digest: None,
             },
             required_receipt_kind: RequiredReceiptKind::Read,
             required_checks: vec![RequiredCheck::SchemaOk],
