@@ -15,6 +15,10 @@ pub enum SepEventType {
     EvKeyEpoch,
     EvControlFrame,
     EvSignalFrame,
+    EvOutcome,
+    EvProfileChange,
+    EvAgentStep,
+    EvIntent,
 }
 
 impl SepEventType {
@@ -25,6 +29,10 @@ impl SepEventType {
             SepEventType::EvKeyEpoch => "EV_KEY_EPOCH",
             SepEventType::EvControlFrame => "EV_CONTROL_FRAME",
             SepEventType::EvSignalFrame => "EV_SIGNAL_FRAME",
+            SepEventType::EvOutcome => "EV_OUTCOME",
+            SepEventType::EvProfileChange => "EV_PROFILE_CHANGE",
+            SepEventType::EvAgentStep => "EV_AGENT_STEP",
+            SepEventType::EvIntent => "EV_INTENT",
         }
     }
 }

@@ -2,11 +2,14 @@
 
 use blake3::Hasher;
 use keys::{verify_key_epoch_signature, KeyEpochHistory, KeyStore};
+use prost::Message;
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
 use sep::{FrameEventKind, SepEventType, SepLog};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 use ucf_protocol::ucf::v1::{
-    self as protocol, Digest32, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReceiptStatus,
+    self as protocol, Digest32, ExperienceRecord, FinalizationHeader, PVGSKeyEpoch, PVGSReceipt,
+    ProofReceipt, ReceiptStatus, RecordType, Ref,
 };
 use vrf::VrfEngine;
 
@@ -19,6 +22,7 @@ use serde::{Deserialize, Serialize};
 pub enum CommitType {
     ReceiptRequest,
     RecordAppend,
+    ExperienceRecordAppend,
     MilestoneAppend,
     CharterUpdate,
     ToolRegistryUpdate,
@@ -51,6 +55,7 @@ pub struct CommitBindings {
     pub prev_record_digest: [u8; 32],
     pub profile_digest: Option<[u8; 32]>,
     pub tool_profile_digest: Option<[u8; 32]>,
+    pub pev_digest: Option<[u8; 32]>,
 }
 
 pub use protocol::RequiredReceiptKind;
@@ -67,18 +72,30 @@ pub struct PvgsCommitRequest {
     pub payload_digests: Vec<[u8; 32]>,
     pub epoch_id: u64,
     pub key_epoch: Option<PVGSKeyEpoch>,
+    pub experience_record_payload: Option<Vec<u8>>,
+}
+
+/// In-memory store tracking experience records and proof receipts.
+#[derive(Debug, Clone, Default)]
+pub struct ExperienceStore {
+    pub records: Vec<ExperienceRecord>,
+    pub head_record_digest: [u8; 32],
+    pub head_id: u64,
+    pub proof_receipts: HashMap<[u8; 32], ProofReceipt>,
 }
 
 /// In-memory store tracking PVGS state and SEP event log.
 #[derive(Debug, Clone)]
 pub struct PvgsStore {
     pub current_head_record_digest: [u8; 32],
+    pub experience_store: ExperienceStore,
     pub known_charter_versions: HashSet<String>,
     pub known_policy_versions: HashSet<String>,
     pub known_profiles: HashSet<[u8; 32]>,
     pub key_epoch_history: KeyEpochHistory,
     pub committed_payload_digests: HashSet<[u8; 32]>,
     pub sep_log: SepLog,
+    pub receipt_gate_enabled: bool,
 }
 
 impl PvgsStore {
@@ -88,24 +105,62 @@ impl PvgsStore {
         known_policy_versions: HashSet<String>,
         known_profiles: HashSet<[u8; 32]>,
     ) -> Self {
+        let experience_store = ExperienceStore {
+            head_record_digest: current_head_record_digest,
+            ..Default::default()
+        };
         Self {
             current_head_record_digest,
+            experience_store,
             known_charter_versions,
             known_policy_versions,
             known_profiles,
             key_epoch_history: KeyEpochHistory::default(),
             committed_payload_digests: HashSet::new(),
             sep_log: SepLog::default(),
+            receipt_gate_enabled: false,
         }
+    }
+
+    pub fn append_record(
+        &mut self,
+        record: ExperienceRecord,
+        record_digest: [u8; 32],
+        proof_receipt: ProofReceipt,
+    ) {
+        self.current_head_record_digest = record_digest;
+        self.experience_store
+            .append(record, record_digest, proof_receipt);
     }
 }
 
-/// Compute a digest over the ruleset inputs (charter + policy).
-pub fn compute_ruleset_digest(charter_digest: &[u8], policy_digest: &[u8]) -> [u8; 32] {
+impl ExperienceStore {
+    pub fn append(
+        &mut self,
+        record: ExperienceRecord,
+        record_digest: [u8; 32],
+        proof_receipt: ProofReceipt,
+    ) {
+        self.records.push(record);
+        self.head_record_digest = record_digest;
+        self.head_id = self.head_id.saturating_add(1);
+        self.proof_receipts.insert(record_digest, proof_receipt);
+    }
+}
+
+/// Compute a digest over the ruleset inputs (charter + policy + optional PEV).
+pub fn compute_ruleset_digest(
+    charter_digest: &[u8],
+    policy_digest: &[u8],
+    pev_digest: Option<&[u8]>,
+) -> [u8; 32] {
     let mut hasher = Hasher::new();
     hasher.update(b"UCF:HASH:RULESET");
     hasher.update(charter_digest);
     hasher.update(policy_digest);
+    if let Some(pev) = pev_digest {
+        hasher.update(pev);
+    }
     *hasher.finalize().as_bytes()
 }
 
@@ -125,8 +180,34 @@ pub fn compute_verified_fields_digest(
     hasher.update(&bindings.prev_record_digest);
     update_optional_digest(&mut hasher, &bindings.profile_digest);
     update_optional_digest(&mut hasher, &bindings.tool_profile_digest);
+    update_optional_digest(&mut hasher, &bindings.pev_digest);
     hasher.update(required_receipt_kind_label(&required_receipt_kind).as_bytes());
 
+    *hasher.finalize().as_bytes()
+}
+
+/// Compute the canonical digest of an experience record.
+pub fn compute_experience_record_digest(record: &ExperienceRecord) -> [u8; 32] {
+    let mut canonical = record.clone();
+    canonical.finalization_header = None;
+    let bytes = canonical.encode_to_vec();
+    let mut hasher = Hasher::new();
+    hasher.update(b"UCF:HASH:EXPERIENCE_RECORD");
+    hasher.update(&bytes);
+    *hasher.finalize().as_bytes()
+}
+
+/// Compute the verified fields digest for experience record appends.
+pub fn compute_experience_verified_fields_digest(
+    prev_record_digest: [u8; 32],
+    record_digest: [u8; 32],
+    experience_id: u64,
+) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(b"UCF:HASH:VERIFIED_FIELDS");
+    hasher.update(&prev_record_digest);
+    hasher.update(&record_digest);
+    hasher.update(&experience_id.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 
@@ -177,6 +258,7 @@ fn event_type_for_commit(
     match commit_type {
         CommitType::ReceiptRequest => SepEventType::EvDecision,
         CommitType::KeyEpochUpdate => SepEventType::EvKeyEpoch,
+        CommitType::ExperienceRecordAppend => SepEventType::EvIntent,
         CommitType::FrameEvidenceAppend => match frame_kind {
             Some(FrameEventKind::ControlFrame) => SepEventType::EvControlFrame,
             Some(FrameEventKind::SignalFrame) => SepEventType::EvSignalFrame,
@@ -218,6 +300,10 @@ pub fn verify_and_commit(
     keystore: &KeyStore,
     vrf_engine: &VrfEngine,
 ) -> (PVGSReceipt, Option<ProofReceipt>) {
+    if req.commit_type == CommitType::ExperienceRecordAppend {
+        return verify_experience_record_append(req, store, keystore, vrf_engine);
+    }
+
     let receipt_input = to_receipt_input(&req);
     let mut reject_reason_codes = Vec::new();
     let key_epoch_event_digest = if req.commit_type == CommitType::KeyEpochUpdate {
@@ -432,6 +518,7 @@ pub fn verify_and_commit(
         compute_ruleset_digest(
             req.bindings.charter_version_digest.as_bytes(),
             req.bindings.policy_version_digest.as_bytes(),
+            req.bindings.pev_digest.as_ref().map(|d| d.as_slice()),
         ),
         verified_fields_digest,
         vrf_digest,
@@ -480,6 +567,364 @@ pub fn verify_and_commit(
     }
 
     (receipt, Some(proof_receipt))
+}
+
+fn verify_experience_record_append(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+    vrf_engine: &VrfEngine,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let payload_digest = req
+        .experience_record_payload
+        .as_ref()
+        .map(|payload| *blake3::hash(payload).as_bytes());
+    if let Some(digest) = payload_digest {
+        req.payload_digests = vec![digest];
+    }
+
+    let receipt_input = to_receipt_input(&req);
+    let mut reject_reason_codes = Vec::new();
+
+    if req.epoch_id != keystore.current_epoch() {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: payload_digest,
+        });
+    }
+
+    if req.bindings.prev_record_digest != store.current_head_record_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: payload_digest,
+        });
+    }
+
+    if !store
+        .known_charter_versions
+        .contains(&req.bindings.charter_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_CHARTER_SCOPE.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: payload_digest,
+        });
+    }
+
+    if !store
+        .known_policy_versions
+        .contains(&req.bindings.policy_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_INTEGRITY_REQUIRED.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: payload_digest,
+        });
+    }
+
+    let payload = match req.experience_record_payload.take() {
+        Some(p) => p,
+        None => {
+            reject_reason_codes
+                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes,
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: payload_digest,
+            });
+        }
+    };
+
+    let mut record = match ExperienceRecord::decode(payload.as_slice()) {
+        Ok(record) => record,
+        Err(_) => {
+            reject_reason_codes
+                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes,
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: payload_digest,
+            });
+        }
+    };
+
+    if let Err(reasons) = validate_experience_record(&record, store) {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: reasons,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: payload_digest,
+        });
+    }
+
+    let record_digest = compute_experience_record_digest(&record);
+    let experience_id = store.experience_store.head_id.saturating_add(1);
+    let key_epoch_id = keystore.current_epoch();
+    let mut finalization_header =
+        build_finalization_header(&req, record_digest, experience_id, key_epoch_id);
+
+    let verified_fields_digest = compute_experience_verified_fields_digest(
+        store.current_head_record_digest,
+        record_digest,
+        experience_id,
+    );
+
+    let profile_digest = profile_digest_from_record(&record).unwrap_or([0u8; 32]);
+    let vrf_digest = vrf_engine.eval_record_vrf(
+        store.current_head_record_digest,
+        record_digest,
+        &finalization_header.charter_version_digest,
+        profile_digest,
+        key_epoch_id,
+    );
+
+    let receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        reject_reason_codes.clone(),
+        keystore,
+    );
+
+    let mut proof_receipt = issue_proof_receipt(
+        compute_ruleset_digest(
+            finalization_header.charter_version_digest.as_bytes(),
+            finalization_header.policy_version_digest.as_bytes(),
+            req.bindings.pev_digest.as_ref().map(|d| d.as_slice()),
+        ),
+        verified_fields_digest,
+        vrf_digest,
+        keystore,
+    );
+    proof_receipt.receipt_digest = receipt.receipt_digest.clone();
+
+    finalization_header.proof_receipt_ref = Some(Ref {
+        id: proof_receipt.proof_receipt_id.clone(),
+    });
+    finalization_header.prev_record_digest = digest_to_vec(store.current_head_record_digest);
+    finalization_header.record_digest = digest_to_vec(record_digest);
+    record.finalization_header = Some(finalization_header);
+
+    log_experience_events(&req.commit_id, record_digest, &record, store);
+    store.append_record(record, record_digest, proof_receipt.clone());
+
+    (receipt, Some(proof_receipt))
+}
+
+fn build_finalization_header(
+    req: &PvgsCommitRequest,
+    record_digest: [u8; 32],
+    experience_id: u64,
+    key_epoch_id: u64,
+) -> FinalizationHeader {
+    FinalizationHeader {
+        experience_id,
+        timestamp_ms: now_ms(),
+        prev_record_digest: digest_to_vec(req.bindings.prev_record_digest),
+        record_digest: digest_to_vec(record_digest),
+        charter_version_digest: req.bindings.charter_version_digest.clone(),
+        policy_version_digest: req.bindings.policy_version_digest.clone(),
+        key_epoch_id,
+        proof_receipt_ref: None,
+    }
+}
+
+fn validate_experience_record(
+    record: &ExperienceRecord,
+    store: &PvgsStore,
+) -> Result<(), Vec<String>> {
+    let Ok(record_type) = RecordType::try_from(record.record_type) else {
+        return Err(vec![
+            protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+        ]);
+    };
+
+    let mut reasons = Vec::new();
+
+    match record_type {
+        RecordType::RtActionExec => {
+            if record.governance_frame_ref.is_none() {
+                reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            }
+
+            if let Some(gov) = &record.governance_frame {
+                if gov.policy_decision_refs.is_empty() {
+                    reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+                }
+
+                if store.receipt_gate_enabled && gov.pvgs_receipt_ref.is_none() {
+                    reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+                }
+            } else if store.receipt_gate_enabled {
+                reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            }
+        }
+        RecordType::RtOutput => {
+            if record.governance_frame_ref.is_none() {
+                reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            }
+
+            if record.dlp_refs.is_empty() {
+                reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            }
+        }
+        RecordType::RtPerception => {
+            if record.core_frame_ref.is_none() {
+                reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            }
+
+            if record.metabolic_frame_ref.is_none() {
+                reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            }
+        }
+        RecordType::Unspecified => {
+            reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+        }
+    }
+
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons)
+    }
+}
+
+fn profile_digest_from_record(record: &ExperienceRecord) -> Option<[u8; 32]> {
+    record
+        .metabolic_frame
+        .as_ref()
+        .and_then(|m| m.profile_digest.as_ref())
+        .and_then(|bytes| digest_from_bytes(bytes))
+}
+
+fn log_experience_events(
+    commit_id: &str,
+    record_digest: [u8; 32],
+    record: &ExperienceRecord,
+    store: &mut PvgsStore,
+) {
+    store.sep_log.append_event(
+        commit_id.to_string(),
+        SepEventType::EvAgentStep,
+        record_digest,
+        Vec::new(),
+    );
+
+    if let Some(gov) = &record.governance_frame {
+        if !gov.policy_decision_refs.is_empty() {
+            store.sep_log.append_event(
+                commit_id.to_string(),
+                SepEventType::EvDecision,
+                record_digest,
+                Vec::new(),
+            );
+        }
+
+        if !gov.dlp_refs.is_empty() {
+            store.sep_log.append_event(
+                commit_id.to_string(),
+                SepEventType::EvOutcome,
+                record_digest,
+                Vec::new(),
+            );
+        }
+    }
+
+    if record.metabolic_frame_ref.is_some() {
+        store.sep_log.append_event(
+            commit_id.to_string(),
+            SepEventType::EvProfileChange,
+            record_digest,
+            Vec::new(),
+        );
+    }
+
+    if let Some(meta) = &record.metabolic_frame {
+        if meta.profile_digest.is_some() {
+            store.sep_log.append_event(
+                commit_id.to_string(),
+                SepEventType::EvProfileChange,
+                record_digest,
+                Vec::new(),
+            );
+        }
+
+        if !meta.outcome_refs.is_empty() {
+            store.sep_log.append_event(
+                commit_id.to_string(),
+                SepEventType::EvOutcome,
+                record_digest,
+                Vec::new(),
+            );
+        }
+    }
+
+    store.sep_log.append_event(
+        commit_id.to_string(),
+        SepEventType::EvRecoveryGov,
+        record_digest,
+        vec!["RECORD_APPEND_OK".to_string()],
+    );
+}
+
+fn digest_to_vec(digest: [u8; 32]) -> Vec<u8> {
+    digest.to_vec()
+}
+
+fn digest_from_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
+    if bytes.len() != 32 {
+        return None;
+    }
+
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(bytes);
+    Some(digest)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -718,6 +1163,7 @@ impl From<CommitType> for protocol::CommitType {
         match value {
             CommitType::ReceiptRequest => protocol::CommitType::ReceiptRequest,
             CommitType::RecordAppend => protocol::CommitType::RecordAppend,
+            CommitType::ExperienceRecordAppend => protocol::CommitType::ExperienceRecordAppend,
             CommitType::MilestoneAppend => protocol::CommitType::MilestoneAppend,
             CommitType::CharterUpdate => protocol::CommitType::CharterUpdate,
             CommitType::ToolRegistryUpdate => protocol::CommitType::ToolRegistryUpdate,
@@ -752,6 +1198,7 @@ impl From<&CommitBindings> for protocol::CommitBindings {
             prev_record_digest: Digest32(value.prev_record_digest),
             profile_digest: value.profile_digest.map(Digest32),
             tool_profile_digest: value.tool_profile_digest.map(Digest32),
+            pev_digest: value.pev_digest.map(Digest32),
         }
     }
 }
@@ -761,6 +1208,7 @@ mod tests {
     use super::*;
     use protocol::ReasonCodes;
     use receipts::verify_pvgs_receipt_attestation;
+    use ucf_protocol::ucf::v1::{GovernanceFrame, MetabolicFrame};
     use vrf::VrfEngine;
 
     fn base_store(prev_digest: [u8; 32]) -> PvgsStore {
@@ -792,12 +1240,14 @@ mod tests {
                 prev_record_digest: prev,
                 profile_digest: Some([9u8; 32]),
                 tool_profile_digest: Some([3u8; 32]),
+                pev_digest: None,
             },
             required_receipt_kind: RequiredReceiptKind::Read,
             required_checks: vec![RequiredCheck::BindingOk],
             payload_digests: vec![[4u8; 32]],
             epoch_id: 1,
             key_epoch: None,
+            experience_record_payload: None,
         }
     }
 
@@ -829,15 +1279,67 @@ mod tests {
                     prev_record_digest: store.current_head_record_digest,
                     profile_digest: Some([9u8; 32]),
                     tool_profile_digest: None,
+                    pev_digest: None,
                 },
                 required_receipt_kind: RequiredReceiptKind::Read,
                 required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
                 payload_digests: vec![epoch.announcement_digest.0],
                 epoch_id: keystore.current_epoch(),
                 key_epoch: Some(epoch.clone()),
+                experience_record_payload: None,
             },
             epoch,
         )
+    }
+
+    fn perception_record(profile_digest: [u8; 32]) -> ExperienceRecord {
+        ExperienceRecord {
+            record_type: RecordType::RtPerception as i32,
+            core_frame: None,
+            metabolic_frame: Some(MetabolicFrame {
+                profile_digest: Some(profile_digest.to_vec()),
+                outcome_refs: Vec::new(),
+            }),
+            governance_frame: None,
+            core_frame_ref: Some(Ref {
+                id: "core-ref".to_string(),
+            }),
+            metabolic_frame_ref: Some(Ref {
+                id: "met-ref".to_string(),
+            }),
+            governance_frame_ref: None,
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        }
+    }
+
+    fn make_experience_request_with_id(
+        record: &ExperienceRecord,
+        store: &PvgsStore,
+        epoch_id: u64,
+        commit_id: &str,
+    ) -> PvgsCommitRequest {
+        PvgsCommitRequest {
+            commit_id: commit_id.to_string(),
+            commit_type: CommitType::ExperienceRecordAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: profile_digest_from_record(record),
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: Vec::new(),
+            epoch_id,
+            key_epoch: None,
+            experience_record_payload: Some(record.encode_to_vec()),
+        }
     }
 
     #[test]
@@ -1067,12 +1569,14 @@ mod tests {
                 prev_record_digest: store.current_head_record_digest,
                 profile_digest: Some([9u8; 32]),
                 tool_profile_digest: None,
+                pev_digest: None,
             },
             required_receipt_kind: RequiredReceiptKind::Read,
             required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
             payload_digests: vec![backward_epoch.announcement_digest.0],
             epoch_id: keystore.current_epoch(),
             key_epoch: Some(backward_epoch),
+            experience_record_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(backward_req, &mut store, &keystore, &vrf_engine);
@@ -1124,12 +1628,14 @@ mod tests {
                 prev_record_digest: store.current_head_record_digest,
                 profile_digest: Some([9u8; 32]),
                 tool_profile_digest: None,
+                pev_digest: None,
             },
             required_receipt_kind: RequiredReceiptKind::Read,
             required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
             payload_digests: vec![epoch.announcement_digest.0],
             epoch_id: keystore.current_epoch(),
             key_epoch: Some(epoch),
+            experience_record_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(dup_req, &mut store, &keystore, &vrf_engine);
@@ -1157,12 +1663,14 @@ mod tests {
                 prev_record_digest: prev,
                 profile_digest: Some([1u8; 32]),
                 tool_profile_digest: None,
+                pev_digest: None,
             },
             required_receipt_kind: RequiredReceiptKind::Write,
             required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
             payload_digests: vec![[1u8; 32]],
             epoch_id: 1,
             key_epoch: None,
+            experience_record_payload: None,
         };
 
         let keystore = KeyStore::new_dev_keystore(1);
@@ -1175,6 +1683,143 @@ mod tests {
         let last_event = store.sep_log.events.last().expect("missing frame event");
         assert_eq!(last_event.event_type, SepEventType::EvControlFrame);
         assert_eq!(last_event.object_digest, [1u8; 32]);
+    }
+
+    #[test]
+    fn experience_perception_append_succeeds() {
+        let prev = [0u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+        let record = perception_record([5u8; 32]);
+        let req =
+            make_experience_request_with_id(&record, &store, keystore.current_epoch(), "exp-1");
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof.is_some());
+        assert_eq!(store.experience_store.head_id, 1);
+        assert_ne!(store.current_head_record_digest, prev);
+    }
+
+    #[test]
+    fn action_exec_missing_governance_ref_rejected() {
+        let prev = [0u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(3);
+        let vrf_engine = VrfEngine::new_dev(3);
+
+        let mut record = ExperienceRecord {
+            record_type: RecordType::RtActionExec as i32,
+            governance_frame: Some(GovernanceFrame::default()),
+            ..Default::default()
+        };
+        record.governance_frame_ref = None;
+
+        let req = make_experience_request_with_id(
+            &record,
+            &store,
+            keystore.current_epoch(),
+            "exp-missing-gov",
+        );
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert!(proof.is_none());
+        assert_eq!(store.current_head_record_digest, prev);
+        assert!(store.experience_store.records.is_empty());
+        assert!(receipt
+            .reject_reason_codes
+            .contains(&ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()));
+    }
+
+    #[test]
+    fn experience_record_chain_binds_prev_digest() {
+        let prev = [1u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(4);
+        let vrf_engine = VrfEngine::new_dev(4);
+
+        let first_record = perception_record([7u8; 32]);
+        let req_one = make_experience_request_with_id(
+            &first_record,
+            &store,
+            keystore.current_epoch(),
+            "exp-chain-1",
+        );
+        let _ = verify_and_commit(req_one, &mut store, &keystore, &vrf_engine);
+        let first_digest = store.current_head_record_digest;
+
+        let second_record = perception_record([8u8; 32]);
+        let req_two = make_experience_request_with_id(
+            &second_record,
+            &store,
+            keystore.current_epoch(),
+            "exp-chain-2",
+        );
+        let (receipt_two, _) = verify_and_commit(req_two, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt_two.status, ReceiptStatus::Accepted);
+
+        let appended = store
+            .experience_store
+            .records
+            .last()
+            .expect("missing appended record");
+        let header = appended
+            .finalization_header
+            .as_ref()
+            .expect("finalization header missing");
+        let prev_digest =
+            digest_from_bytes(&header.prev_record_digest).expect("invalid prev digest");
+        let record_digest =
+            digest_from_bytes(&header.record_digest).expect("invalid record digest");
+
+        assert_eq!(prev_digest, first_digest);
+        assert_eq!(store.current_head_record_digest, record_digest);
+        assert_eq!(
+            compute_experience_record_digest(&first_record),
+            compute_experience_record_digest(&first_record),
+        );
+    }
+
+    #[test]
+    fn proof_receipt_vrf_digest_is_non_zero() {
+        let prev = [0u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(5);
+        let vrf_engine = VrfEngine::new_dev(5);
+        let record = perception_record([9u8; 32]);
+        let req =
+            make_experience_request_with_id(&record, &store, keystore.current_epoch(), "exp-proof");
+
+        let (_, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        let proof = proof.expect("missing proof receipt");
+
+        assert_ne!(proof.vrf_digest, Digest32::zero());
+    }
+
+    #[test]
+    fn sep_log_updates_after_experience_append() {
+        let prev = [2u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(6);
+        let vrf_engine = VrfEngine::new_dev(6);
+        let record = perception_record([6u8; 32]);
+        let req =
+            make_experience_request_with_id(&record, &store, keystore.current_epoch(), "exp-sep");
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(!store.sep_log.events.is_empty());
+        assert!(store.sep_log.validate_chain().is_ok());
+        let has_append_ok = store.sep_log.events.iter().any(|event| {
+            event.event_type == SepEventType::EvRecoveryGov
+                && event.reason_codes.contains(&"RECORD_APPEND_OK".to_string())
+        });
+        assert!(has_append_ok);
     }
 
     #[test]
