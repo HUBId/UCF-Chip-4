@@ -801,11 +801,8 @@ fn verify_pev_update(
 
     if req.payload_digests.is_empty() {
         req.payload_digests = vec![pev_digest];
-    } else {
-        if req.payload_digests.len() != 1 || req.payload_digests[0] != pev_digest {
-            reject_reason_codes
-                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
-        }
+    } else if req.payload_digests.len() != 1 || req.payload_digests[0] != pev_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
     req.bindings.pev_digest = Some(pev_digest);
@@ -826,7 +823,7 @@ fn verify_pev_update(
         reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
     }
 
-    if let Err(_) = store.pev_store.validate_pev(&pev) {
+    if store.pev_store.validate_pev(&pev).is_err() {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
