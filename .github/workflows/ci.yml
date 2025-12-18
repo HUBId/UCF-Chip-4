@@ -19,11 +19,15 @@ jobs:
             ~/.rustup/toolchains
             ~/.rustup/update-hashes
           key: ${{ runner.os }}-rustup-stable-${{ runner.arch }}
-      - name: Use runner Rust toolchain
-        run: |
-          rustup default stable
-          rustup component add rustfmt clippy
-          rustup show active-toolchain
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+          components: rustfmt, clippy
+      - name: Show active toolchain
+        run: rustup show active-toolchain
       - name: Cache cargo
         uses: actions/cache@v4
         with:
