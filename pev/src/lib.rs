@@ -59,7 +59,7 @@ impl PevStore {
         let digest_bytes = pev
             .pev_version_digest
             .as_deref()
-            .or_else(|| pev.pev_digest.as_deref())
+            .or(pev.pev_digest.as_deref())
             .ok_or(PevError::MissingDigest)?;
 
         if digest_bytes.len() != 32 {
