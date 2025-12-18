@@ -30,6 +30,19 @@ pub mod ucf {
             PevUpdate,
             CbvUpdate,
             KeyEpochUpdate,
+            FrameEvidenceAppend,
+        }
+
+        /// Required receipt classes for PVGS commits.
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum RequiredReceiptKind {
+            Read,
+            Transform,
+            Write,
+            Execute,
+            Export,
+            Persist,
         }
 
         /// Required checks requested by the caller.
@@ -72,6 +85,7 @@ pub mod ucf {
             pub commit_type: CommitType,
             pub bindings: CommitBindings,
             pub required_checks: Vec<RequiredCheck>,
+            pub required_receipt_kind: RequiredReceiptKind,
             pub payload_digests: Vec<Digest32>,
             pub epoch_id: u64,
             pub status: ReceiptStatus,
@@ -113,6 +127,36 @@ pub mod ucf {
             pub announcement_signature: Vec<u8>,
         }
 
+        /// Control overlays included in control frames.
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Debug, PartialEq, Eq, Default)]
+        pub struct Overlays {
+            pub export_lock: bool,
+            pub novelty_lock: bool,
+            pub simulate_first: bool,
+            pub deescalation_lock: bool,
+        }
+
+        /// Control profiles that can be commanded by the governance engine.
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Profile {
+            M0,
+            M1Restricted,
+            M2Quarantine,
+            M3KillSwitch,
+        }
+
+        /// Control frame emitted by the engine with overlays and reasons.
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct ControlFrame {
+            pub profile: Profile,
+            pub overlays: Overlays,
+            pub profile_reason_codes: Vec<String>,
+            pub created_at_ms: u64,
+        }
+
         /// Alias for PVGSKeyEpoch using Rust-style casing.
         pub type PvgsKeyEpoch = PVGSKeyEpoch;
 
@@ -136,6 +180,10 @@ pub mod ucf {
                 "RC.GV.KEY_EPOCH.REQUIRED_CHECK_MISSING";
             pub const GV_KEY_EPOCH_PAYLOAD_INVALID: &'static str =
                 "RC.GV.KEY_EPOCH.PAYLOAD_INVALID";
+            pub const GV_FRAME_EVIDENCE_REQUIRED_CHECK: &'static str =
+                "RC.GV.FRAME_EVIDENCE.REQUIRED_CHECK";
+            pub const GV_FRAME_EVIDENCE_PAYLOAD_INVALID: &'static str =
+                "RC.GV.FRAME_EVIDENCE.PAYLOAD_INVALID";
         }
 
         /// Lightweight reference type for future graph links.
