@@ -1,0 +1,11 @@
+name: "Rust toolchain (vendored)"
+description: "Set stable toolchain and install rustfmt/clippy without external actions."
+runs:
+  using: "composite"
+  steps:
+    - name: Set stable toolchain
+      shell: bash
+      run: rustup default stable
+    - name: Ensure rustfmt and clippy
+      shell: bash
+      run: rustup component add rustfmt clippy
