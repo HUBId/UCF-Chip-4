@@ -34,6 +34,7 @@ fn main() {
         epoch_id: 0,
         key_epoch: None,
         experience_record_payload: None,
+        pev: None,
     };
 
     let keystore = KeyStore::new_dev_keystore(0);

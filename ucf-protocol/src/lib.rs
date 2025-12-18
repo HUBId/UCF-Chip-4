@@ -253,6 +253,28 @@ pub mod ucf {
             pub pvgs_attestation_sig: Vec<u8>,
         }
 
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct PolicyEcologyDimension {
+            #[prost(string, tag = "1")]
+            pub name: String,
+            #[prost(uint32, tag = "2")]
+            pub value: u32,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct PolicyEcologyVector {
+            #[prost(message, repeated, tag = "1")]
+            pub dimensions: Vec<PolicyEcologyDimension>,
+            #[prost(bytes = "vec", optional, tag = "2")]
+            pub pev_digest: Option<Vec<u8>>,
+            #[prost(bytes = "vec", optional, tag = "3")]
+            pub pev_version_digest: Option<Vec<u8>>,
+            #[prost(uint64, optional, tag = "4")]
+            pub pev_epoch: Option<u64>,
+        }
+
         /// Control frame emitted by the engine with overlays and reasons.
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
         #[derive(Clone, Debug, PartialEq, Eq)]
@@ -297,6 +319,7 @@ pub mod ucf {
                 "RC.GE.VALIDATION.SCHEMA_INVALID";
             pub const GV_CBV_UPDATED: &'static str = "RC.GV.CBV.UPDATED";
             pub const GV_CBV_NO_CHANGE: &'static str = "RC.GV.CBV.NO_CHANGE";
+            pub const GV_PEV_UPDATED: &'static str = "RC.GV.PEV.UPDATED";
         }
 
         /// Lightweight reference type for future graph links.

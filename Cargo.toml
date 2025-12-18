@@ -3,6 +3,7 @@ members = [
     "wire",
     "ucf-protocol",
     "pvgs",
+    "pev",
     "receipts",
     "vrf",
     "sep",

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use cbv::CharacterBaselineVector;
+use pev::{pev_digest, PolicyEcologyVector};
 use pvgs::{PvgsCommitRequest, PvgsStore};
 use sep::{SepEventInternal, SepEventType, SepLog};
 use thiserror::Error;
@@ -65,6 +66,26 @@ pub fn get_key_epoch(store: &PvgsStore, epoch_id: u64) -> Option<PVGSKeyEpoch> {
         .cloned()
 }
 
+/// Return the most recent Policy Ecology Vector if present.
+pub fn get_latest_pev(store: &PvgsStore) -> Option<PolicyEcologyVector> {
+    store.pev_store.latest().cloned()
+}
+
+/// Return the latest PEV digest if stored.
+pub fn get_latest_pev_digest(store: &PvgsStore) -> Option<[u8; 32]> {
+    store.pev_store.latest().and_then(pev_digest)
+}
+
+/// List all known PEV version digests in insertion order.
+pub fn list_pev_versions(store: &PvgsStore) -> Vec<[u8; 32]> {
+    store
+        .pev_store
+        .list()
+        .iter()
+        .filter_map(pev_digest)
+        .collect()
+}
+
 /// Return true if the SEP log contains a control frame event with the digest in the session.
 pub fn has_control_frame_digest(log: &SepLog, session_id: &str, digest: [u8; 32]) -> bool {
     log.events.iter().any(|event| {
@@ -102,6 +123,7 @@ pub fn list_signal_frames(log: &SepLog, session_id: &str) -> Vec<[u8; 32]> {
 mod tests {
     use super::*;
     use keys::KeyStore;
+    use pev::PolicyEcologyDimension;
     use sep::{FrameEventKind, SepLog};
     use std::collections::HashSet;
     use vrf::VrfEngine;
@@ -163,6 +185,35 @@ mod tests {
             mutated.attestation_key_id,
             store.key_epoch_history.list()[0].attestation_key_id
         );
+    }
+
+    #[test]
+    fn pev_queries_return_clones_and_digests() {
+        let (mut store, _, _) = store_with_epochs();
+        let pev = PolicyEcologyVector {
+            dimensions: vec![PolicyEcologyDimension {
+                name: "conservatism_bias".to_string(),
+                value: 1,
+            }],
+            pev_digest: Some([0xAB; 32].to_vec()),
+            pev_version_digest: None,
+            pev_epoch: Some(1),
+        };
+        store.pev_store.push(pev.clone()).expect("push pev");
+
+        let latest = get_latest_pev(&store).expect("missing pev");
+        assert_eq!(pev_digest(&latest), Some([0xAB; 32]));
+
+        let mut mutated = latest;
+        mutated.dimensions[0].value = 2;
+        assert_eq!(pev.dimensions[0].value, 1);
+        assert_eq!(
+            store.pev_store.latest().unwrap().dimensions[0].value,
+            pev.dimensions[0].value
+        );
+
+        assert_eq!(get_latest_pev_digest(&store), Some([0xAB; 32]));
+        assert_eq!(list_pev_versions(&store), vec![[0xAB; 32]]);
     }
 
     #[test]

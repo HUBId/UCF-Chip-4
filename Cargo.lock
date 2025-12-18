@@ -306,6 +306,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
 
 [[package]]
+name = "pev"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "ucf-protocol",
+]
+
+[[package]]
 name = "pkcs8"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -365,6 +374,7 @@ dependencies = [
  "cbv",
  "ed25519-dalek",
  "keys",
+ "pev",
  "prost",
  "receipts",
  "sep",
@@ -388,6 +398,7 @@ version = "0.1.0"
 dependencies = [
  "cbv",
  "keys",
+ "pev",
  "pvgs",
  "receipts",
  "sep",
