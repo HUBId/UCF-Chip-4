@@ -12,6 +12,7 @@ receipts = { path = "../receipts" }
 sep = { path = "../sep" }
 vrf = { path = "../vrf" }
 cbv = { path = "../cbv" }
+pev = { path = "../pev" }
 keys = { path = "../keys" }
 wire = { path = "../wire" }
 ucf-protocol = { path = "../ucf-protocol" }
