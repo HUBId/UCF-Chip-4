@@ -73,7 +73,7 @@ pub fn get_latest_pev(store: &PvgsStore) -> Option<PolicyEcologyVector> {
 
 /// Return the latest PEV digest if stored.
 pub fn get_latest_pev_digest(store: &PvgsStore) -> Option<[u8; 32]> {
-    store.pev_store.latest().and_then(|pev| pev_digest(pev))
+    store.pev_store.latest().and_then(pev_digest)
 }
 
 /// List all known PEV version digests in insertion order.
