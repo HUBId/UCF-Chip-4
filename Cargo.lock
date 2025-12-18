@@ -326,6 +326,7 @@ name = "profiles"
 version = "0.1.0"
 dependencies = [
  "engine",
+ "pvgs_client",
  "rsv",
  "ucf-protocol",
 ]
@@ -366,6 +367,13 @@ dependencies = [
  "serde_yaml",
  "ucf-protocol",
  "vrf",
+]
+
+[[package]]
+name = "pvgs_client"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

@@ -8,6 +8,7 @@ members = [
     "sep",
     "cbv",
     "keys",
+    "pvgs_client",
     "query",
     "app",
     "rsv",

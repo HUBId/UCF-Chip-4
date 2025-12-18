@@ -27,6 +27,24 @@ impl Profile {
     }
 }
 
+/// Approval mode describing how permissive the control frame is allowed to be.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApprovalMode {
+    #[default]
+    Standard,
+    Strict,
+}
+
+impl ApprovalMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ApprovalMode::Standard => "STANDARD",
+            ApprovalMode::Strict => "STRICT",
+        }
+    }
+}
+
 /// Overlay toggles applied to outbound control frames.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -43,6 +61,9 @@ pub struct Overlays {
 pub struct ControlFrame {
     pub profile: Profile,
     pub overlays: Overlays,
+    pub approval_mode: ApprovalMode,
+    pub character_epoch_digest: Option<[u8; 32]>,
+    pub policy_ecology_digest: Option<[u8; 32]>,
     pub profile_reason_codes: Vec<String>,
     pub created_at_ms: u64,
 }
@@ -52,6 +73,9 @@ impl Default for ControlFrame {
         Self {
             profile: Profile::M0,
             overlays: Overlays::default(),
+            approval_mode: ApprovalMode::default(),
+            character_epoch_digest: None,
+            policy_ecology_digest: None,
             profile_reason_codes: Vec::new(),
             created_at_ms: 0,
         }
@@ -62,12 +86,33 @@ impl ControlFrame {
     /// Compute a deterministic digest over the control frame.
     pub fn digest(&self) -> [u8; 32] {
         let mut hasher = Hasher::new();
-        hasher.update(b"UCF:ENGINE:CONTROL_FRAME");
+        hasher.update(b"UCF:HASH:CONTROL_FRAME");
         hasher.update(self.profile.as_str().as_bytes());
         hasher.update(&[u8::from(self.overlays.export_lock)]);
         hasher.update(&[u8::from(self.overlays.novelty_lock)]);
         hasher.update(&[u8::from(self.overlays.simulate_first)]);
         hasher.update(&[u8::from(self.overlays.deescalation_lock)]);
+        hasher.update(self.approval_mode.as_str().as_bytes());
+
+        match self.character_epoch_digest {
+            Some(digest) => {
+                hasher.update(&[1]);
+                hasher.update(&digest);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+
+        match self.policy_ecology_digest {
+            Some(digest) => {
+                hasher.update(&[1]);
+                hasher.update(&digest);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
         hasher.update(&self.created_at_ms.to_le_bytes());
 
         let mut rcs = self.profile_reason_codes.clone();
@@ -107,6 +152,9 @@ mod tests {
                 simulate_first: true,
                 deescalation_lock: true,
             },
+            approval_mode: ApprovalMode::Strict,
+            character_epoch_digest: Some([1u8; 32]),
+            policy_ecology_digest: None,
             profile_reason_codes: vec![
                 ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string(),
                 ReasonCodes::TH_INTEGRITY_COMPROMISE.to_string(),
@@ -116,7 +164,14 @@ mod tests {
 
         let mut cf2 = cf1.clone();
         cf2.profile_reason_codes.reverse();
+        cf2.policy_ecology_digest = Some([2u8; 32]);
 
+        assert_ne!(cf1.digest(), cf2.digest());
+
+        cf2.policy_ecology_digest = None;
         assert_eq!(cf1.digest(), cf2.digest());
+
+        cf2.character_epoch_digest = Some([9u8; 32]);
+        assert_ne!(cf1.digest(), cf2.digest());
     }
 }
