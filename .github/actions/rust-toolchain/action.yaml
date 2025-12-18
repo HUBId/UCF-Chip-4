@@ -1,0 +1,38 @@
+name: "Setup Rust toolchain"
+description: "Install and configure the Rust toolchain with required components using runner-provided rustup."
+inputs:
+  toolchain:
+    description: "Rust toolchain channel, version, or target triple."
+    required: false
+    default: "stable"
+  components:
+    description: "Comma-separated list of components to install."
+    required: false
+    default: "rustfmt, clippy"
+runs:
+  using: "composite"
+  steps:
+    - name: Set minimal profile
+      shell: bash
+      run: rustup set profile minimal
+
+    - name: Install toolchain
+      shell: bash
+      run: |
+        rustup toolchain install --no-self-update --profile minimal "${{ inputs.toolchain }}"
+        rustup default "${{ inputs.toolchain }}"
+
+    - name: Install components
+      shell: bash
+      run: |
+        IFS=',' read -ra comps <<< "${{ inputs.components }}"
+        for comp in "${comps[@]}"; do
+          comp_trim="$(echo "$comp" | xargs)"
+          if [[ -n "$comp_trim" ]]; then
+            rustup component add "$comp_trim" --toolchain "${{ inputs.toolchain }}"
+          fi
+        done
+
+    - name: Show active toolchain
+      shell: bash
+      run: rustup show active-toolchain
