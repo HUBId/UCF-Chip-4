@@ -164,12 +164,23 @@ pub mod ucf {
             M3KillSwitch,
         }
 
+        /// Approval mode describing how conservative the control frame is.
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum ApprovalMode {
+            Standard,
+            Strict,
+        }
+
         /// Control frame emitted by the engine with overlays and reasons.
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
         #[derive(Clone, Debug, PartialEq, Eq)]
         pub struct ControlFrame {
             pub profile: Profile,
             pub overlays: Overlays,
+            pub approval_mode: ApprovalMode,
+            pub character_epoch_digest: Option<Digest32>,
+            pub policy_ecology_digest: Option<Digest32>,
             pub profile_reason_codes: Vec<String>,
             pub created_at_ms: u64,
         }
