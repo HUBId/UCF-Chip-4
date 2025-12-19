@@ -1707,72 +1707,240 @@ fn now_ms() -> u64 {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletenessStatus {
-    Pass,
+    Ok,
     Degraded,
     Fail,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletenessResult {
+pub struct CompletenessReport {
     pub status: CompletenessStatus,
+    pub missing_nodes: Vec<[u8; 32]>,
+    pub missing_edges: Vec<String>,
     pub reason_codes: Vec<String>,
 }
 
-impl CompletenessResult {
-    fn pass() -> Self {
-        Self {
-            status: CompletenessStatus::Pass,
-            reason_codes: Vec::new(),
+#[derive(Debug)]
+pub struct CompletenessChecker<'a> {
+    graph: &'a CausalGraph,
+    sep_log: &'a SepLog,
+}
+
+impl<'a> CompletenessChecker<'a> {
+    pub fn new(graph: &'a CausalGraph, sep_log: &'a SepLog) -> Self {
+        Self { graph, sep_log }
+    }
+
+    /// Evaluate completeness for the provided action digests using graph-based rules.
+    pub fn check_actions(
+        &self,
+        session_id: &str,
+        action_digests: Vec<[u8; 32]>,
+    ) -> CompletenessReport {
+        use std::collections::BTreeSet;
+
+        let mut status = CompletenessStatus::Ok;
+        let mut missing_nodes: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut missing_edges: Vec<String> = Vec::new();
+        let mut reason_codes: BTreeSet<String> = BTreeSet::new();
+
+        let mut actions: BTreeSet<[u8; 32]> = action_digests.into_iter().collect();
+
+        if actions.is_empty() {
+            let session_receipts: Vec<[u8; 32]> = self
+                .sep_log
+                .events
+                .iter()
+                .filter(|event| {
+                    event.session_id == session_id
+                        && matches!(event.event_type, SepEventType::EvDecision)
+                })
+                .map(|event| event.object_digest)
+                .collect();
+
+            for receipt in &session_receipts {
+                for (edge, action) in self.graph.reverse_neighbors(*receipt) {
+                    if matches!(edge, EdgeType::Authorizes) {
+                        actions.insert(*action);
+                    }
+                }
+            }
+        }
+
+        if actions.is_empty() {
+            for event in self
+                .sep_log
+                .events
+                .iter()
+                .filter(|event| event.session_id == session_id)
+            {
+                for (edge, target) in self.graph.neighbors(event.object_digest) {
+                    if matches!(edge, EdgeType::References) {
+                        actions.insert(*target);
+                    }
+                }
+            }
+        }
+
+        let mut receipts_for_session: BTreeSet<[u8; 32]> = BTreeSet::new();
+
+        for action in &actions {
+            let receipts: Vec<[u8; 32]> = self
+                .graph
+                .neighbors(*action)
+                .iter()
+                .filter_map(|(edge, digest)| {
+                    if matches!(edge, EdgeType::Authorizes) {
+                        Some(*digest)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if receipts.is_empty() {
+                status = CompletenessStatus::Fail;
+                missing_nodes.insert(*action);
+                missing_edges.push(format!(
+                    "AUTHORIZES missing from action {} to receipt",
+                    hex::encode(action)
+                ));
+                reason_codes.insert(protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string());
+            } else {
+                receipts_for_session.extend(receipts);
+            }
+        }
+
+        for receipt in &receipts_for_session {
+            let has_decision = self
+                .graph
+                .reverse_neighbors(*receipt)
+                .iter()
+                .any(|(edge, _)| matches!(edge, EdgeType::Authorizes));
+
+            let referenced_by_record = self
+                .graph
+                .reverse_neighbors(*receipt)
+                .iter()
+                .filter(|(edge, _)| matches!(edge, EdgeType::References))
+                .any(|(_, record)| {
+                    self.graph
+                        .neighbors(*record)
+                        .iter()
+                        .any(|(edge, _)| matches!(edge, EdgeType::References))
+                });
+
+            if !has_decision && !referenced_by_record {
+                status = CompletenessStatus::Fail;
+                missing_nodes.insert(*receipt);
+                missing_edges.push(format!(
+                    "decision AUTHORIZES missing for receipt {}",
+                    hex::encode(receipt)
+                ));
+                reason_codes.insert(protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string());
+            }
+        }
+
+        for action in &actions {
+            let receipts: Vec<[u8; 32]> = self
+                .graph
+                .neighbors(*action)
+                .iter()
+                .filter_map(|(edge, digest)| {
+                    if matches!(edge, EdgeType::Authorizes) {
+                        Some(*digest)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for receipt in receipts {
+                if !self.references_both(action, &receipt) {
+                    if !matches!(status, CompletenessStatus::Fail) {
+                        status = CompletenessStatus::Degraded;
+                    }
+                    missing_nodes.insert(*action);
+                    missing_edges.push(format!(
+                        "record missing REFERENCES links for action {} and receipt {}",
+                        hex::encode(action),
+                        hex::encode(receipt)
+                    ));
+                    reason_codes.insert(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+                }
+            }
+        }
+
+        for receipt in &receipts_for_session {
+            let profile_digests: Vec<[u8; 32]> = self
+                .graph
+                .reverse_neighbors(*receipt)
+                .iter()
+                .filter_map(|(edge, digest)| {
+                    if matches!(edge, EdgeType::References) {
+                        Some(*digest)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !profile_digests.is_empty()
+                && !profile_digests.iter().any(|digest| {
+                    self.sep_log.events.iter().any(|event| {
+                        event.session_id == session_id
+                            && matches!(event.event_type, SepEventType::EvControlFrame)
+                            && event.object_digest == *digest
+                    })
+                })
+            {
+                if !matches!(status, CompletenessStatus::Fail) {
+                    status = CompletenessStatus::Degraded;
+                }
+                missing_nodes.extend(profile_digests);
+                missing_edges.push("control frame missing for receipt profile_digest".to_string());
+                reason_codes.insert(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+            }
+        }
+
+        missing_edges.sort();
+
+        CompletenessReport {
+            status,
+            missing_nodes: missing_nodes.into_iter().collect(),
+            missing_edges,
+            reason_codes: reason_codes.into_iter().collect(),
         }
     }
 
-    fn degraded(reason_codes: Vec<String>) -> Self {
-        Self {
-            status: CompletenessStatus::Degraded,
-            reason_codes,
-        }
-    }
-}
+    fn references_both(&self, action: &[u8; 32], receipt: &[u8; 32]) -> bool {
+        let mut nodes: Vec<[u8; 32]> = self
+            .graph
+            .adj
+            .keys()
+            .copied()
+            .chain(self.graph.rev.keys().copied())
+            .collect();
+        nodes.sort();
+        nodes.dedup();
 
-fn is_side_effecting(kind: &RequiredReceiptKind) -> bool {
-    matches!(
-        kind,
-        RequiredReceiptKind::Write
-            | RequiredReceiptKind::Execute
-            | RequiredReceiptKind::Export
-            | RequiredReceiptKind::Persist
-    )
-}
-
-/// Evaluate completeness rule CF1 ensuring control frame evidence exists for side-effect receipts.
-pub fn evaluate_completeness(receipt: &PVGSReceipt, sep_log: &SepLog) -> CompletenessResult {
-    if receipt.status != ReceiptStatus::Accepted {
-        return CompletenessResult::pass();
+        nodes.into_iter().any(|node| {
+            self.references(node, action) && self.references(node, receipt)
+                || self.references(*action, &node) && self.references(*receipt, &node)
+        })
     }
 
-    if !is_side_effecting(&receipt.required_receipt_kind) {
-        return CompletenessResult::pass();
-    }
-
-    let Some(profile_digest) = receipt.bindings.profile_digest.as_ref().map(|d| d.0) else {
-        return CompletenessResult::degraded(vec![
-            protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()
-        ]);
-    };
-
-    let found = sep_log.events.iter().any(|event| {
-        event.session_id == receipt.commit_id
-            && matches!(event.event_type, SepEventType::EvControlFrame)
-            && event.object_digest == profile_digest
-    });
-
-    if found {
-        CompletenessResult::pass()
-    } else {
-        CompletenessResult::degraded(vec![
-            protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()
-        ])
+    fn references(&self, from: [u8; 32], to: &[u8; 32]) -> bool {
+        self.graph
+            .neighbors(from)
+            .iter()
+            .any(|(edge, digest)| matches!(edge, EdgeType::References) && digest == to)
+            || self
+                .graph
+                .reverse_neighbors(from)
+                .iter()
+                .any(|(edge, digest)| matches!(edge, EdgeType::References) && digest == to)
     }
 }
 
@@ -2961,53 +3129,145 @@ mod tests {
     }
 
     #[test]
-    fn completeness_rule_passes_when_control_frame_logged() {
-        let prev = [9u8; 32];
-        let mut store = base_store(prev);
-        let keystore = KeyStore::new_dev_keystore(1);
-        let vrf_engine = VrfEngine::new_dev(1);
+    fn completeness_passes_with_action_receipt_decision_and_record() {
+        let mut graph = CausalGraph::default();
+        let mut sep_log = SepLog::default();
+        let action = [1u8; 32];
+        let receipt = [2u8; 32];
+        let decision = [3u8; 32];
+        let record = [4u8; 32];
+        let profile = [5u8; 32];
 
-        let profile_digest = [4u8; 32];
-        store.sep_log.append_frame_event(
-            "session-pass".to_string(),
+        graph.add_edge(action, EdgeType::Authorizes, receipt);
+        graph.add_edge(decision, EdgeType::Authorizes, receipt);
+        graph.add_edge(record, EdgeType::References, action);
+        graph.add_edge(record, EdgeType::References, receipt);
+        graph.add_edge(profile, EdgeType::References, receipt);
+
+        sep_log.append_event(
+            "sess-ok".to_string(),
+            SepEventType::EvDecision,
+            receipt,
+            vec![],
+        );
+        sep_log.append_frame_event(
+            "sess-ok".to_string(),
             FrameEventKind::ControlFrame,
-            profile_digest,
+            profile,
             vec![],
         );
 
-        let mut req = make_request(prev);
-        req.commit_id = "session-pass".to_string();
-        req.required_receipt_kind = RequiredReceiptKind::Write;
-        req.bindings.profile_digest = Some(profile_digest);
-        req.bindings.tool_profile_digest = Some([5u8; 32]);
+        let checker = CompletenessChecker::new(&graph, &sep_log);
+        let report = checker.check_actions("sess-ok", vec![action]);
 
-        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
-        let result = evaluate_completeness(&receipt, &store.sep_log);
-
-        assert_eq!(result.status, CompletenessStatus::Pass);
-        assert!(result.reason_codes.is_empty());
+        assert!(report.missing_edges.is_empty());
+        assert!(report.missing_nodes.is_empty());
+        assert_eq!(report.status, CompletenessStatus::Ok);
     }
 
     #[test]
-    fn completeness_rule_degrades_when_missing_control_frame() {
-        let prev = [3u8; 32];
-        let mut store = base_store(prev);
-        let keystore = KeyStore::new_dev_keystore(1);
-        let vrf_engine = VrfEngine::new_dev(1);
+    fn completeness_fails_when_receipt_missing() {
+        let graph = CausalGraph::default();
+        let sep_log = SepLog::default();
+        let checker = CompletenessChecker::new(&graph, &sep_log);
 
-        let mut req = make_request(prev);
-        req.commit_id = "session-degraded".to_string();
-        req.required_receipt_kind = RequiredReceiptKind::Export;
-        req.bindings.profile_digest = Some([6u8; 32]);
-        req.bindings.tool_profile_digest = Some([7u8; 32]);
+        let report = checker.check_actions("sess-missing", vec![[9u8; 32]]);
 
-        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
-        let result = evaluate_completeness(&receipt, &store.sep_log);
+        assert_eq!(report.status, CompletenessStatus::Fail);
+        assert!(report
+            .reason_codes
+            .contains(&ReasonCodes::RE_INTEGRITY_FAIL.to_string()));
+    }
 
-        assert_eq!(result.status, CompletenessStatus::Degraded);
-        assert!(result
+    #[test]
+    fn completeness_degrades_when_record_missing() {
+        let mut graph = CausalGraph::default();
+        let mut sep_log = SepLog::default();
+        let action = [7u8; 32];
+        let receipt = [8u8; 32];
+        let decision = [6u8; 32];
+        let profile = [5u8; 32];
+
+        graph.add_edge(action, EdgeType::Authorizes, receipt);
+        graph.add_edge(decision, EdgeType::Authorizes, receipt);
+        graph.add_edge(profile, EdgeType::References, receipt);
+
+        sep_log.append_event(
+            "sess-degraded".to_string(),
+            SepEventType::EvDecision,
+            receipt,
+            vec![],
+        );
+        sep_log.append_frame_event(
+            "sess-degraded".to_string(),
+            FrameEventKind::ControlFrame,
+            profile,
+            vec![],
+        );
+
+        let checker = CompletenessChecker::new(&graph, &sep_log);
+        let report = checker.check_actions("sess-degraded", vec![action]);
+
+        assert_eq!(report.status, CompletenessStatus::Degraded);
+        assert!(report
             .reason_codes
             .contains(&ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()));
+    }
+
+    #[test]
+    fn completeness_output_is_deterministic() {
+        let mut graph = CausalGraph::default();
+        let mut sep_log = SepLog::default();
+        let action = [1u8; 32];
+        let receipt = [2u8; 32];
+
+        graph.add_edge(action, EdgeType::Authorizes, receipt);
+        graph.add_edge([3u8; 32], EdgeType::References, receipt);
+
+        sep_log.append_event(
+            "sess-deterministic".to_string(),
+            SepEventType::EvDecision,
+            receipt,
+            vec![],
+        );
+
+        let checker = CompletenessChecker::new(&graph, &sep_log);
+        let report_one = checker.check_actions("sess-deterministic", vec![action]);
+        let report_two = checker.check_actions("sess-deterministic", vec![action]);
+
+        assert_eq!(report_one.missing_edges, report_two.missing_edges);
+        assert_eq!(report_one.missing_nodes, report_two.missing_nodes);
+        assert_eq!(report_one.reason_codes, report_two.reason_codes);
+        assert_eq!(report_one.status, report_two.status);
+    }
+
+    #[test]
+    fn completeness_degrades_without_control_frame() {
+        let mut graph = CausalGraph::default();
+        let mut sep_log = SepLog::default();
+        let action = [10u8; 32];
+        let receipt = [11u8; 32];
+        let decision = [12u8; 32];
+        let profile = [13u8; 32];
+
+        graph.add_edge(action, EdgeType::Authorizes, receipt);
+        graph.add_edge(decision, EdgeType::Authorizes, receipt);
+        graph.add_edge(profile, EdgeType::References, receipt);
+        graph.add_edge([14u8; 32], EdgeType::References, action);
+        graph.add_edge([14u8; 32], EdgeType::References, receipt);
+
+        sep_log.append_event(
+            "sess-cf".to_string(),
+            SepEventType::EvDecision,
+            receipt,
+            vec![],
+        );
+
+        let checker = CompletenessChecker::new(&graph, &sep_log);
+        let report = checker.check_actions("sess-cf", vec![action]);
+
+        assert_eq!(report.status, CompletenessStatus::Degraded);
+        assert!(report.missing_nodes.iter().any(|digest| digest == &profile));
     }
 
     #[test]
