@@ -219,8 +219,8 @@ pub fn verify_action_manifest(
                     let receipt_matches = gov
                         .pvgs_receipt_ref
                         .as_ref()
-                        .and_then(|r| digest_from_ref(r))
-                        .map_or(false, |digest| digest == entry.receipt_digest);
+                        .and_then(digest_from_ref)
+                        == Some(entry.receipt_digest);
                     let mut decisions: Vec<[u8; 32]> = gov
                         .policy_decision_refs
                         .iter()
@@ -350,7 +350,7 @@ fn collect_action_entries(session_id: &str, store: &PvgsStore) -> Vec<ActionEntr
             decision_digests.sort();
             let decision_digest = decision_digests.first().copied().unwrap_or([0u8; 32]);
 
-            let action_digest = action_digest_from_record(&record);
+            let action_digest = action_digest_from_record(record);
             let created_at_ms = record
                 .finalization_header
                 .as_ref()
