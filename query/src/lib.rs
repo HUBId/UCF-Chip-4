@@ -138,6 +138,8 @@ mod tests {
 
         let mut store = PvgsStore::new(
             [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
             known_charter_versions,
             known_policy_versions,
             known_profiles,
