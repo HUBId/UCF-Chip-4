@@ -15,10 +15,11 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tool_registry_state::{ToolRegistryError, ToolRegistryState};
 use ucf_protocol::ucf::v1::{
     self as protocol, CharacterBaselineVector, Digest32, ExperienceRecord, FinalizationHeader,
     MacroMilestone, MacroMilestoneState, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReceiptStatus,
-    RecordType, Ref,
+    RecordType, Ref, ToolRegistryContainer,
 };
 use vrf::VrfEngine;
 
@@ -102,14 +103,12 @@ impl RulesetState {
     }
 
     pub fn recompute_ruleset_digest(&mut self) {
-        let mut hasher = Hasher::new();
-        hasher.update(b"UCF:HASH:RULESET");
-        hasher.update(self.charter_version_digest.as_bytes());
-        hasher.update(self.policy_version_digest.as_bytes());
-        hasher.update(&self.pev_digest.unwrap_or([0u8; 32]));
-        hasher.update(&self.tool_registry_digest.unwrap_or([0u8; 32]));
-
-        self.ruleset_digest = *hasher.finalize().as_bytes();
+        self.ruleset_digest = compute_ruleset_digest(
+            self.charter_version_digest.as_bytes(),
+            self.policy_version_digest.as_bytes(),
+            self.pev_digest.as_ref().map(|d| d.as_slice()),
+            self.tool_registry_digest.as_ref().map(|d| d.as_slice()),
+        );
     }
 }
 
@@ -128,6 +127,7 @@ pub struct PvgsCommitRequest {
     pub epoch_id: u64,
     pub key_epoch: Option<PVGSKeyEpoch>,
     pub experience_record_payload: Option<Vec<u8>>,
+    pub tool_registry_container: Option<Vec<u8>>,
     pub pev: Option<PolicyEcologyVector>,
 }
 
@@ -159,6 +159,7 @@ pub struct PvgsStore {
     pub key_epoch_history: KeyEpochHistory,
     pub cbv_store: CbvStore,
     pub pev_store: PevStore,
+    pub tool_registry_state: ToolRegistryState,
     pub committed_payload_digests: HashSet<[u8; 32]>,
     pub sep_log: SepLog,
     pub receipt_gate_enabled: bool,
@@ -187,6 +188,7 @@ impl PvgsStore {
             key_epoch_history: KeyEpochHistory::default(),
             cbv_store: CbvStore::default(),
             pev_store: PevStore::default(),
+            tool_registry_state: ToolRegistryState::default(),
             committed_payload_digests: HashSet::new(),
             sep_log: SepLog::default(),
             receipt_gate_enabled: false,
@@ -206,11 +208,17 @@ impl PvgsStore {
         self.ruleset_state.charter_version_digest = charter_version_digest.to_string();
         self.ruleset_state.policy_version_digest = policy_version_digest.to_string();
         self.ruleset_state.pev_digest = self.pev_store.latest().and_then(extract_pev_digest);
+        self.ruleset_state.tool_registry_digest = self.tool_registry_state.current();
         self.ruleset_state.recompute_ruleset_digest();
     }
 
     pub fn update_pev_digest(&mut self, pev_digest: Option<[u8; 32]>) {
         self.ruleset_state.pev_digest = pev_digest;
+        self.ruleset_state.recompute_ruleset_digest();
+    }
+
+    pub fn update_tool_registry_digest(&mut self, tool_registry_digest: Option<[u8; 32]>) {
+        self.ruleset_state.tool_registry_digest = tool_registry_digest;
         self.ruleset_state.recompute_ruleset_digest();
     }
 
@@ -368,13 +376,14 @@ pub fn compute_ruleset_digest(
     charter_digest: &[u8],
     policy_digest: &[u8],
     pev_digest: Option<&[u8]>,
+    tool_registry_digest: Option<&[u8]>,
 ) -> [u8; 32] {
     let mut hasher = Hasher::new();
     hasher.update(b"UCF:HASH:RULESET");
     hasher.update(charter_digest);
     hasher.update(policy_digest);
     hasher.update(pev_digest.unwrap_or([0u8; 32].as_slice()));
-    hasher.update([0u8; 32].as_slice());
+    hasher.update(tool_registry_digest.unwrap_or([0u8; 32].as_slice()));
     *hasher.finalize().as_bytes()
 }
 
@@ -481,6 +490,20 @@ pub fn compute_pev_verified_fields_digest(
     *hasher.finalize().as_bytes()
 }
 
+/// Compute the verified fields digest for tool registry updates.
+pub fn compute_tool_registry_verified_fields_digest(
+    prev_record_digest: [u8; 32],
+    registry_digest: [u8; 32],
+    registry_version: &str,
+) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(b"UCF:PVGS:TOOL_REGISTRY_VERIFIED_FIELDS");
+    hasher.update(&prev_record_digest);
+    hasher.update(&registry_digest);
+    hasher.update(registry_version.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 fn event_type_for_commit(
     commit_type: CommitType,
     frame_kind: Option<FrameEventKind>,
@@ -489,6 +512,7 @@ fn event_type_for_commit(
         CommitType::ReceiptRequest => SepEventType::EvDecision,
         CommitType::KeyEpochUpdate => SepEventType::EvKeyEpoch,
         CommitType::PevUpdate => SepEventType::EvPevUpdate,
+        CommitType::ToolRegistryUpdate => SepEventType::EvToolOnboarding,
         CommitType::ExperienceRecordAppend => SepEventType::EvIntent,
         CommitType::FrameEvidenceAppend => match frame_kind {
             Some(FrameEventKind::ControlFrame) => SepEventType::EvControlFrame,
@@ -533,6 +557,10 @@ pub fn verify_and_commit(
 ) -> (PVGSReceipt, Option<ProofReceipt>) {
     if req.commit_type == CommitType::PevUpdate {
         return verify_pev_update(req, store, keystore, vrf_engine);
+    }
+
+    if req.commit_type == CommitType::ToolRegistryUpdate {
+        return verify_tool_registry_update(req, store, keystore, vrf_engine);
     }
 
     if req.commit_type == CommitType::ExperienceRecordAppend {
@@ -948,6 +976,180 @@ fn verify_pev_update(
         SepEventType::EvPevUpdate,
         store.ruleset_state.ruleset_digest,
         vec![protocol::ReasonCodes::GV_PEV_UPDATED.to_string()],
+    );
+
+    (receipt, Some(proof_receipt))
+}
+
+fn verify_tool_registry_update(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+    vrf_engine: &VrfEngine,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let Some(payload) = req.tool_registry_container.clone() else {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &to_receipt_input(&req),
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: vec![
+                protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+            ],
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    };
+
+    let Ok(container) = ToolRegistryContainer::decode(payload.as_slice()) else {
+        let receipt_input = to_receipt_input(&req);
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: vec![
+                protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+            ],
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    };
+
+    let Some(registry_digest) = digest_from_bytes(&container.registry_digest) else {
+        let receipt_input = to_receipt_input(&req);
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: vec![
+                protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+            ],
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    };
+
+    let mut reject_reason_codes = Vec::new();
+
+    if req.payload_digests.is_empty() {
+        req.payload_digests = vec![registry_digest];
+    } else if req.payload_digests.len() != 1 || req.payload_digests[0] != registry_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    let receipt_input = to_receipt_input(&req);
+
+    if !req.required_checks.contains(&RequiredCheck::SchemaOk)
+        || !req.required_checks.contains(&RequiredCheck::BindingOk)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if req.epoch_id != keystore.current_epoch() {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+    }
+
+    if req.bindings.prev_record_digest != store.current_head_record_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+    }
+
+    if container.registry_version.is_empty() {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if store.tool_registry_state.history.contains(&registry_digest) {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if !reject_reason_codes.is_empty() {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(registry_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    if let Err(err) = store.tool_registry_state.set_current(registry_digest) {
+        let reason = match err {
+            ToolRegistryError::DuplicateDigest => {
+                protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+            }
+        };
+
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: vec![reason],
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(registry_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    let verified_fields_digest = compute_tool_registry_verified_fields_digest(
+        req.bindings.prev_record_digest,
+        registry_digest,
+        &container.registry_version,
+    );
+    let record_digest = compute_record_digest(
+        verified_fields_digest,
+        req.bindings.prev_record_digest,
+        &req.commit_id,
+    );
+
+    let vrf_digest = vrf_engine.eval_record_vrf(
+        req.bindings.prev_record_digest,
+        record_digest,
+        &req.bindings.charter_version_digest,
+        req.bindings.profile_digest.unwrap_or([0u8; 32]),
+        req.epoch_id,
+    );
+
+    store.refresh_ruleset_state(
+        &req.bindings.charter_version_digest,
+        &req.bindings.policy_version_digest,
+    );
+    store.update_tool_registry_digest(store.tool_registry_state.current());
+
+    let receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        Vec::new(),
+        keystore,
+    );
+
+    store.committed_payload_digests.insert(registry_digest);
+
+    let mut proof_receipt = issue_proof_receipt(
+        store.ruleset_state.ruleset_digest,
+        verified_fields_digest,
+        vrf_digest,
+        keystore,
+    );
+    proof_receipt.receipt_digest = receipt.receipt_digest.clone();
+
+    store.sep_log.append_event(
+        req.commit_id.clone(),
+        SepEventType::EvToolOnboarding,
+        registry_digest,
+        vec![protocol::ReasonCodes::GV_TOOL_REGISTRY_UPDATED.to_string()],
     );
 
     (receipt, Some(proof_receipt))
@@ -1648,6 +1850,7 @@ mod tests {
             epoch_id: 1,
             key_epoch: None,
             experience_record_payload: None,
+            tool_registry_container: None,
             pev: None,
         }
     }
@@ -1688,6 +1891,7 @@ mod tests {
                 epoch_id: keystore.current_epoch(),
                 key_epoch: Some(epoch.clone()),
                 experience_record_payload: None,
+                tool_registry_container: None,
                 pev: None,
             },
             epoch,
@@ -1720,6 +1924,13 @@ mod tests {
             pev_digest: Some(digest.to_vec()),
             pev_version_digest: Some(digest.to_vec()),
             pev_epoch: Some(epoch),
+        }
+    }
+
+    fn tool_registry_container(digest: [u8; 32], version: &str) -> ToolRegistryContainer {
+        ToolRegistryContainer {
+            registry_digest: digest.to_vec(),
+            registry_version: version.to_string(),
         }
     }
 
@@ -1770,6 +1981,7 @@ mod tests {
             epoch_id,
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
+            tool_registry_container: None,
             pev: None,
         }
     }
@@ -2009,6 +2221,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: Some(backward_epoch),
             experience_record_payload: None,
+            tool_registry_container: None,
             pev: None,
         };
 
@@ -2069,6 +2282,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: Some(epoch),
             experience_record_payload: None,
+            tool_registry_container: None,
             pev: None,
         };
 
@@ -2105,6 +2319,7 @@ mod tests {
             epoch_id: 1,
             key_epoch: None,
             experience_record_payload: None,
+            tool_registry_container: None,
             pev: None,
         };
 
@@ -2149,6 +2364,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
+            tool_registry_container: None,
             pev: Some(pev.clone()),
         };
 
@@ -2219,6 +2435,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
+            tool_registry_container: None,
             pev: Some(pev),
         };
 
@@ -2247,6 +2464,61 @@ mod tests {
             .find(|event| event.event_type == SepEventType::EvPevUpdate)
             .expect("missing sep event");
         assert_eq!(sep_event.object_digest, store.ruleset_state.ruleset_digest);
+    }
+
+    #[test]
+    fn tool_registry_update_changes_ruleset_and_logs_sep() {
+        let prev = [3u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let initial_ruleset = store.ruleset_state.ruleset_digest;
+        let registry_digest = [0x77u8; 32];
+        let container = tool_registry_container(registry_digest, "trc-v1");
+        let req = PvgsCommitRequest {
+            commit_id: "tool-registry".to_string(),
+            commit_type: CommitType::ToolRegistryUpdate,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: prev,
+                profile_digest: Some([9u8; 32]),
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            tool_registry_container: Some(container.encode_to_vec()),
+            pev: None,
+        };
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        let proof = proof.expect("missing proof receipt");
+
+        let updated_ruleset = store.ruleset_state.ruleset_digest;
+        assert_ne!(initial_ruleset, updated_ruleset);
+        assert_eq!(store.tool_registry_state.current(), Some(registry_digest));
+        assert_eq!(
+            store.ruleset_state.tool_registry_digest,
+            Some(registry_digest)
+        );
+        assert_eq!(proof.ruleset_digest.0, updated_ruleset);
+
+        let sep_event = store.sep_log.events.last().expect("missing sep event");
+        assert_eq!(sep_event.event_type, SepEventType::EvToolOnboarding);
+        assert_eq!(sep_event.object_digest, registry_digest);
+        assert!(sep_event
+            .reason_codes
+            .contains(&ReasonCodes::GV_TOOL_REGISTRY_UPDATED.to_string()));
     }
 
     #[test]

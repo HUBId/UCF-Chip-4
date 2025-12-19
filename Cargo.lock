@@ -381,6 +381,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "thiserror",
+ "tool_registry_state",
  "ucf-protocol",
  "vrf",
 ]
@@ -593,6 +594,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tool_registry_state"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

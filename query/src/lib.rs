@@ -86,6 +86,16 @@ pub fn list_pev_versions(store: &PvgsStore) -> Vec<[u8; 32]> {
         .collect()
 }
 
+/// Return the current tool registry digest if set.
+pub fn get_current_tool_registry_digest(store: &PvgsStore) -> Option<[u8; 32]> {
+    store.tool_registry_state.current()
+}
+
+/// List all committed tool registry digests in insertion order.
+pub fn list_tool_registry_digests(store: &PvgsStore) -> Vec<[u8; 32]> {
+    store.tool_registry_state.history.clone()
+}
+
 /// Return true if the SEP log contains a control frame event with the digest in the session.
 pub fn has_control_frame_digest(log: &SepLog, session_id: &str, digest: [u8; 32]) -> bool {
     log.events.iter().any(|event| {
@@ -216,6 +226,20 @@ mod tests {
 
         assert_eq!(get_latest_pev_digest(&store), Some([0xAB; 32]));
         assert_eq!(list_pev_versions(&store), vec![[0xAB; 32]]);
+    }
+
+    #[test]
+    fn tool_registry_queries_return_current_and_history() {
+        let (mut store, _, _) = store_with_epochs();
+        let digest = [0xAAu8; 32];
+        store
+            .tool_registry_state
+            .set_current(digest)
+            .expect("insert digest");
+        store.update_tool_registry_digest(store.tool_registry_state.current());
+
+        assert_eq!(get_current_tool_registry_digest(&store), Some(digest));
+        assert_eq!(list_tool_registry_digests(&store), vec![digest]);
     }
 
     #[test]

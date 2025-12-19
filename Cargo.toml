@@ -15,6 +15,7 @@ members = [
     "rsv",
     "profiles",
     "engine",
+    "tool_registry_state",
 ]
 resolver = "2"
 

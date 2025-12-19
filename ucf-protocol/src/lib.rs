@@ -129,6 +129,16 @@ pub mod ucf {
             pub proof_attestation_sig: Vec<u8>,
         }
 
+        /// Tool registry container used for PVGS commits.
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct ToolRegistryContainer {
+            #[prost(bytes = "vec", tag = "1")]
+            pub registry_digest: Vec<u8>,
+            #[prost(string, tag = "2")]
+            pub registry_version: String,
+        }
+
         /// Published key epoch announcement for PVGS attestation and VRF verification.
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
         #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,6 +330,7 @@ pub mod ucf {
             pub const GV_CBV_UPDATED: &'static str = "RC.GV.CBV.UPDATED";
             pub const GV_CBV_NO_CHANGE: &'static str = "RC.GV.CBV.NO_CHANGE";
             pub const GV_PEV_UPDATED: &'static str = "RC.GV.PEV.UPDATED";
+            pub const GV_TOOL_REGISTRY_UPDATED: &'static str = "RC.GV.TOOL_REGISTRY.UPDATED";
         }
 
         /// Lightweight reference type for future graph links.
