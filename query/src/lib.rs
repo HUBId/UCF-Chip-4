@@ -222,14 +222,16 @@ pub fn trace_action(store: &PvgsStore, action_digest: [u8; 32]) -> TraceResult {
                     }
                 }
                 EdgeType::References => {
-                    if is_record_node(store, &neighbor) {
-                        if records.insert(neighbor) && visited.insert(neighbor) {
-                            path.push(neighbor);
-                        }
-                    } else if is_profile_node(store, &neighbor) {
-                        if profiles.insert(neighbor) && visited.insert(neighbor) {
-                            path.push(neighbor);
-                        }
+                    if is_record_node(store, &neighbor)
+                        && records.insert(neighbor)
+                        && visited.insert(neighbor)
+                    {
+                        path.push(neighbor);
+                    } else if is_profile_node(store, &neighbor)
+                        && profiles.insert(neighbor)
+                        && visited.insert(neighbor)
+                    {
+                        path.push(neighbor);
                     }
                 }
                 _ => {}
@@ -242,10 +244,12 @@ pub fn trace_action(store: &PvgsStore, action_digest: [u8; 32]) -> TraceResult {
             break;
         }
 
-        if matches!(edge, EdgeType::References) && is_record_node(store, &neighbor) {
-            if records.insert(neighbor) && visited.insert(neighbor) {
-                path.push(neighbor);
-            }
+        if matches!(edge, EdgeType::References)
+            && is_record_node(store, &neighbor)
+            && records.insert(neighbor)
+            && visited.insert(neighbor)
+        {
+            path.push(neighbor);
         }
     }
 
