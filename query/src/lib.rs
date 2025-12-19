@@ -115,7 +115,7 @@ pub fn list_ruleset_changes(log: &SepLog, session_id: Option<&str>) -> Vec<[u8; 
                 .reason_codes
                 .iter()
                 .any(|reason| reason == ReasonCodes::GV_RULESET_CHANGED)
-                && session_id.map_or(true, |sid| sid == event.session_id)
+                && session_id.is_none_or(|sid| sid == event.session_id)
         })
         .map(|event| event.object_digest)
         .collect()
