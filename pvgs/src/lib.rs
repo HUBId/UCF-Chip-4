@@ -10,7 +10,7 @@ use keys::{verify_key_epoch_signature, KeyEpochHistory, KeyStore};
 use pev::{pev_digest as extract_pev_digest, PevStore, PolicyEcologyVector};
 use prost::Message;
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
-use sep::{FrameEventKind, SepEventType, SepLog};
+use sep::{CausalGraph, EdgeType, FrameEventKind, NodeKey, SepEventType, SepLog};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -173,6 +173,7 @@ pub struct PvgsStore {
     pub tool_registry_state: ToolRegistryState,
     pub committed_payload_digests: HashSet<[u8; 32]>,
     pub sep_log: SepLog,
+    pub causal_graph: CausalGraph,
     pub receipt_gate_enabled: bool,
     pub ruleset_state: RulesetState,
 }
@@ -202,6 +203,7 @@ impl PvgsStore {
             tool_registry_state: ToolRegistryState::default(),
             committed_payload_digests: HashSet::new(),
             sep_log: SepLog::default(),
+            causal_graph: CausalGraph::default(),
             receipt_gate_enabled: false,
             ruleset_state: RulesetState::new(charter_version_digest, policy_version_digest),
         }
@@ -251,6 +253,109 @@ impl PvgsStore {
             self.ruleset_state.ruleset_digest,
             reason_codes,
         );
+    }
+
+    fn add_receipt_edges(&mut self, receipt: &PVGSReceipt) {
+        if !matches!(receipt.status, ReceiptStatus::Accepted) {
+            return;
+        }
+
+        let receipt_digest = receipt.receipt_digest.0;
+        if let Some(decision) = optional_proto_digest(&receipt.bindings.decision_digest) {
+            self.causal_graph
+                .add_edge(decision, EdgeType::Authorizes, receipt_digest);
+        }
+
+        if let Some(action) = optional_proto_digest(&receipt.bindings.action_digest) {
+            self.causal_graph
+                .add_edge(action, EdgeType::Authorizes, receipt_digest);
+        }
+
+        if let Some(profile) = optional_proto_digest(&receipt.bindings.profile_digest) {
+            self.causal_graph
+                .add_edge(profile, EdgeType::References, receipt_digest);
+        }
+
+        if let Some(tool_profile) = optional_proto_digest(&receipt.bindings.tool_profile_digest) {
+            self.causal_graph
+                .add_edge(tool_profile, EdgeType::References, receipt_digest);
+        }
+    }
+
+    fn add_record_edges(
+        &mut self,
+        record_digest: [u8; 32],
+        prev_record_digest: [u8; 32],
+        record: &ExperienceRecord,
+    ) {
+        if prev_record_digest != [0u8; 32] {
+            self.causal_graph
+                .add_edge(prev_record_digest, EdgeType::Causes, record_digest);
+        }
+
+        self.add_frame_reference_edges(record_digest, record);
+
+        match RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified) {
+            RecordType::RtActionExec => self.add_action_exec_edges(record_digest, record),
+            RecordType::RtOutput => self.add_output_edges(record_digest, record),
+            _ => {}
+        }
+    }
+
+    fn add_frame_reference_edges(&mut self, record_digest: NodeKey, record: &ExperienceRecord) {
+        if let Some(core_ref) = &record.core_frame_ref {
+            self.add_reference_edges_from_refs(record_digest, std::slice::from_ref(core_ref));
+        }
+
+        if let Some(meta_ref) = &record.metabolic_frame_ref {
+            self.add_reference_edges_from_refs(record_digest, std::slice::from_ref(meta_ref));
+        }
+
+        if let Some(gov_ref) = &record.governance_frame_ref {
+            self.add_reference_edges_from_refs(record_digest, std::slice::from_ref(gov_ref));
+        }
+    }
+
+    fn add_action_exec_edges(&mut self, record_digest: NodeKey, record: &ExperienceRecord) {
+        if let Some(core) = &record.core_frame {
+            self.add_reference_edges_from_refs(record_digest, &core.evidence_refs);
+        }
+
+        if let Some(gov) = &record.governance_frame {
+            self.add_reference_edges_from_refs(record_digest, &gov.policy_decision_refs);
+
+            if let Some(receipt_ref) = &gov.pvgs_receipt_ref {
+                self.add_reference_edges_from_refs(
+                    record_digest,
+                    std::slice::from_ref(receipt_ref),
+                );
+            }
+        }
+
+        if let Some(core_ref) = &record.core_frame_ref {
+            self.add_reference_edges_from_refs(record_digest, std::slice::from_ref(core_ref));
+        }
+    }
+
+    fn add_output_edges(&mut self, record_digest: NodeKey, record: &ExperienceRecord) {
+        if !record.dlp_refs.is_empty() {
+            self.add_reference_edges_from_refs(record_digest, &record.dlp_refs);
+        }
+
+        if let Some(gov) = &record.governance_frame {
+            if !gov.dlp_refs.is_empty() {
+                self.add_reference_edges_from_refs(record_digest, &gov.dlp_refs);
+            }
+        }
+    }
+
+    fn add_reference_edges_from_refs(&mut self, from: NodeKey, refs: &[Ref]) {
+        for reference in refs {
+            if let Some(target) = digest_from_ref(reference) {
+                self.causal_graph
+                    .add_edge(from, EdgeType::References, target);
+            }
+        }
     }
 
     pub fn append_record(
@@ -815,6 +920,8 @@ pub fn verify_and_commit(
         reject_reason_codes.clone(),
         keystore,
     );
+
+    store.add_receipt_edges(&receipt);
 
     let vrf_digest = vrf_engine.eval_record_vrf(
         req.bindings.prev_record_digest,
@@ -1396,6 +1503,7 @@ fn verify_experience_record_append(
     finalization_header.record_digest = digest_to_vec(record_digest);
     record.finalization_header = Some(finalization_header);
 
+    store.add_record_edges(record_digest, req.bindings.prev_record_digest, &record);
     log_experience_events(&req.commit_id, record_digest, &record, store);
     store.append_record(record, record_digest, proof_receipt.clone());
 
@@ -1570,6 +1678,23 @@ fn digest_from_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
     let mut digest = [0u8; 32];
     digest.copy_from_slice(bytes);
     Some(digest)
+}
+
+fn optional_proto_digest(value: &Option<Digest32>) -> Option<[u8; 32]> {
+    value.as_ref().map(|d| d.0)
+}
+
+fn digest_from_ref(reference: &Ref) -> Option<[u8; 32]> {
+    digest_from_hex_str(&reference.id).or_else(|| digest_from_bytes(reference.id.as_bytes()))
+}
+
+fn digest_from_hex_str(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+
+    let bytes = hex::decode(value).ok()?;
+    digest_from_bytes(&bytes)
 }
 
 fn now_ms() -> u64 {
@@ -1755,6 +1880,10 @@ fn finalize_receipt(args: FinalizeReceiptArgs) -> (PVGSReceipt, Option<ProofRece
     let receipt = issue_receipt(receipt_input, status, reject_reason_codes, keystore);
     let event_type = event_type_for_commit(req.commit_type, frame_kind);
 
+    if matches!(receipt.status, ReceiptStatus::Accepted) {
+        store.add_receipt_edges(&receipt);
+    }
+
     let object_digest = event_object_digest.unwrap_or(receipt.receipt_digest.0);
     let reason_codes = event_reason_codes.unwrap_or_else(|| receipt.reject_reason_codes.clone());
 
@@ -1860,9 +1989,10 @@ mod tests {
     use super::*;
     use protocol::ReasonCodes;
     use receipts::verify_pvgs_receipt_attestation;
+    use sep::EdgeType;
     use ucf_protocol::ucf::v1::{
-        GovernanceFrame, MacroMilestoneState, MagnitudeClass, MetabolicFrame,
-        PolicyEcologyDimension, PolicyEcologyVector, TraitDirection, TraitUpdate,
+        CoreFrame, GovernanceFrame, MacroMilestoneState, MagnitudeClass, MetabolicFrame,
+        PolicyEcologyDimension, PolicyEcologyVector, Ref, TraitDirection, TraitUpdate,
     };
     use vrf::VrfEngine;
 
@@ -2055,6 +2185,86 @@ mod tests {
         let proof = proof.expect("proof receipt missing");
         assert_ne!(proof.vrf_digest, Digest32::zero());
         assert_eq!(store.sep_log.events.len(), 1);
+    }
+
+    #[test]
+    fn graph_updates_on_receipt() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let req = make_request(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        let receipt_digest = receipt.receipt_digest.0;
+
+        let decision_edges = store.causal_graph.neighbors([2u8; 32]);
+        assert!(decision_edges.contains(&(EdgeType::Authorizes, receipt_digest)));
+
+        let action_edges = store.causal_graph.neighbors([1u8; 32]);
+        assert!(action_edges.contains(&(EdgeType::Authorizes, receipt_digest)));
+
+        let reverse = store.causal_graph.reverse_neighbors(receipt_digest);
+        assert!(reverse.contains(&(EdgeType::References, [9u8; 32])));
+        assert!(reverse.contains(&(EdgeType::References, [3u8; 32])));
+    }
+
+    #[test]
+    fn graph_updates_on_record_append() {
+        let prev = [7u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let receipt_req = make_request(prev);
+        let (receipt, _) = verify_and_commit(receipt_req, &mut store, &keystore, &vrf_engine);
+        let receipt_digest = receipt.receipt_digest.0;
+
+        let action_digest = [5u8; 32];
+        let decision_digest = [6u8; 32];
+        let frame_digest = [4u8; 32];
+
+        let record = ExperienceRecord {
+            record_type: RecordType::RtActionExec as i32,
+            core_frame: Some(CoreFrame {
+                evidence_refs: vec![Ref {
+                    id: hex::encode(action_digest),
+                }],
+            }),
+            metabolic_frame: None,
+            governance_frame: Some(GovernanceFrame {
+                policy_decision_refs: vec![Ref {
+                    id: hex::encode(decision_digest),
+                }],
+                pvgs_receipt_ref: Some(Ref {
+                    id: hex::encode(receipt_digest),
+                }),
+                dlp_refs: Vec::new(),
+            }),
+            core_frame_ref: Some(Ref {
+                id: hex::encode(action_digest),
+            }),
+            metabolic_frame_ref: None,
+            governance_frame_ref: Some(Ref {
+                id: hex::encode(frame_digest),
+            }),
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        };
+
+        let req =
+            make_experience_request_with_id(&record, &store, keystore.current_epoch(), "exp-1");
+        let (record_receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(record_receipt.status, ReceiptStatus::Accepted);
+
+        let record_digest = store.experience_store.head_record_digest;
+        let neighbors = store.causal_graph.neighbors(record_digest);
+        assert!(neighbors.contains(&(EdgeType::References, decision_digest)));
+        assert!(neighbors.contains(&(EdgeType::References, receipt_digest)));
+        assert!(neighbors.contains(&(EdgeType::References, action_digest)));
+
+        let prev_edges = store.causal_graph.neighbors(prev);
+        assert!(prev_edges.contains(&(EdgeType::Causes, record_digest)));
     }
 
     #[test]

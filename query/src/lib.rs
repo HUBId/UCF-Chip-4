@@ -3,7 +3,8 @@
 use cbv::CharacterBaselineVector;
 use pev::{pev_digest, PolicyEcologyVector};
 use pvgs::{PvgsCommitRequest, PvgsStore};
-use sep::{SepEventInternal, SepEventType, SepLog};
+use sep::{EdgeType, NodeKey, SepEventInternal, SepEventType, SepLog};
+use std::collections::{BTreeSet, VecDeque};
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes};
 use wire::{AuthContext, Envelope};
@@ -27,6 +28,16 @@ pub struct QueryResult {
     pub current_epoch: Option<PVGSKeyEpoch>,
     pub latest_event: Option<SepEventInternal>,
     pub recent_vrf_digest: Option<[u8; 32]>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceResult {
+    pub receipts: Vec<NodeKey>,
+    pub decisions: Vec<NodeKey>,
+    pub records: Vec<NodeKey>,
+    pub profiles: Vec<NodeKey>,
+    pub path: Vec<NodeKey>,
 }
 
 pub trait QueryInspector {
@@ -154,14 +165,123 @@ pub fn list_signal_frames(log: &SepLog, session_id: &str) -> Vec<[u8; 32]> {
         .collect()
 }
 
+const MAX_TRACE_NODES: usize = 256;
+
+/// Traverse the causal graph starting from an action digest to collect receipts,
+/// related decisions, records, and profiles.
+pub fn trace_action(store: &PvgsStore, action_digest: [u8; 32]) -> TraceResult {
+    let mut receipts = BTreeSet::new();
+    let mut decisions = BTreeSet::new();
+    let mut records = BTreeSet::new();
+    let mut profiles = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut path = Vec::new();
+
+    visited.insert(action_digest);
+    path.push(action_digest);
+
+    for (edge, neighbor) in sorted_edges(store.causal_graph.neighbors(action_digest)) {
+        if visited.len() >= MAX_TRACE_NODES {
+            break;
+        }
+
+        match edge {
+            EdgeType::Authorizes => {
+                if receipts.insert(neighbor) && visited.insert(neighbor) {
+                    path.push(neighbor);
+                }
+            }
+            EdgeType::References if is_record_node(store, &neighbor) => {
+                if records.insert(neighbor) && visited.insert(neighbor) {
+                    path.push(neighbor);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut queue = VecDeque::from(receipts.iter().copied().collect::<Vec<_>>());
+    while let Some(receipt) = queue.pop_front() {
+        if visited.len() >= MAX_TRACE_NODES {
+            break;
+        }
+
+        for (edge, neighbor) in sorted_edges(store.causal_graph.reverse_neighbors(receipt)) {
+            if visited.len() >= MAX_TRACE_NODES {
+                break;
+            }
+
+            match edge {
+                EdgeType::Authorizes => {
+                    if neighbor == action_digest {
+                        continue;
+                    }
+
+                    if decisions.insert(neighbor) && visited.insert(neighbor) {
+                        path.push(neighbor);
+                    }
+                }
+                EdgeType::References => {
+                    if is_record_node(store, &neighbor) {
+                        if records.insert(neighbor) && visited.insert(neighbor) {
+                            path.push(neighbor);
+                        }
+                    } else if is_profile_node(store, &neighbor) {
+                        if profiles.insert(neighbor) && visited.insert(neighbor) {
+                            path.push(neighbor);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for (edge, neighbor) in sorted_edges(store.causal_graph.reverse_neighbors(action_digest)) {
+        if visited.len() >= MAX_TRACE_NODES {
+            break;
+        }
+
+        if matches!(edge, EdgeType::References) && is_record_node(store, &neighbor) {
+            if records.insert(neighbor) && visited.insert(neighbor) {
+                path.push(neighbor);
+            }
+        }
+    }
+
+    TraceResult {
+        receipts: receipts.into_iter().collect(),
+        decisions: decisions.into_iter().collect(),
+        records: records.into_iter().collect(),
+        profiles: profiles.into_iter().collect(),
+        path,
+    }
+}
+
+fn sorted_edges(edges: &[(EdgeType, NodeKey)]) -> Vec<(EdgeType, NodeKey)> {
+    let mut ordered = edges.to_vec();
+    ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    ordered
+}
+
+fn is_record_node(store: &PvgsStore, digest: &NodeKey) -> bool {
+    store.experience_store.proof_receipts.contains_key(digest)
+        || store.experience_store.head_record_digest == *digest
+}
+
+fn is_profile_node(store: &PvgsStore, digest: &NodeKey) -> bool {
+    store.known_profiles.contains(digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use keys::KeyStore;
     use pev::PolicyEcologyDimension;
     use pvgs::compute_ruleset_digest;
-    use sep::{FrameEventKind, SepLog};
+    use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
+    use ucf_protocol::ucf::v1::Digest32;
     use vrf::VrfEngine;
 
     fn store_with_epochs() -> (PvgsStore, PVGSKeyEpoch, PVGSKeyEpoch) {
@@ -202,6 +322,39 @@ mod tests {
             .insert(second.announcement_digest.0);
 
         (store, first, second)
+    }
+
+    fn trace_store(profile_digest: [u8; 32]) -> PvgsStore {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+        let mut known_profiles = HashSet::new();
+        known_profiles.insert(profile_digest);
+
+        PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            known_profiles,
+        )
+    }
+
+    fn dummy_proof_receipt(record_digest: [u8; 32]) -> ProofReceipt {
+        ProofReceipt {
+            proof_receipt_id: "proof".to_string(),
+            receipt_digest: Digest32(record_digest),
+            ruleset_digest: Digest32([0u8; 32]),
+            verified_fields_digest: Digest32([0u8; 32]),
+            vrf_digest: Digest32([0u8; 32]),
+            timestamp_ms: 0,
+            epoch_id: 0,
+            proof_receipt_digest: Digest32([0u8; 32]),
+            proof_attestation_key_id: String::new(),
+            proof_attestation_sig: Vec::new(),
+        }
     }
 
     #[test]
@@ -342,5 +495,107 @@ mod tests {
 
         let filtered = list_ruleset_changes(&log, Some("session-b"));
         assert_eq!(filtered, vec![digest_two]);
+    }
+
+    #[test]
+    fn trace_action_collects_related_nodes() {
+        let action = [1u8; 32];
+        let receipt = [2u8; 32];
+        let decision = [3u8; 32];
+        let record = [4u8; 32];
+        let profile = [5u8; 32];
+
+        let mut store = trace_store(profile);
+        store
+            .experience_store
+            .proof_receipts
+            .insert(record, dummy_proof_receipt(record));
+
+        store
+            .causal_graph
+            .add_edge(action, EdgeType::Authorizes, receipt);
+        store
+            .causal_graph
+            .add_edge(decision, EdgeType::Authorizes, receipt);
+        store
+            .causal_graph
+            .add_edge(profile, EdgeType::References, receipt);
+        store
+            .causal_graph
+            .add_edge(record, EdgeType::References, receipt);
+        store
+            .causal_graph
+            .add_edge(record, EdgeType::References, action);
+
+        let result = trace_action(&store, action);
+        assert_eq!(result.receipts, vec![receipt]);
+        assert_eq!(result.decisions, vec![decision]);
+        assert_eq!(result.records, vec![record]);
+        assert_eq!(result.profiles, vec![profile]);
+        assert_eq!(
+            result.path,
+            vec![action, receipt, decision, record, profile]
+        );
+    }
+
+    #[test]
+    fn trace_action_is_deterministic() {
+        let action = [9u8; 32];
+        let receipt = [8u8; 32];
+        let decision_a = [7u8; 32];
+        let decision_b = [6u8; 32];
+        let profile = [5u8; 32];
+        let record = [4u8; 32];
+
+        let mut store_one = trace_store(profile);
+        store_one
+            .experience_store
+            .proof_receipts
+            .insert(record, dummy_proof_receipt(record));
+        store_one
+            .causal_graph
+            .add_edge(action, EdgeType::Authorizes, receipt);
+        store_one
+            .causal_graph
+            .add_edge(decision_b, EdgeType::Authorizes, receipt);
+        store_one
+            .causal_graph
+            .add_edge(decision_a, EdgeType::Authorizes, receipt);
+        store_one
+            .causal_graph
+            .add_edge(record, EdgeType::References, receipt);
+        store_one
+            .causal_graph
+            .add_edge(profile, EdgeType::References, receipt);
+
+        let mut store_two = trace_store(profile);
+        store_two
+            .experience_store
+            .proof_receipts
+            .insert(record, dummy_proof_receipt(record));
+        store_two
+            .causal_graph
+            .add_edge(decision_a, EdgeType::Authorizes, receipt);
+        store_two
+            .causal_graph
+            .add_edge(action, EdgeType::Authorizes, receipt);
+        store_two
+            .causal_graph
+            .add_edge(profile, EdgeType::References, receipt);
+        store_two
+            .causal_graph
+            .add_edge(record, EdgeType::References, receipt);
+        store_two
+            .causal_graph
+            .add_edge(decision_b, EdgeType::Authorizes, receipt);
+
+        let result_one = trace_action(&store_one, action);
+        let result_two = trace_action(&store_two, action);
+
+        assert_eq!(result_one.receipts, result_two.receipts);
+        assert_eq!(result_one.decisions, result_two.decisions);
+        assert_eq!(result_one.records, result_two.records);
+        assert_eq!(result_one.profiles, result_two.profiles);
+        assert_eq!(result_one.path, result_two.path);
     }
 }
