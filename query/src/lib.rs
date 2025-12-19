@@ -222,16 +222,15 @@ pub fn trace_action(store: &PvgsStore, action_digest: [u8; 32]) -> TraceResult {
                     }
                 }
                 EdgeType::References => {
-                    if is_record_node(store, &neighbor)
-                        && records.insert(neighbor)
-                        && visited.insert(neighbor)
+                    let is_record = is_record_node(store, &neighbor);
+                    let is_profile = is_profile_node(store, &neighbor);
+
+                    if (is_record && records.insert(neighbor))
+                        || (is_profile && profiles.insert(neighbor))
                     {
-                        path.push(neighbor);
-                    } else if is_profile_node(store, &neighbor)
-                        && profiles.insert(neighbor)
-                        && visited.insert(neighbor)
-                    {
-                        path.push(neighbor);
+                        if visited.insert(neighbor) {
+                            path.push(neighbor);
+                        }
                     }
                 }
                 _ => {}
