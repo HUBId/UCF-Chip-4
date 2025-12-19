@@ -77,6 +77,42 @@ pub struct CommitBindings {
     pub pev_digest: Option<[u8; 32]>,
 }
 
+/// Current digest state of governance ruleset inputs.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RulesetState {
+    pub charter_version_digest: String,
+    pub policy_version_digest: String,
+    pub tool_registry_digest: Option<[u8; 32]>,
+    pub pev_digest: Option<[u8; 32]>,
+    pub ruleset_digest: [u8; 32],
+}
+
+impl RulesetState {
+    pub fn new(charter_version_digest: String, policy_version_digest: String) -> Self {
+        let mut state = Self {
+            charter_version_digest,
+            policy_version_digest,
+            tool_registry_digest: None,
+            pev_digest: None,
+            ruleset_digest: [0u8; 32],
+        };
+        state.recompute_ruleset_digest();
+        state
+    }
+
+    pub fn recompute_ruleset_digest(&mut self) {
+        let mut hasher = Hasher::new();
+        hasher.update(b"UCF:HASH:RULESET");
+        hasher.update(self.charter_version_digest.as_bytes());
+        hasher.update(self.policy_version_digest.as_bytes());
+        hasher.update(&self.pev_digest.unwrap_or([0u8; 32]));
+        hasher.update(&self.tool_registry_digest.unwrap_or([0u8; 32]));
+
+        self.ruleset_digest = *hasher.finalize().as_bytes();
+    }
+}
+
 pub use protocol::RequiredReceiptKind;
 
 /// A PVGS commit request encompassing bindings and payload digests.
@@ -126,11 +162,14 @@ pub struct PvgsStore {
     pub committed_payload_digests: HashSet<[u8; 32]>,
     pub sep_log: SepLog,
     pub receipt_gate_enabled: bool,
+    pub ruleset_state: RulesetState,
 }
 
 impl PvgsStore {
     pub fn new(
         current_head_record_digest: [u8; 32],
+        charter_version_digest: String,
+        policy_version_digest: String,
         known_charter_versions: HashSet<String>,
         known_policy_versions: HashSet<String>,
         known_profiles: HashSet<[u8; 32]>,
@@ -151,11 +190,28 @@ impl PvgsStore {
             committed_payload_digests: HashSet::new(),
             sep_log: SepLog::default(),
             receipt_gate_enabled: false,
+            ruleset_state: RulesetState::new(charter_version_digest, policy_version_digest),
         }
     }
 
     pub fn get_latest_cbv(&self) -> Option<CharacterBaselineVector> {
         self.cbv_store.latest().cloned()
+    }
+
+    pub fn refresh_ruleset_state(
+        &mut self,
+        charter_version_digest: &str,
+        policy_version_digest: &str,
+    ) {
+        self.ruleset_state.charter_version_digest = charter_version_digest.to_string();
+        self.ruleset_state.policy_version_digest = policy_version_digest.to_string();
+        self.ruleset_state.pev_digest = self.pev_store.latest().and_then(extract_pev_digest);
+        self.ruleset_state.recompute_ruleset_digest();
+    }
+
+    pub fn update_pev_digest(&mut self, pev_digest: Option<[u8; 32]>) {
+        self.ruleset_state.pev_digest = pev_digest;
+        self.ruleset_state.recompute_ruleset_digest();
     }
 
     pub fn append_record(
@@ -216,11 +272,9 @@ impl PvgsStore {
             cbv.cbv_epoch,
         );
 
-        let ruleset_digest = compute_ruleset_digest(
-            charter_version_digest.as_bytes(),
-            policy_version_digest.as_bytes(),
-            pev_digest.as_ref().map(|d| d.as_slice()),
-        );
+        self.refresh_ruleset_state(charter_version_digest, policy_version_digest);
+        self.update_pev_digest(pev_digest);
+        let ruleset_digest = self.ruleset_state.ruleset_digest;
 
         let vrf_digest = vrf_engine.eval_record_vrf(
             prev_cbv_digest,
@@ -319,9 +373,8 @@ pub fn compute_ruleset_digest(
     hasher.update(b"UCF:HASH:RULESET");
     hasher.update(charter_digest);
     hasher.update(policy_digest);
-    if let Some(pev) = pev_digest {
-        hasher.update(pev);
-    }
+    hasher.update(pev_digest.unwrap_or([0u8; 32].as_slice()));
+    hasher.update([0u8; 32].as_slice());
     *hasher.finalize().as_bytes()
 }
 
@@ -704,12 +757,16 @@ pub fn verify_and_commit(
         req.epoch_id,
     );
 
+    store.refresh_ruleset_state(
+        &req.bindings.charter_version_digest,
+        &req.bindings.policy_version_digest,
+    );
+    if req.bindings.pev_digest.is_some() {
+        store.update_pev_digest(req.bindings.pev_digest);
+    }
+
     let mut proof_receipt = issue_proof_receipt(
-        compute_ruleset_digest(
-            req.bindings.charter_version_digest.as_bytes(),
-            req.bindings.policy_version_digest.as_bytes(),
-            req.bindings.pev_digest.as_ref().map(|d| d.as_slice()),
-        ),
+        store.ruleset_state.ruleset_digest,
         verified_fields_digest,
         vrf_digest,
         keystore,
@@ -865,12 +922,14 @@ fn verify_pev_update(
         req.epoch_id,
     );
 
+    store.refresh_ruleset_state(
+        &req.bindings.charter_version_digest,
+        &req.bindings.policy_version_digest,
+    );
+    store.update_pev_digest(Some(pev_digest));
+
     let mut proof_receipt = issue_proof_receipt(
-        compute_ruleset_digest(
-            req.bindings.charter_version_digest.as_bytes(),
-            req.bindings.policy_version_digest.as_bytes(),
-            Some(&pev_digest),
-        ),
+        store.ruleset_state.ruleset_digest,
         verified_fields_digest,
         vrf_digest,
         keystore,
@@ -882,11 +941,12 @@ fn verify_pev_update(
         .push(pev)
         .expect("validated PEV must be insertable");
     store.committed_payload_digests.insert(pev_digest);
+    store.update_pev_digest(Some(pev_digest));
 
     store.sep_log.append_event(
         req.commit_id.clone(),
         SepEventType::EvPevUpdate,
-        pev_digest,
+        store.ruleset_state.ruleset_digest,
         vec![protocol::ReasonCodes::GV_PEV_UPDATED.to_string()],
     );
 
@@ -1056,12 +1116,16 @@ fn verify_experience_record_append(
         keystore,
     );
 
+    store.refresh_ruleset_state(
+        &finalization_header.charter_version_digest,
+        &finalization_header.policy_version_digest,
+    );
+    if req.bindings.pev_digest.is_some() {
+        store.update_pev_digest(req.bindings.pev_digest);
+    }
+
     let mut proof_receipt = issue_proof_receipt(
-        compute_ruleset_digest(
-            finalization_header.charter_version_digest.as_bytes(),
-            finalization_header.policy_version_digest.as_bytes(),
-            req.bindings.pev_digest.as_ref().map(|d| d.as_slice()),
-        ),
+        store.ruleset_state.ruleset_digest,
         verified_fields_digest,
         vrf_digest,
         keystore,
@@ -1555,6 +1619,8 @@ mod tests {
 
         PvgsStore::new(
             prev_digest,
+            "charter".to_string(),
+            "policy".to_string(),
             known_charter_versions,
             known_policy_versions,
             known_profiles,
@@ -2106,11 +2172,90 @@ mod tests {
 
         let sep_event = store.sep_log.events.last().expect("missing sep event");
         assert_eq!(sep_event.event_type, SepEventType::EvPevUpdate);
-        assert_eq!(sep_event.object_digest, pev_digest);
+        assert_eq!(sep_event.object_digest, store.ruleset_state.ruleset_digest);
         assert_eq!(
             sep_event.reason_codes,
             vec![ReasonCodes::GV_PEV_UPDATED.to_string()]
         );
+    }
+
+    #[test]
+    fn ruleset_digest_changes_when_pev_updates() {
+        let prev = [2u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let initial_ruleset = store.ruleset_state.ruleset_digest;
+
+        let (receipt_before, proof_before) =
+            verify_and_commit(make_request(prev), &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt_before.status, ReceiptStatus::Accepted);
+        let proof_before = proof_before.expect("proof receipt before PEV");
+        assert_eq!(
+            proof_before.ruleset_digest.0,
+            store.ruleset_state.ruleset_digest
+        );
+
+        let pev_digest = [0x33u8; 32];
+        let pev = sample_pev(pev_digest, 1);
+        let pev_req = PvgsCommitRequest {
+            commit_id: "pev-update-ruleset".to_string(),
+            commit_type: CommitType::PevUpdate,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: prev,
+                profile_digest: Some([9u8; 32]),
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+            payload_digests: vec![pev_digest],
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            pev: Some(pev),
+        };
+
+        let (_, pev_proof) = verify_and_commit(pev_req, &mut store, &keystore, &vrf_engine);
+        let pev_proof = pev_proof.expect("proof receipt after PEV");
+        let updated_ruleset = store.ruleset_state.ruleset_digest;
+
+        assert_ne!(initial_ruleset, updated_ruleset);
+        assert_eq!(pev_proof.ruleset_digest.0, updated_ruleset);
+
+        let mut after_req = make_request(prev);
+        after_req.commit_id = "after-pev".to_string();
+        let (_, proof_after) = verify_and_commit(after_req, &mut store, &keystore, &vrf_engine);
+        let proof_after = proof_after.expect("proof receipt after ruleset change");
+
+        assert_ne!(proof_before.ruleset_digest, proof_after.ruleset_digest);
+        assert_eq!(
+            proof_after.ruleset_digest.0,
+            store.ruleset_state.ruleset_digest
+        );
+
+        let sep_event = store
+            .sep_log
+            .events
+            .iter()
+            .find(|event| event.event_type == SepEventType::EvPevUpdate)
+            .expect("missing sep event");
+        assert_eq!(sep_event.object_digest, store.ruleset_state.ruleset_digest);
+    }
+
+    #[test]
+    fn ruleset_digest_is_stable_without_pev() {
+        let mut state = RulesetState::new("charter".to_string(), "policy".to_string());
+        let first = state.ruleset_digest;
+        state.recompute_ruleset_digest();
+
+        assert_eq!(first, state.ruleset_digest);
     }
 
     #[test]

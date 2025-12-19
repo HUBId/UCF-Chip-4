@@ -3,8 +3,8 @@
 use cbv::CharacterBaselineVector;
 use keys::{KeyEpochHistory, KeyStore};
 use pvgs::{
-    compute_ruleset_digest, compute_verified_fields_digest, CommitBindings, CommitType,
-    PvgsCommitRequest, RequiredCheck,
+    compute_verified_fields_digest, CommitBindings, CommitType, PvgsCommitRequest, RequiredCheck,
+    RulesetState,
 };
 use query::{QueryRequest, QueryResult};
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
@@ -79,12 +79,14 @@ fn main() {
         commit_request.epoch_id,
     );
 
+    let mut ruleset_state = RulesetState::new(
+        commit_request.bindings.charter_version_digest.clone(),
+        commit_request.bindings.policy_version_digest.clone(),
+    );
+    ruleset_state.recompute_ruleset_digest();
+
     let proof_receipt = issue_proof_receipt(
-        compute_ruleset_digest(
-            commit_request.bindings.charter_version_digest.as_bytes(),
-            commit_request.bindings.policy_version_digest.as_bytes(),
-            None,
-        ),
+        ruleset_state.ruleset_digest,
         verified_fields_digest,
         vrf_digest,
         &keystore,
