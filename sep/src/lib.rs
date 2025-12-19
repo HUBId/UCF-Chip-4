@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hasher;
+use log::warn;
+use std::collections::HashMap;
 use thiserror::Error;
 
 #[cfg(feature = "serde")]
@@ -147,6 +149,116 @@ impl SepLog {
             }
         }
         Ok(())
+    }
+}
+
+/// Canonical node identifier for causal graph nodes.
+pub type NodeKey = [u8; 32];
+
+/// Edge relationship between two nodes.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EdgeType {
+    Causes,
+    Decides,
+    Authorizes,
+    Dispatches,
+    Finalizes,
+    References,
+}
+
+/// Default maximum number of edges stored per node.
+pub const MAX_EDGES_PER_NODE: usize = 128;
+
+/// In-memory causal graph index with forward and reverse adjacency.
+#[derive(Debug, Clone, Default)]
+pub struct CausalGraph {
+    pub adj: HashMap<NodeKey, Vec<(EdgeType, NodeKey)>>,
+    pub rev: HashMap<NodeKey, Vec<(EdgeType, NodeKey)>>,
+}
+
+const EMPTY_EDGES: &[(EdgeType, NodeKey)] = &[];
+
+impl CausalGraph {
+    /// Create a new empty graph.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add an edge to the graph, enforcing per-node limits and dropping the
+    /// oldest edge when the limit is exceeded.
+    pub fn add_edge(&mut self, from: NodeKey, et: EdgeType, to: NodeKey) {
+        if self.edge_exists(&from, et, &to) {
+            return;
+        }
+
+        if let Some((old_et, old_to)) = self.prune_if_needed(&from, true) {
+            self.remove_edge_from(&old_to, old_et, &from, false);
+        }
+        self.adj.entry(from).or_default().push((et, to));
+
+        if let Some((old_et, old_from)) = self.prune_if_needed(&to, false) {
+            self.remove_edge_from(&old_from, old_et, &to, true);
+        }
+        self.rev.entry(to).or_default().push((et, from));
+    }
+
+    /// Forward neighbors for a node.
+    pub fn neighbors(&self, node: NodeKey) -> &[(EdgeType, NodeKey)] {
+        self.adj
+            .get(&node)
+            .map(|v| v.as_slice())
+            .unwrap_or(EMPTY_EDGES)
+    }
+
+    /// Reverse neighbors for a node.
+    pub fn reverse_neighbors(&self, node: NodeKey) -> &[(EdgeType, NodeKey)] {
+        self.rev
+            .get(&node)
+            .map(|v| v.as_slice())
+            .unwrap_or(EMPTY_EDGES)
+    }
+
+    fn edge_exists(&self, from: &NodeKey, et: EdgeType, to: &NodeKey) -> bool {
+        self.adj
+            .get(from)
+            .map(|edges| edges.iter().any(|(e, dst)| *e == et && dst == to))
+            .unwrap_or(false)
+    }
+
+    fn prune_if_needed(&mut self, node: &NodeKey, forward: bool) -> Option<(EdgeType, NodeKey)> {
+        let map = if forward {
+            &mut self.adj
+        } else {
+            &mut self.rev
+        };
+        let edges = map.get_mut(node)?;
+        if edges.len() < MAX_EDGES_PER_NODE {
+            return None;
+        }
+
+        let removed = edges.remove(0);
+        warn!(
+            "edge limit exceeded for node {:?} (forward={}), dropping oldest edge",
+            node, forward
+        );
+        Some(removed)
+    }
+
+    fn remove_edge_from(&mut self, node: &NodeKey, et: EdgeType, target: &NodeKey, forward: bool) {
+        let map = if forward {
+            &mut self.adj
+        } else {
+            &mut self.rev
+        };
+        if let Some(edges) = map.get_mut(node) {
+            if let Some(pos) = edges
+                .iter()
+                .position(|(edge_type, neighbor)| *edge_type == et && neighbor == target)
+            {
+                edges.remove(pos);
+            }
+        }
     }
 }
 
