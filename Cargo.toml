@@ -17,6 +17,7 @@ members = [
     "engine",
     "tool_registry_state",
     "replay",
+    "gem",
 ]
 resolver = "2"
 

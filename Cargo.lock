@@ -234,6 +234,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a3076410a55c90011c298b04d0cfa770b00fa04e1e3c97d3f6c9de105a03844"
 
 [[package]]
+name = "gem"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "once_cell",
+ "prost",
+ "pvgs_client",
+ "thiserror",
+ "ucf-protocol",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -316,6 +328,12 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "once_cell"
+version = "1.21.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
 name = "pev"
@@ -404,6 +422,7 @@ name = "pvgs_client"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+ "ucf-protocol",
 ]
 
 [[package]]

@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
+
 use thiserror::Error;
+use ucf_protocol::ucf::v1::ExperienceRecord;
 
 /// Convenience alias for 32-byte digests exposed by PVGS queries.
 pub type Digest32 = [u8; 32];
@@ -23,9 +26,18 @@ pub trait PvgsWriter {
         session_id: &str,
         control_frame_digest: Digest32,
     ) -> Result<(), PvgsClientError>;
+
+    fn commit_experience_record(
+        &mut self,
+        _record: &ExperienceRecord,
+    ) -> Result<(), PvgsClientError> {
+        Err(PvgsClientError::Commit(
+            "experience commit unsupported".into(),
+        ))
+    }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum PvgsClientError {
     #[error("commit failed: {0}")]
     Commit(String),
@@ -37,6 +49,48 @@ pub struct MockPvgsReader {
     cbv_digest: Option<Digest32>,
     pev_digest: Option<Digest32>,
     ruleset_digest: Option<Digest32>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MockPvgsWriter {
+    pub control_frame_commits: RefCell<Vec<(String, Digest32)>>,
+    pub experience_records: RefCell<Vec<ExperienceRecord>>,
+    pub fail_experience: RefCell<Option<PvgsClientError>>,
+}
+
+impl MockPvgsWriter {
+    pub fn with_experience_error(err: PvgsClientError) -> Self {
+        Self {
+            control_frame_commits: RefCell::new(Vec::new()),
+            experience_records: RefCell::new(Vec::new()),
+            fail_experience: RefCell::new(Some(err)),
+        }
+    }
+}
+
+impl PvgsWriter for MockPvgsWriter {
+    fn commit_control_frame_evidence(
+        &mut self,
+        session_id: &str,
+        control_frame_digest: Digest32,
+    ) -> Result<(), PvgsClientError> {
+        self.control_frame_commits
+            .borrow_mut()
+            .push((session_id.to_string(), control_frame_digest));
+        Ok(())
+    }
+
+    fn commit_experience_record(
+        &mut self,
+        record: &ExperienceRecord,
+    ) -> Result<(), PvgsClientError> {
+        if let Some(err) = self.fail_experience.borrow_mut().take() {
+            return Err(err);
+        }
+
+        self.experience_records.borrow_mut().push(record.clone());
+        Ok(())
+    }
 }
 
 impl MockPvgsReader {

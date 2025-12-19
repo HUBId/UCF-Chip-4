@@ -301,6 +301,7 @@ impl PvgsStore {
         match RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified) {
             RecordType::RtActionExec => self.add_action_exec_edges(record_digest, record),
             RecordType::RtOutput => self.add_output_edges(record_digest, record),
+            RecordType::RtDecision => {}
             _ => {}
         }
     }
@@ -1573,6 +1574,19 @@ fn validate_experience_record(
             }
 
             if record.dlp_refs.is_empty() {
+                reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            }
+        }
+        RecordType::RtDecision => {
+            if record.governance_frame_ref.is_none() {
+                reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            }
+
+            if record
+                .governance_frame
+                .as_ref()
+                .is_none_or(|gov| gov.policy_decision_refs.is_empty())
+            {
                 reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
             }
         }
