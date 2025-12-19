@@ -164,6 +164,7 @@ pub struct ExperienceStore {
 pub struct PvgsStore {
     pub current_head_record_digest: [u8; 32],
     pub experience_store: ExperienceStore,
+    pub receipts: HashMap<[u8; 32], PVGSReceipt>,
     pub known_charter_versions: HashSet<String>,
     pub known_policy_versions: HashSet<String>,
     pub known_profiles: HashSet<[u8; 32]>,
@@ -194,6 +195,7 @@ impl PvgsStore {
         Self {
             current_head_record_digest,
             experience_store,
+            receipts: HashMap::new(),
             known_charter_versions,
             known_policy_versions,
             known_profiles,
@@ -256,11 +258,12 @@ impl PvgsStore {
     }
 
     fn add_receipt_edges(&mut self, receipt: &PVGSReceipt) {
+        let receipt_digest = receipt.receipt_digest.0;
+        self.receipts.insert(receipt_digest, receipt.clone());
+
         if !matches!(receipt.status, ReceiptStatus::Accepted) {
             return;
         }
-
-        let receipt_digest = receipt.receipt_digest.0;
         if let Some(decision) = optional_proto_digest(&receipt.bindings.decision_digest) {
             self.causal_graph
                 .add_edge(decision, EdgeType::Authorizes, receipt_digest);
@@ -470,6 +473,8 @@ impl PvgsStore {
             Vec::new(),
             keystore,
         );
+
+        self.add_receipt_edges(&receipt);
 
         cbv.proof_receipt_ref = Some(Ref {
             id: proof_receipt.proof_receipt_id.clone(),
@@ -1293,6 +1298,8 @@ fn verify_tool_registry_update(
         keystore,
     );
 
+    store.add_receipt_edges(&receipt);
+
     store.committed_payload_digests.insert(registry_digest);
 
     let mut proof_receipt = issue_proof_receipt(
@@ -1476,6 +1483,8 @@ fn verify_experience_record_append(
         reject_reason_codes.clone(),
         keystore,
     );
+
+    store.add_receipt_edges(&receipt);
 
     let (ruleset_changed, charter_or_policy_changed) = store.refresh_ruleset_state(
         &finalization_header.charter_version_digest,

@@ -455,6 +455,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "replay"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "keys",
+ "prost",
+ "pvgs",
+ "sep",
+ "serde",
+ "thiserror",
+ "ucf-protocol",
+ "vrf",
+]
+
+[[package]]
 name = "rsv"
 version = "0.1.0"
 dependencies = [

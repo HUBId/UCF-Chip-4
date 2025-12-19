@@ -1,0 +1,18 @@
+[package]
+name = "replay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+blake3 = { workspace = true }
+pvgs = { path = "../pvgs" }
+sep = { path = "../sep" }
+ucf-protocol = { path = "../ucf-protocol" }
+thiserror = { workspace = true }
+serde = { workspace = true, optional = true, features = ["derive"] }
+hex = "0.4"
+
+[dev-dependencies]
+keys = { path = "../keys" }
+prost = { workspace = true }
+vrf = { path = "../vrf" }
