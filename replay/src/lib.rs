@@ -216,10 +216,7 @@ pub fn verify_action_manifest(
         match lookup_record(&entry.record_digest, &store.experience_store.records) {
             Some(record) => {
                 if let Some(gov) = &record.governance_frame {
-                    let receipt_matches = gov
-                        .pvgs_receipt_ref
-                        .as_ref()
-                        .and_then(digest_from_ref)
+                    let receipt_matches = gov.pvgs_receipt_ref.as_ref().and_then(digest_from_ref)
                         == Some(entry.receipt_digest);
                     let mut decisions: Vec<[u8; 32]> = gov
                         .policy_decision_refs
