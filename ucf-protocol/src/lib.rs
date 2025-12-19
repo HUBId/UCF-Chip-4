@@ -377,6 +377,7 @@ pub mod ucf {
             RtActionExec = 1,
             RtOutput = 2,
             RtPerception = 3,
+            RtDecision = 4,
         }
 
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
