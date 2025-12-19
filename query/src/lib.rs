@@ -225,8 +225,8 @@ pub fn trace_action(store: &PvgsStore, action_digest: [u8; 32]) -> TraceResult {
                     let is_record = is_record_node(store, &neighbor);
                     let is_profile = is_profile_node(store, &neighbor);
 
-                    let inserted =
-                        (is_record && records.insert(neighbor)) || (is_profile && profiles.insert(neighbor));
+                    let inserted = (is_record && records.insert(neighbor))
+                        || (is_profile && profiles.insert(neighbor));
 
                     if inserted && visited.insert(neighbor) {
                         path.push(neighbor);
