@@ -205,10 +205,7 @@ impl PvgsStore {
     ) {
         self.ruleset_state.charter_version_digest = charter_version_digest.to_string();
         self.ruleset_state.policy_version_digest = policy_version_digest.to_string();
-        self.ruleset_state.pev_digest = self
-            .pev_store
-            .latest()
-            .and_then(|pev| extract_pev_digest(pev));
+        self.ruleset_state.pev_digest = self.pev_store.latest().and_then(extract_pev_digest);
         self.ruleset_state.recompute_ruleset_digest();
     }
 
