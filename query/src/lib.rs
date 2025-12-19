@@ -5,7 +5,7 @@ use pev::{pev_digest, PolicyEcologyVector};
 use pvgs::{PvgsCommitRequest, PvgsStore};
 use sep::{SepEventInternal, SepEventType, SepLog};
 use thiserror::Error;
-use ucf_protocol::ucf::v1::{PVGSKeyEpoch, PVGSReceipt, ProofReceipt};
+use ucf_protocol::ucf::v1::{PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes};
 use wire::{AuthContext, Envelope};
 
 #[cfg(feature = "serde")]
@@ -96,6 +96,31 @@ pub fn list_tool_registry_digests(store: &PvgsStore) -> Vec<[u8; 32]> {
     store.tool_registry_state.history.clone()
 }
 
+/// Return the current ruleset digest if available.
+pub fn get_current_ruleset_digest(store: &PvgsStore) -> Option<[u8; 32]> {
+    Some(store.ruleset_state.ruleset_digest)
+}
+
+/// Return the previous ruleset digest if tracked.
+pub fn get_previous_ruleset_digest(store: &PvgsStore) -> Option<[u8; 32]> {
+    store.ruleset_state.prev_ruleset_digest
+}
+
+/// List all ruleset change digests observed in the SEP log.
+pub fn list_ruleset_changes(log: &SepLog, session_id: Option<&str>) -> Vec<[u8; 32]> {
+    log.events
+        .iter()
+        .filter(|event| {
+            event
+                .reason_codes
+                .iter()
+                .any(|reason| reason == ReasonCodes::GV_RULESET_CHANGED)
+                && session_id.map_or(true, |sid| sid == event.session_id)
+        })
+        .map(|event| event.object_digest)
+        .collect()
+}
+
 /// Return true if the SEP log contains a control frame event with the digest in the session.
 pub fn has_control_frame_digest(log: &SepLog, session_id: &str, digest: [u8; 32]) -> bool {
     log.events.iter().any(|event| {
@@ -134,6 +159,7 @@ mod tests {
     use super::*;
     use keys::KeyStore;
     use pev::PolicyEcologyDimension;
+    use pvgs::compute_ruleset_digest;
     use sep::{FrameEventKind, SepLog};
     use std::collections::HashSet;
     use vrf::VrfEngine;
@@ -243,6 +269,27 @@ mod tests {
     }
 
     #[test]
+    fn ruleset_queries_return_current_and_previous() {
+        let (mut store, _, _) = store_with_epochs();
+        let expected = compute_ruleset_digest(b"charter", b"policy", None, None);
+
+        let current = get_current_ruleset_digest(&store).expect("missing ruleset");
+        assert_eq!(current, expected);
+        assert_eq!(get_previous_ruleset_digest(&store), Some([0u8; 32]));
+
+        let updated_tool_registry = [0x44u8; 32];
+        store
+            .tool_registry_state
+            .set_current(updated_tool_registry)
+            .expect("tool registry digest");
+        store.update_tool_registry_digest(store.tool_registry_state.current());
+
+        let updated = get_current_ruleset_digest(&store).expect("missing updated ruleset");
+        assert_ne!(updated, expected);
+        assert_eq!(get_previous_ruleset_digest(&store), Some(expected));
+    }
+
+    #[test]
     fn frame_queries_return_digests() {
         let mut log = SepLog::default();
         let control_digest = [7u8; 32];
@@ -269,5 +316,31 @@ mod tests {
 
         let signals = list_signal_frames(&log, "session-1");
         assert_eq!(signals, vec![signal_digest]);
+    }
+
+    #[test]
+    fn ruleset_change_queries_list_digests() {
+        let mut log = SepLog::default();
+        let digest_one = [1u8; 32];
+        let digest_two = [2u8; 32];
+
+        log.append_event(
+            "session-a".to_string(),
+            SepEventType::EvPevUpdate,
+            digest_one,
+            vec![ReasonCodes::GV_RULESET_CHANGED.to_string()],
+        );
+        log.append_event(
+            "session-b".to_string(),
+            SepEventType::EvToolOnboarding,
+            digest_two,
+            vec![ReasonCodes::GV_RULESET_CHANGED.to_string()],
+        );
+
+        let all_changes = list_ruleset_changes(&log, None);
+        assert_eq!(all_changes, vec![digest_one, digest_two]);
+
+        let filtered = list_ruleset_changes(&log, Some("session-b"));
+        assert_eq!(filtered, vec![digest_two]);
     }
 }
