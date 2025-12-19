@@ -1585,7 +1585,7 @@ fn validate_experience_record(
             if record
                 .governance_frame
                 .as_ref()
-                .map_or(true, |gov| gov.policy_decision_refs.is_empty())
+                .is_none_or(|gov| gov.policy_decision_refs.is_empty())
             {
                 reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
             }
