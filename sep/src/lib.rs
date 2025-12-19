@@ -24,6 +24,7 @@ pub enum SepEventType {
     EvProfileChange,
     EvAgentStep,
     EvIntent,
+    EvReplay,
 }
 
 impl SepEventType {
@@ -41,6 +42,7 @@ impl SepEventType {
             SepEventType::EvProfileChange => "EV_PROFILE_CHANGE",
             SepEventType::EvAgentStep => "EV_AGENT_STEP",
             SepEventType::EvIntent => "EV_INTENT",
+            SepEventType::EvReplay => "EV_REPLAY",
         }
     }
 }

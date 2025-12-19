@@ -16,6 +16,7 @@ members = [
     "profiles",
     "engine",
     "tool_registry_state",
+    "replay",
 ]
 resolver = "2"
 
