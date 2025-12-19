@@ -331,6 +331,7 @@ pub mod ucf {
             pub const GV_CBV_NO_CHANGE: &'static str = "RC.GV.CBV.NO_CHANGE";
             pub const GV_PEV_UPDATED: &'static str = "RC.GV.PEV.UPDATED";
             pub const GV_TOOL_REGISTRY_UPDATED: &'static str = "RC.GV.TOOL_REGISTRY.UPDATED";
+            pub const GV_RULESET_CHANGED: &'static str = "RC.GV.RULESET.CHANGED";
         }
 
         /// Lightweight reference type for future graph links.

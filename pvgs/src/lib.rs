@@ -87,6 +87,7 @@ pub struct RulesetState {
     pub tool_registry_digest: Option<[u8; 32]>,
     pub pev_digest: Option<[u8; 32]>,
     pub ruleset_digest: [u8; 32],
+    pub prev_ruleset_digest: Option<[u8; 32]>,
 }
 
 impl RulesetState {
@@ -97,18 +98,28 @@ impl RulesetState {
             tool_registry_digest: None,
             pev_digest: None,
             ruleset_digest: [0u8; 32],
+            prev_ruleset_digest: None,
         };
         state.recompute_ruleset_digest();
         state
     }
 
-    pub fn recompute_ruleset_digest(&mut self) {
-        self.ruleset_digest = compute_ruleset_digest(
+    pub fn recompute_ruleset_digest(&mut self) -> bool {
+        let old_ruleset_digest = self.ruleset_digest;
+        let new_ruleset_digest = compute_ruleset_digest(
             self.charter_version_digest.as_bytes(),
             self.policy_version_digest.as_bytes(),
             self.pev_digest.as_ref().map(|d| d.as_slice()),
             self.tool_registry_digest.as_ref().map(|d| d.as_slice()),
         );
+
+        if new_ruleset_digest != old_ruleset_digest {
+            self.prev_ruleset_digest = Some(old_ruleset_digest);
+            self.ruleset_digest = new_ruleset_digest;
+            return true;
+        }
+
+        false
     }
 }
 
@@ -204,22 +215,42 @@ impl PvgsStore {
         &mut self,
         charter_version_digest: &str,
         policy_version_digest: &str,
-    ) {
+    ) -> (bool, bool) {
+        let charter_changed = self.ruleset_state.charter_version_digest != charter_version_digest;
+        let policy_changed = self.ruleset_state.policy_version_digest != policy_version_digest;
         self.ruleset_state.charter_version_digest = charter_version_digest.to_string();
         self.ruleset_state.policy_version_digest = policy_version_digest.to_string();
         self.ruleset_state.pev_digest = self.pev_store.latest().and_then(extract_pev_digest);
         self.ruleset_state.tool_registry_digest = self.tool_registry_state.current();
-        self.ruleset_state.recompute_ruleset_digest();
+        (
+            self.ruleset_state.recompute_ruleset_digest(),
+            charter_changed || policy_changed,
+        )
     }
 
-    pub fn update_pev_digest(&mut self, pev_digest: Option<[u8; 32]>) {
+    pub fn update_pev_digest(&mut self, pev_digest: Option<[u8; 32]>) -> bool {
         self.ruleset_state.pev_digest = pev_digest;
-        self.ruleset_state.recompute_ruleset_digest();
+        self.ruleset_state.recompute_ruleset_digest()
     }
 
-    pub fn update_tool_registry_digest(&mut self, tool_registry_digest: Option<[u8; 32]>) {
+    pub fn update_tool_registry_digest(&mut self, tool_registry_digest: Option<[u8; 32]>) -> bool {
         self.ruleset_state.tool_registry_digest = tool_registry_digest;
-        self.ruleset_state.recompute_ruleset_digest();
+        self.ruleset_state.recompute_ruleset_digest()
+    }
+
+    fn log_ruleset_change(
+        &mut self,
+        session_id: &str,
+        event_type: SepEventType,
+        mut reason_codes: Vec<String>,
+    ) {
+        reason_codes.push(protocol::ReasonCodes::GV_RULESET_CHANGED.to_string());
+        self.sep_log.append_event(
+            session_id.to_string(),
+            event_type,
+            self.ruleset_state.ruleset_digest,
+            reason_codes,
+        );
     }
 
     pub fn append_record(
@@ -280,7 +311,15 @@ impl PvgsStore {
             cbv.cbv_epoch,
         );
 
-        self.refresh_ruleset_state(charter_version_digest, policy_version_digest);
+        let (ruleset_changed, charter_or_policy_changed) =
+            self.refresh_ruleset_state(charter_version_digest, policy_version_digest);
+        if ruleset_changed && charter_or_policy_changed {
+            self.log_ruleset_change(
+                &macro_milestone.macro_id,
+                SepEventType::EvCharterUpdate,
+                Vec::new(),
+            );
+        }
         self.update_pev_digest(pev_digest);
         let ruleset_digest = self.ruleset_state.ruleset_digest;
 
@@ -785,10 +824,13 @@ pub fn verify_and_commit(
         req.epoch_id,
     );
 
-    store.refresh_ruleset_state(
+    let (ruleset_changed, charter_or_policy_changed) = store.refresh_ruleset_state(
         &req.bindings.charter_version_digest,
         &req.bindings.policy_version_digest,
     );
+    if ruleset_changed && charter_or_policy_changed {
+        store.log_ruleset_change(&req.commit_id, SepEventType::EvCharterUpdate, Vec::new());
+    }
     if req.bindings.pev_digest.is_some() {
         store.update_pev_digest(req.bindings.pev_digest);
     }
@@ -950,11 +992,14 @@ fn verify_pev_update(
         req.epoch_id,
     );
 
-    store.refresh_ruleset_state(
+    let (ruleset_changed, charter_or_policy_changed) = store.refresh_ruleset_state(
         &req.bindings.charter_version_digest,
         &req.bindings.policy_version_digest,
     );
-    store.update_pev_digest(Some(pev_digest));
+    if ruleset_changed && charter_or_policy_changed {
+        store.log_ruleset_change(&req.commit_id, SepEventType::EvCharterUpdate, Vec::new());
+    }
+    let ruleset_changed = store.update_pev_digest(Some(pev_digest));
 
     let mut proof_receipt = issue_proof_receipt(
         store.ruleset_state.ruleset_digest,
@@ -969,14 +1014,14 @@ fn verify_pev_update(
         .push(pev)
         .expect("validated PEV must be insertable");
     store.committed_payload_digests.insert(pev_digest);
-    store.update_pev_digest(Some(pev_digest));
 
-    store.sep_log.append_event(
-        req.commit_id.clone(),
-        SepEventType::EvPevUpdate,
-        store.ruleset_state.ruleset_digest,
-        vec![protocol::ReasonCodes::GV_PEV_UPDATED.to_string()],
-    );
+    if ruleset_changed {
+        store.log_ruleset_change(
+            &req.commit_id,
+            SepEventType::EvPevUpdate,
+            vec![protocol::ReasonCodes::GV_PEV_UPDATED.to_string()],
+        );
+    }
 
     (receipt, Some(proof_receipt))
 }
@@ -1122,11 +1167,17 @@ fn verify_tool_registry_update(
         req.epoch_id,
     );
 
-    store.refresh_ruleset_state(
+    let (ruleset_changed, charter_or_policy_changed) = store.refresh_ruleset_state(
         &req.bindings.charter_version_digest,
         &req.bindings.policy_version_digest,
     );
-    store.update_tool_registry_digest(store.tool_registry_state.current());
+    if ruleset_changed && charter_or_policy_changed {
+        store.log_ruleset_change(&req.commit_id, SepEventType::EvCharterUpdate, Vec::new());
+    }
+    let tool_ruleset_changed =
+        store.update_tool_registry_digest(store.tool_registry_state.current());
+    let effective_tool_change =
+        tool_ruleset_changed || (ruleset_changed && !charter_or_policy_changed);
 
     let receipt = issue_receipt(
         &receipt_input,
@@ -1145,12 +1196,13 @@ fn verify_tool_registry_update(
     );
     proof_receipt.receipt_digest = receipt.receipt_digest.clone();
 
-    store.sep_log.append_event(
-        req.commit_id.clone(),
-        SepEventType::EvToolOnboarding,
-        registry_digest,
-        vec![protocol::ReasonCodes::GV_TOOL_REGISTRY_UPDATED.to_string()],
-    );
+    if effective_tool_change {
+        store.log_ruleset_change(
+            &req.commit_id,
+            SepEventType::EvToolOnboarding,
+            vec![protocol::ReasonCodes::GV_TOOL_REGISTRY_UPDATED.to_string()],
+        );
+    }
 
     (receipt, Some(proof_receipt))
 }
@@ -1318,10 +1370,13 @@ fn verify_experience_record_append(
         keystore,
     );
 
-    store.refresh_ruleset_state(
+    let (ruleset_changed, charter_or_policy_changed) = store.refresh_ruleset_state(
         &finalization_header.charter_version_digest,
         &finalization_header.policy_version_digest,
     );
+    if ruleset_changed && charter_or_policy_changed {
+        store.log_ruleset_change(&req.commit_id, SepEventType::EvCharterUpdate, Vec::new());
+    }
     if req.bindings.pev_digest.is_some() {
         store.update_pev_digest(req.bindings.pev_digest);
     }
@@ -2339,6 +2394,7 @@ mod tests {
     fn pev_update_commit_appends_sep_event() {
         let prev = [2u8; 32];
         let mut store = base_store(prev);
+        let initial_ruleset = store.ruleset_state.ruleset_digest;
         let keystore = KeyStore::new_dev_keystore(1);
         let vrf_engine = VrfEngine::new_dev(1);
         let pev_digest = [0x22u8; 32];
@@ -2391,7 +2447,14 @@ mod tests {
         assert_eq!(sep_event.object_digest, store.ruleset_state.ruleset_digest);
         assert_eq!(
             sep_event.reason_codes,
-            vec![ReasonCodes::GV_PEV_UPDATED.to_string()]
+            vec![
+                ReasonCodes::GV_PEV_UPDATED.to_string(),
+                ReasonCodes::GV_RULESET_CHANGED.to_string(),
+            ]
+        );
+        assert_eq!(
+            store.ruleset_state.prev_ruleset_digest,
+            Some(initial_ruleset)
         );
     }
 
@@ -2464,6 +2527,17 @@ mod tests {
             .find(|event| event.event_type == SepEventType::EvPevUpdate)
             .expect("missing sep event");
         assert_eq!(sep_event.object_digest, store.ruleset_state.ruleset_digest);
+        assert_eq!(
+            sep_event.reason_codes,
+            vec![
+                ReasonCodes::GV_PEV_UPDATED.to_string(),
+                ReasonCodes::GV_RULESET_CHANGED.to_string(),
+            ]
+        );
+        assert_eq!(
+            store.ruleset_state.prev_ruleset_digest,
+            Some(initial_ruleset)
+        );
     }
 
     #[test]
@@ -2515,18 +2589,27 @@ mod tests {
 
         let sep_event = store.sep_log.events.last().expect("missing sep event");
         assert_eq!(sep_event.event_type, SepEventType::EvToolOnboarding);
-        assert_eq!(sep_event.object_digest, registry_digest);
-        assert!(sep_event
-            .reason_codes
-            .contains(&ReasonCodes::GV_TOOL_REGISTRY_UPDATED.to_string()));
+        assert_eq!(sep_event.object_digest, store.ruleset_state.ruleset_digest);
+        assert_eq!(
+            sep_event.reason_codes,
+            vec![
+                ReasonCodes::GV_TOOL_REGISTRY_UPDATED.to_string(),
+                ReasonCodes::GV_RULESET_CHANGED.to_string(),
+            ]
+        );
+        assert_eq!(
+            store.ruleset_state.prev_ruleset_digest,
+            Some(initial_ruleset)
+        );
     }
 
     #[test]
     fn ruleset_digest_is_stable_without_pev() {
         let mut state = RulesetState::new("charter".to_string(), "policy".to_string());
         let first = state.ruleset_digest;
-        state.recompute_ruleset_digest();
+        let changed = state.recompute_ruleset_digest();
 
+        assert!(!changed);
         assert_eq!(first, state.ruleset_digest);
     }
 
