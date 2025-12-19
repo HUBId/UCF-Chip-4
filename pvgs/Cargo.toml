@@ -17,3 +17,4 @@ prost = { workspace = true }
 cbv = { path = "../cbv" }
 thiserror.workspace = true
 ed25519-dalek.workspace = true
+tool_registry_state = { path = "../tool_registry_state" }
