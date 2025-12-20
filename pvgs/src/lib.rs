@@ -342,14 +342,18 @@ impl PvgsStore {
     }
 
     fn add_output_edges(&mut self, record_digest: NodeKey, record: &ExperienceRecord) {
-        if !record.dlp_refs.is_empty() {
-            self.add_reference_edges_from_refs(record_digest, &record.dlp_refs);
-        }
+        let mut dlp_refs: Vec<Ref> = Vec::new();
 
         if let Some(gov) = &record.governance_frame {
-            if !gov.dlp_refs.is_empty() {
-                self.add_reference_edges_from_refs(record_digest, &gov.dlp_refs);
-            }
+            dlp_refs.extend(gov.dlp_refs.clone());
+        }
+
+        if !record.dlp_refs.is_empty() {
+            dlp_refs.extend(record.dlp_refs.clone());
+        }
+
+        if !dlp_refs.is_empty() {
+            self.add_reference_edges_from_refs(record_digest, &dlp_refs);
         }
     }
 
@@ -1573,7 +1577,11 @@ fn validate_experience_record(
                 reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
             }
 
-            if record.dlp_refs.is_empty() {
+            if record
+                .governance_frame
+                .as_ref()
+                .is_none_or(|gov| gov.dlp_refs.is_empty())
+            {
                 reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
             }
         }
@@ -1625,12 +1633,55 @@ fn log_experience_events(
     record: &ExperienceRecord,
     store: &mut PvgsStore,
 ) {
+    let record_type = RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified);
+
     store.sep_log.append_event(
         commit_id.to_string(),
         SepEventType::EvAgentStep,
         record_digest,
         Vec::new(),
     );
+
+    if let RecordType::RtOutput = record_type {
+        let mut dlp_digests: Vec<[u8; 32]> = Vec::new();
+
+        if let Some(gov) = &record.governance_frame {
+            for reference in &gov.dlp_refs {
+                if let Some(digest) = digest_from_ref(reference) {
+                    dlp_digests.push(digest);
+                }
+            }
+        }
+
+        for digest in &record.dlp_refs {
+            if let Some(target) = digest_from_ref(digest) {
+                dlp_digests.push(target);
+            }
+        }
+
+        let dlp_reason = vec![protocol::ReasonCodes::CD_DLP_EXPORT_BLOCKED.to_string()];
+        for digest in &dlp_digests {
+            store.sep_log.append_event(
+                commit_id.to_string(),
+                SepEventType::EvDlpDecision,
+                *digest,
+                dlp_reason.clone(),
+            );
+        }
+
+        let output_reason = if dlp_digests.is_empty() {
+            vec![protocol::ReasonCodes::RE_INTEGRITY_OK.to_string()]
+        } else {
+            dlp_reason.clone()
+        };
+
+        store.sep_log.append_event(
+            commit_id.to_string(),
+            SepEventType::EvOutput,
+            record_digest,
+            output_reason,
+        );
+    }
 
     if let Some(gov) = &record.governance_frame {
         if !gov.policy_decision_refs.is_empty() {
@@ -2180,7 +2231,7 @@ mod tests {
     use super::*;
     use protocol::ReasonCodes;
     use receipts::verify_pvgs_receipt_attestation;
-    use sep::EdgeType;
+    use sep::{EdgeType, SepEventType};
     use ucf_protocol::ucf::v1::{
         CoreFrame, GovernanceFrame, MacroMilestoneState, MagnitudeClass, MetabolicFrame,
         PolicyEcologyDimension, PolicyEcologyVector, Ref, TraitDirection, TraitUpdate,
@@ -2326,6 +2377,28 @@ mod tests {
                 id: "met-ref".to_string(),
             }),
             governance_frame_ref: None,
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        }
+    }
+
+    fn output_record(dlp_digest: [u8; 32]) -> ExperienceRecord {
+        ExperienceRecord {
+            record_type: RecordType::RtOutput as i32,
+            core_frame: None,
+            metabolic_frame: None,
+            governance_frame: Some(GovernanceFrame {
+                policy_decision_refs: Vec::new(),
+                pvgs_receipt_ref: None,
+                dlp_refs: vec![Ref {
+                    id: hex::encode(dlp_digest),
+                }],
+            }),
+            core_frame_ref: None,
+            metabolic_frame_ref: None,
+            governance_frame_ref: Some(Ref {
+                id: hex::encode([7u8; 32]),
+            }),
             dlp_refs: Vec::new(),
             finalization_header: None,
         }
@@ -3062,6 +3135,84 @@ mod tests {
         assert!(receipt
             .reject_reason_codes
             .contains(&ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()));
+    }
+
+    #[test]
+    fn rt_output_accepts_with_dlp_refs() {
+        let prev = [4u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(7);
+        let vrf_engine = VrfEngine::new_dev(7);
+
+        let record = output_record([2u8; 32]);
+        let req = make_experience_request_with_id(
+            &record,
+            &store,
+            keystore.current_epoch(),
+            "exp-output-accept",
+        );
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert_eq!(store.experience_store.head_id, 1);
+    }
+
+    #[test]
+    fn rt_output_rejects_without_dlp_refs() {
+        let prev = [5u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(8);
+        let vrf_engine = VrfEngine::new_dev(8);
+
+        let mut record = output_record([3u8; 32]);
+        if let Some(gov) = record.governance_frame.as_mut() {
+            gov.dlp_refs.clear();
+        }
+
+        let req = make_experience_request_with_id(
+            &record,
+            &store,
+            keystore.current_epoch(),
+            "exp-output-reject",
+        );
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert!(receipt
+            .reject_reason_codes
+            .contains(&ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()));
+    }
+
+    #[test]
+    fn rt_output_logs_sep_and_graph_edges() {
+        let prev = [6u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(9);
+        let vrf_engine = VrfEngine::new_dev(9);
+
+        let dlp_digest = [9u8; 32];
+        let record = output_record(dlp_digest);
+        let req = make_experience_request_with_id(
+            &record,
+            &store,
+            keystore.current_epoch(),
+            "exp-output-sep",
+        );
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+
+        let record_digest = store.experience_store.head_record_digest;
+        let neighbors = store.causal_graph.neighbors(record_digest);
+        assert!(neighbors.contains(&(EdgeType::References, dlp_digest)));
+
+        let has_dlp_event = store.sep_log.events.iter().any(|event| {
+            event.event_type == SepEventType::EvDlpDecision && event.object_digest == dlp_digest
+        });
+        assert!(has_dlp_event);
+        assert!(store.sep_log.validate_chain().is_ok());
     }
 
     #[test]

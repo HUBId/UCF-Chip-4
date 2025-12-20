@@ -2,11 +2,13 @@
 
 use cbv::CharacterBaselineVector;
 use pev::{pev_digest, PolicyEcologyVector};
-use pvgs::{PvgsCommitRequest, PvgsStore};
+use pvgs::{compute_experience_record_digest, PvgsCommitRequest, PvgsStore};
 use sep::{EdgeType, NodeKey, SepEventInternal, SepEventType, SepLog};
 use std::collections::{BTreeSet, VecDeque};
 use thiserror::Error;
-use ucf_protocol::ucf::v1::{PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes};
+use ucf_protocol::ucf::v1::{
+    ExperienceRecord, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes,
+};
 use wire::{AuthContext, Envelope};
 
 #[cfg(feature = "serde")]
@@ -38,6 +40,23 @@ pub struct TraceResult {
     pub records: Vec<NodeKey>,
     pub profiles: Vec<NodeKey>,
     pub path: Vec<NodeKey>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordTrace {
+    pub references: Vec<NodeKey>,
+    pub referenced_by: Vec<NodeKey>,
+    pub dlp_decisions: Vec<NodeKey>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportAttempt {
+    pub record_digest: NodeKey,
+    pub dlp_decision_digests: Vec<NodeKey>,
+    pub timestamp_ms: Option<u64>,
+    pub blocked: bool,
 }
 
 pub trait QueryInspector {
@@ -260,6 +279,127 @@ pub fn trace_action(store: &PvgsStore, action_digest: [u8; 32]) -> TraceResult {
     }
 }
 
+/// Trace record references and related DLP decisions.
+pub fn trace_record(store: &PvgsStore, record_digest: [u8; 32]) -> RecordTrace {
+    let mut references = BTreeSet::new();
+    let mut referenced_by = BTreeSet::new();
+    let mut dlp_decisions = BTreeSet::new();
+
+    for (edge, neighbor) in sorted_edges(store.causal_graph.neighbors(record_digest)) {
+        if matches!(edge, EdgeType::References) {
+            references.insert(neighbor);
+        }
+    }
+
+    for (edge, neighbor) in sorted_edges(store.causal_graph.reverse_neighbors(record_digest)) {
+        if matches!(edge, EdgeType::References | EdgeType::Causes) {
+            referenced_by.insert(neighbor);
+        }
+    }
+
+    if let Some(record) = find_record(store, record_digest) {
+        for digest in dlp_digests_from_record(record) {
+            dlp_decisions.insert(digest);
+        }
+    }
+
+    RecordTrace {
+        references: references.into_iter().collect(),
+        referenced_by: referenced_by.into_iter().collect(),
+        dlp_decisions: dlp_decisions.into_iter().collect(),
+    }
+}
+
+/// List export attempts for a session in deterministic order.
+pub fn list_export_attempts(store: &PvgsStore, session_id: &str) -> Vec<ExportAttempt> {
+    let mut attempts = Vec::new();
+
+    for event in store.sep_log.events.iter().filter(|event| {
+        event.session_id == session_id && matches!(event.event_type, SepEventType::EvOutput)
+    }) {
+        let record = find_record(store, event.object_digest);
+        let dlp_digests = record.map(dlp_digests_from_record).unwrap_or_default();
+
+        let timestamp_ms = record.and_then(record_timestamp_ms);
+        let blocked = is_blocked_by_dlp(&store.sep_log, &dlp_digests);
+
+        attempts.push(ExportAttempt {
+            record_digest: event.object_digest,
+            dlp_decision_digests: dlp_digests,
+            timestamp_ms,
+            blocked,
+        });
+    }
+
+    attempts.sort_by(|a, b| a.record_digest.cmp(&b.record_digest));
+    attempts
+}
+
+fn find_record<'a>(store: &'a PvgsStore, record_digest: [u8; 32]) -> Option<&'a ExperienceRecord> {
+    store
+        .experience_store
+        .records
+        .iter()
+        .find(|record| compute_experience_record_digest(record) == record_digest)
+}
+
+fn dlp_digests_from_record(record: &ExperienceRecord) -> Vec<NodeKey> {
+    let mut digests = BTreeSet::new();
+
+    if let Some(gov) = &record.governance_frame {
+        for reference in &gov.dlp_refs {
+            if let Some(digest) = digest_from_ref(reference) {
+                digests.insert(digest);
+            }
+        }
+    }
+
+    for reference in &record.dlp_refs {
+        if let Some(digest) = digest_from_ref(reference) {
+            digests.insert(digest);
+        }
+    }
+
+    digests.into_iter().collect()
+}
+
+fn digest_from_ref(reference: &ucf_protocol::ucf::v1::Ref) -> Option<[u8; 32]> {
+    if reference.id.len() == 64 {
+        let bytes = hex::decode(&reference.id).ok()?;
+        return digest_from_bytes(&bytes);
+    }
+
+    digest_from_bytes(reference.id.as_bytes())
+}
+
+fn digest_from_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
+    if bytes.len() != 32 {
+        return None;
+    }
+
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(bytes);
+    Some(digest)
+}
+
+fn record_timestamp_ms(record: &ExperienceRecord) -> Option<u64> {
+    record
+        .finalization_header
+        .as_ref()
+        .map(|header| header.timestamp_ms)
+}
+
+fn is_blocked_by_dlp(log: &SepLog, dlp_digests: &[NodeKey]) -> bool {
+    log.events.iter().any(|event| {
+        matches!(event.event_type, SepEventType::EvDlpDecision)
+            && dlp_digests.contains(&event.object_digest)
+            && event.reason_codes.iter().any(|code| {
+                code == ReasonCodes::CD_DLP_SECRET_PATTERN
+                    || code == ReasonCodes::CD_DLP_EXPORT_BLOCKED
+            })
+    })
+}
+
 fn sorted_edges(edges: &[(EdgeType, NodeKey)]) -> Vec<(EdgeType, NodeKey)> {
     let mut ordered = edges.to_vec();
     ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -280,10 +420,14 @@ mod tests {
     use super::*;
     use keys::KeyStore;
     use pev::PolicyEcologyDimension;
-    use pvgs::compute_ruleset_digest;
+    use prost::Message;
+    use pvgs::{
+        compute_ruleset_digest, verify_and_commit, CommitBindings, CommitType, RequiredCheck,
+        RequiredReceiptKind,
+    };
     use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
-    use ucf_protocol::ucf::v1::Digest32;
+    use ucf_protocol::ucf::v1::{Digest32, GovernanceFrame, ReceiptStatus, RecordType, Ref};
     use vrf::VrfEngine;
 
     fn store_with_epochs() -> (PvgsStore, PVGSKeyEpoch, PVGSKeyEpoch) {
@@ -599,5 +743,158 @@ mod tests {
         assert_eq!(result_one.records, result_two.records);
         assert_eq!(result_one.profiles, result_two.profiles);
         assert_eq!(result_one.path, result_two.path);
+    }
+
+    #[test]
+    fn trace_record_includes_dlp_decisions() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+
+        let dlp_digest = [7u8; 32];
+        let governance_frame = GovernanceFrame {
+            policy_decision_refs: Vec::new(),
+            pvgs_receipt_ref: None,
+            dlp_refs: vec![Ref {
+                id: hex::encode(dlp_digest),
+            }],
+        };
+
+        let record = ExperienceRecord {
+            record_type: RecordType::RtOutput as i32,
+            core_frame: None,
+            metabolic_frame: None,
+            governance_frame: Some(governance_frame),
+            core_frame_ref: None,
+            metabolic_frame_ref: None,
+            governance_frame_ref: Some(Ref {
+                id: hex::encode([3u8; 32]),
+            }),
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        };
+
+        let req = PvgsCommitRequest {
+            commit_id: "session-export".to_string(),
+            commit_type: CommitType::ExperienceRecordAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: Some(record.encode_to_vec()),
+            tool_registry_container: None,
+            pev: None,
+        };
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+
+        let record_digest = store.experience_store.head_record_digest;
+        let trace = trace_record(&store, record_digest);
+
+        assert_eq!(trace.dlp_decisions, vec![dlp_digest]);
+    }
+
+    #[test]
+    fn list_export_attempts_returns_output() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(3);
+        let vrf_engine = VrfEngine::new_dev(3);
+        let dlp_digest = [5u8; 32];
+        let governance_frame = GovernanceFrame {
+            policy_decision_refs: Vec::new(),
+            pvgs_receipt_ref: None,
+            dlp_refs: vec![Ref {
+                id: hex::encode(dlp_digest),
+            }],
+        };
+
+        let record = ExperienceRecord {
+            record_type: RecordType::RtOutput as i32,
+            core_frame: None,
+            metabolic_frame: None,
+            governance_frame: Some(governance_frame),
+            core_frame_ref: None,
+            metabolic_frame_ref: None,
+            governance_frame_ref: Some(Ref {
+                id: hex::encode([9u8; 32]),
+            }),
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        };
+
+        let commit_id = "export-list";
+        let req = PvgsCommitRequest {
+            commit_id: commit_id.to_string(),
+            commit_type: CommitType::ExperienceRecordAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: Some(record.encode_to_vec()),
+            tool_registry_container: None,
+            pev: None,
+        };
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+
+        let attempts = list_export_attempts(&store, commit_id);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].record_digest,
+            store.experience_store.head_record_digest
+        );
+        assert_eq!(attempts[0].dlp_decision_digests, vec![dlp_digest]);
+        assert!(attempts[0].timestamp_ms.is_some());
+        assert!(attempts[0].blocked);
     }
 }
