@@ -19,6 +19,7 @@ members = [
     "replay",
     "gem",
     "dlp_store",
+    "milestones",
 ]
 resolver = "2"
 
