@@ -9,6 +9,11 @@ blake3 = "1"
 prost = { version = "0.12", features = ["prost-derive"] }
 thiserror = "1"
 hex = "0.4"
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "ucf-protocol/serde"]
 
 [dev-dependencies]
 rand = "0.8"

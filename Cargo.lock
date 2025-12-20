@@ -346,6 +346,7 @@ dependencies = [
  "hex",
  "prost",
  "rand",
+ "serde",
  "thiserror",
  "ucf-protocol",
 ]
