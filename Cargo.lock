@@ -343,6 +343,7 @@ name = "milestones"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "hex",
  "prost",
  "rand",
  "thiserror",
@@ -435,6 +436,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "keys",
+ "milestones",
  "pev",
  "prost",
  "receipts",
@@ -463,6 +465,7 @@ dependencies = [
  "dlp_store",
  "hex",
  "keys",
+ "milestones",
  "pev",
  "prost",
  "pvgs",

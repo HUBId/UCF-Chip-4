@@ -2,6 +2,7 @@
 
 use cbv::CharacterBaselineVector;
 use dlp_store::DlpDecisionStore;
+use milestones::{MesoMilestone, MicroMilestone};
 use pev::{pev_digest, PolicyEcologyVector};
 use pvgs::{compute_experience_record_digest, PvgsCommitRequest, PvgsStore};
 use sep::{EdgeType, NodeKey, SepEventInternal, SepEventType, SepLog};
@@ -143,6 +144,20 @@ pub fn get_current_tool_registry_digest(store: &PvgsStore) -> Option<[u8; 32]> {
 /// List all committed tool registry digests in insertion order.
 pub fn list_tool_registry_digests(store: &PvgsStore) -> Vec<[u8; 32]> {
     store.tool_registry_state.history.clone()
+}
+
+/// List all micro milestones in deterministic order.
+pub fn list_micros(store: &PvgsStore) -> Vec<MicroMilestone> {
+    let mut micros = store.micro_milestones.list().to_vec();
+    micros.sort_by(|a, b| a.micro_id.cmp(&b.micro_id));
+    micros
+}
+
+/// List all meso milestones in deterministic order.
+pub fn list_mesos(store: &PvgsStore) -> Vec<MesoMilestone> {
+    let mut mesos = store.meso_milestones.list().to_vec();
+    mesos.sort_by(|a, b| a.meso_id.cmp(&b.meso_id));
+    mesos
 }
 
 /// Return the current ruleset digest if available.
@@ -965,6 +980,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
             macro_milestone: None,
+            meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
@@ -1073,6 +1089,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
             macro_milestone: None,
+            meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,

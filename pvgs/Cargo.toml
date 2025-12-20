@@ -20,3 +20,4 @@ thiserror.workspace = true
 ed25519-dalek.workspace = true
 tool_registry_state = { path = "../tool_registry_state" }
 hex = "0.4"
+milestones = { path = "../milestones" }

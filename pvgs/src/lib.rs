@@ -8,6 +8,9 @@ use cbv::{
 use dlp_store::DlpDecisionStore;
 use ed25519_dalek::Signer;
 use keys::{verify_key_epoch_signature, KeyEpochHistory, KeyStore};
+use milestones::{
+    compute_meso_digest, MesoDeriver, MesoMilestone, MesoMilestoneStore, MicroMilestoneStore,
+};
 use pev::{pev_digest as extract_pev_digest, PevStore, PolicyEcologyVector};
 use prost::Message;
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
@@ -63,6 +66,12 @@ pub enum CbvCommitError {
     NonMonotonicEpoch,
     #[error("cbv derivation failed: {0}")]
     Derivation(String),
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AutoCommitError {
+    #[error("meso commit rejected: {0:?}")]
+    Rejected(Vec<String>),
 }
 
 /// Commit binding data that feeds into receipts.
@@ -141,6 +150,7 @@ pub struct PvgsCommitRequest {
     pub key_epoch: Option<PVGSKeyEpoch>,
     pub experience_record_payload: Option<Vec<u8>>,
     pub macro_milestone: Option<MacroMilestone>,
+    pub meso_milestone: Option<MesoMilestone>,
     pub dlp_decision_payload: Option<Vec<u8>>,
     pub tool_registry_container: Option<Vec<u8>>,
     pub pev: Option<PolicyEcologyVector>,
@@ -177,6 +187,9 @@ pub struct PvgsStore {
     pub pev_store: PevStore,
     pub dlp_store: DlpDecisionStore,
     pub tool_registry_state: ToolRegistryState,
+    pub micro_milestones: MicroMilestoneStore,
+    pub meso_milestones: MesoMilestoneStore,
+    pub meso_deriver: MesoDeriver,
     pub macro_milestones: Vec<MacroMilestone>,
     pub committed_payload_digests: HashSet<[u8; 32]>,
     pub sep_log: SepLog,
@@ -210,6 +223,9 @@ impl PvgsStore {
             pev_store: PevStore::default(),
             dlp_store: DlpDecisionStore::default(),
             tool_registry_state: ToolRegistryState::default(),
+            micro_milestones: MicroMilestoneStore::default(),
+            meso_milestones: MesoMilestoneStore::default(),
+            meso_deriver: MesoDeriver::new_beta(),
             macro_milestones: Vec::new(),
             committed_payload_digests: HashSet::new(),
             sep_log: SepLog::default(),
@@ -517,6 +533,57 @@ impl PvgsStore {
             applied_updates: derived.applied_updates,
         })
     }
+
+    pub fn auto_commit_next_meso(
+        &mut self,
+        keystore: &KeyStore,
+        vrf_engine: &VrfEngine,
+    ) -> Result<Option<PVGSReceipt>, AutoCommitError> {
+        let mut candidates = self
+            .meso_deriver
+            .derive_candidates(self.micro_milestones.list());
+
+        candidates.sort_by(|a, b| a.meso_id.cmp(&b.meso_id));
+        let Some(meso) = candidates.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let meso_digest = digest_from_bytes(&meso.meso_digest).unwrap_or([0u8; 32]);
+
+        let req = PvgsCommitRequest {
+            commit_id: meso.meso_id.clone(),
+            commit_type: CommitType::MilestoneAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: self.ruleset_state.charter_version_digest.clone(),
+                policy_version_digest: self.ruleset_state.policy_version_digest.clone(),
+                prev_record_digest: self.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: self.ruleset_state.pev_digest,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: vec![meso_digest],
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            macro_milestone: None,
+            meso_milestone: Some(meso),
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+        };
+
+        let (receipt, _proof) = verify_meso_milestone_append(req, self, keystore, vrf_engine);
+        if receipt.status == ReceiptStatus::Rejected {
+            return Err(AutoCommitError::Rejected(receipt.reject_reason_codes));
+        }
+
+        Ok(Some(receipt))
+    }
 }
 
 impl ExperienceStore {
@@ -679,6 +746,19 @@ fn compute_macro_verified_fields_digest(
     *hasher.finalize().as_bytes()
 }
 
+fn compute_meso_verified_fields_digest(
+    prev_record_digest: [u8; 32],
+    meso_digest: [u8; 32],
+    epoch_id: u64,
+) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(b"UCF:PVGS:MESO_VERIFIED_FIELDS");
+    hasher.update(&prev_record_digest);
+    hasher.update(&meso_digest);
+    hasher.update(&epoch_id.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 fn event_type_for_commit(
     commit_type: CommitType,
     frame_kind: Option<FrameEventKind>,
@@ -740,6 +820,10 @@ pub fn verify_and_commit(
     vrf_engine: &VrfEngine,
 ) -> (PVGSReceipt, Option<ProofReceipt>) {
     if req.commit_type == CommitType::MilestoneAppend {
+        if req.meso_milestone.is_some() {
+            return verify_meso_milestone_append(req, store, keystore, vrf_engine);
+        }
+
         return verify_macro_milestone_append(req, store, keystore, vrf_engine);
     }
 
@@ -1203,6 +1287,186 @@ fn verify_macro_milestone_append(
     );
 
     attempt_cbv_update_from_macro(store, keystore, vrf_engine, macro_milestone, macro_digest);
+
+    (receipt, Some(proof_receipt))
+}
+
+fn verify_meso_milestone_append(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+    vrf_engine: &VrfEngine,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let mut reject_reason_codes = Vec::new();
+    let receipt_input = to_receipt_input(&req);
+
+    if req.epoch_id != keystore.current_epoch() {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    }
+
+    if req.bindings.prev_record_digest != store.current_head_record_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    }
+
+    if !store
+        .known_charter_versions
+        .contains(&req.bindings.charter_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_CHARTER_SCOPE.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    }
+
+    if !store
+        .known_policy_versions
+        .contains(&req.bindings.policy_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_INTEGRITY_REQUIRED.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    }
+
+    let Some(mut meso_milestone) = req.meso_milestone.clone() else {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    };
+
+    let meso_digest = digest_from_bytes(&meso_milestone.meso_digest).unwrap_or([0u8; 32]);
+    let recomputed_digest = compute_meso_digest(&meso_milestone).0;
+
+    if meso_digest == [0u8; 32] || meso_digest != recomputed_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if req.payload_digests.is_empty() {
+        req.payload_digests = vec![meso_digest];
+    } else if req.payload_digests.len() != 1 || req.payload_digests[0] != meso_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if !reject_reason_codes.is_empty() {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(meso_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    let (ruleset_changed, charter_or_policy_changed) = store.refresh_ruleset_state(
+        &req.bindings.charter_version_digest,
+        &req.bindings.policy_version_digest,
+    );
+    if ruleset_changed && charter_or_policy_changed {
+        store.log_ruleset_change(&req.commit_id, SepEventType::EvCharterUpdate, Vec::new());
+    }
+
+    let verified_fields_digest = compute_meso_verified_fields_digest(
+        req.bindings.prev_record_digest,
+        meso_digest,
+        req.epoch_id,
+    );
+    let vrf_digest = vrf_engine.eval_record_vrf(
+        req.bindings.prev_record_digest,
+        meso_digest,
+        &req.bindings.charter_version_digest,
+        req.bindings.profile_digest.unwrap_or([0u8; 32]),
+        req.epoch_id,
+    );
+
+    let ruleset_digest = store.ruleset_state.ruleset_digest;
+    let proof_receipt =
+        issue_proof_receipt(ruleset_digest, verified_fields_digest, vrf_digest, keystore);
+
+    meso_milestone.proof_receipt_ref = Some(Ref {
+        id: proof_receipt.proof_receipt_id.clone(),
+    });
+
+    let receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        Vec::new(),
+        keystore,
+    );
+
+    if let Err(err) = store.meso_milestones.push(meso_milestone.clone()) {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: vec![err.to_string()],
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(meso_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    store.add_receipt_edges(&receipt);
+    store.meso_deriver.register_committed(&meso_milestone);
+
+    store.sep_log.append_event(
+        req.commit_id.clone(),
+        SepEventType::EvRecoveryGov,
+        meso_digest,
+        vec!["RC.GV.MILESTONE.MESO_APPENDED".to_string()],
+    );
 
     (receipt, Some(proof_receipt))
 }
@@ -2714,6 +2978,7 @@ impl From<&CommitBindings> for protocol::CommitBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use milestones::{ExperienceRange, MicroMilestone, MicroMilestoneState, PriorityClass};
     use protocol::ReasonCodes;
     use receipts::verify_pvgs_receipt_attestation;
     use sep::{EdgeType, SepEventType};
@@ -2763,6 +3028,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             macro_milestone: None,
+            meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
@@ -2806,6 +3072,7 @@ mod tests {
                 key_epoch: Some(epoch.clone()),
                 experience_record_payload: None,
                 macro_milestone: None,
+                meso_milestone: None,
                 dlp_decision_payload: None,
                 tool_registry_container: None,
                 pev: None,
@@ -2840,6 +3107,25 @@ mod tests {
         }
     }
 
+    fn sample_micro(id: u64) -> MicroMilestone {
+        let range = ExperienceRange {
+            start_experience_id: id * 10,
+            end_experience_id: id * 10 + 5,
+            head_record_digest: vec![1u8; 32],
+        };
+
+        MicroMilestone {
+            micro_id: format!("micro:s:{id}:{}", id * 10 + 5),
+            experience_range: Some(range),
+            summary_digest: vec![2u8; 32],
+            hormone_profile: None,
+            priority_class: PriorityClass::Med as i32,
+            state: MicroMilestoneState::Sealed as i32,
+            micro_digest: vec![id as u8; 32],
+            proof_receipt_ref: None,
+        }
+    }
+
     fn make_macro_request(
         macro_milestone: &MacroMilestone,
         store: &PvgsStore,
@@ -2868,6 +3154,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             macro_milestone: Some(macro_milestone.clone()),
+            meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
@@ -2963,6 +3250,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
             macro_milestone: None,
+            meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
@@ -3143,6 +3431,52 @@ mod tests {
 
         let prev_edges = store.causal_graph.neighbors(prev);
         assert!(prev_edges.contains(&(EdgeType::Causes, record_digest)));
+    }
+
+    #[test]
+    fn auto_commit_meso_appends_once() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        for i in 0..4 {
+            store
+                .micro_milestones
+                .push(sample_micro(i + 1))
+                .expect("valid micro");
+        }
+
+        let candidates = store
+            .meso_deriver
+            .derive_candidates(store.micro_milestones.list());
+        assert_eq!(candidates.len(), 1);
+        let meso_digest: [u8; 32] = candidates[0]
+            .meso_digest
+            .clone()
+            .try_into()
+            .expect("meso digest length");
+        assert_eq!(compute_meso_digest(&candidates[0]).0, meso_digest);
+
+        let receipt = store
+            .auto_commit_next_meso(&keystore, &vrf_engine)
+            .expect("auto commit")
+            .expect("meso committed");
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert_eq!(store.meso_milestones.list().len(), 1);
+
+        let meso_reason_logged = store.sep_log.events.iter().any(|event| {
+            event
+                .reason_codes
+                .contains(&"RC.GV.MILESTONE.MESO_APPENDED".to_string())
+        });
+        assert!(meso_reason_logged);
+
+        let second = store
+            .auto_commit_next_meso(&keystore, &vrf_engine)
+            .expect("second attempt");
+        assert!(second.is_none());
     }
 
     #[test]
@@ -3365,6 +3699,7 @@ mod tests {
             key_epoch: Some(backward_epoch),
             experience_record_payload: None,
             macro_milestone: None,
+            meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
@@ -3428,6 +3763,7 @@ mod tests {
             key_epoch: Some(epoch),
             experience_record_payload: None,
             macro_milestone: None,
+            meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
@@ -3467,6 +3803,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             macro_milestone: None,
+            meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
@@ -3522,6 +3859,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             macro_milestone: None,
+            meso_milestone: None,
             dlp_decision_payload: Some(decision.encode_to_vec()),
             tool_registry_container: None,
             pev: None,
@@ -3577,6 +3915,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             macro_milestone: None,
+            meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: Some(pev.clone()),
@@ -3657,6 +3996,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             macro_milestone: None,
+            meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: Some(pev),
@@ -3731,6 +4071,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             macro_milestone: None,
+            meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: Some(container.encode_to_vec()),
             pev: None,
