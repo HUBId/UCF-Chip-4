@@ -1,0 +1,16 @@
+[package]
+name = "replay_plan"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, optional = true, features = ["derive"] }
+hex = "0.4"
+ucf-protocol = { path = "../ucf-protocol" }
+prost = { workspace = true }
+
+[features]
+default = []
+serde = ["dep:serde", "ucf-protocol/serde"]

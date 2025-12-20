@@ -261,6 +261,7 @@ fn commit_type_label(commit_type: &protocol::CommitType) -> &'static str {
         protocol::CommitType::KeyEpochUpdate => "KeyEpochUpdate",
         protocol::CommitType::FrameEvidenceAppend => "FrameEvidenceAppend",
         protocol::CommitType::DlpDecisionAppend => "DlpDecisionAppend",
+        protocol::CommitType::ReplayPlanAppend => "ReplayPlanAppend",
     }
 }
 

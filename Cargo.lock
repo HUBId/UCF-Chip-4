@@ -441,6 +441,7 @@ dependencies = [
  "pev",
  "prost",
  "receipts",
+ "replay_plan",
  "sep",
  "serde",
  "serde_yaml",
@@ -471,6 +472,7 @@ dependencies = [
  "prost",
  "pvgs",
  "receipts",
+ "replay_plan",
  "sep",
  "serde",
  "serde_yaml",
@@ -545,6 +547,18 @@ dependencies = [
  "thiserror",
  "ucf-protocol",
  "vrf",
+]
+
+[[package]]
+name = "replay_plan"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "prost",
+ "serde",
+ "thiserror",
+ "ucf-protocol",
 ]
 
 [[package]]

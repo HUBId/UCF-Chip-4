@@ -17,6 +17,7 @@ members = [
     "engine",
     "tool_registry_state",
     "replay",
+    "replay_plan",
     "gem",
     "dlp_store",
     "milestones",

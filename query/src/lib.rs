@@ -11,6 +11,7 @@ use std::convert::TryFrom;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{
     DlpDecisionForm, ExperienceRecord, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes,
+    ReplayPlan,
 };
 use wire::{AuthContext, Envelope};
 
@@ -183,6 +184,25 @@ pub fn list_ruleset_changes(log: &SepLog, session_id: Option<&str>) -> Vec<[u8; 
         })
         .map(|event| event.object_digest)
         .collect()
+}
+
+pub fn get_pending_replay_plans(store: &PvgsStore, session_id: &str) -> Vec<ReplayPlan> {
+    let mut plans: Vec<_> = store
+        .replay_plans
+        .list_pending()
+        .into_iter()
+        .filter(|plan| plan.session_id == session_id)
+        .collect();
+    plans.sort_by(|a, b| a.replay_id.cmp(&b.replay_id));
+    plans.truncate(64);
+    plans
+}
+
+pub fn consume_replay_plan(store: &mut PvgsStore, replay_id: &str) -> Result<(), QueryError> {
+    store
+        .replay_plans
+        .mark_consumed(replay_id)
+        .map_err(|err| QueryError::Lookup(err.to_string()))
 }
 
 /// Return true if the SEP log contains a control frame event with the digest in the session.
@@ -596,10 +616,12 @@ mod tests {
         compute_ruleset_digest, verify_and_commit, CommitBindings, CommitType, RequiredCheck,
         RequiredReceiptKind,
     };
+    use replay_plan::build_replay_plan;
     use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
     use ucf_protocol::ucf::v1::{
         Digest32, DlpDecision, GovernanceFrame, MetabolicFrame, ReceiptStatus, RecordType, Ref,
+        ReplayFidelity, ReplayTargetKind,
     };
     use vrf::VrfEngine;
 
@@ -641,6 +663,23 @@ mod tests {
             .insert(second.announcement_digest.0);
 
         (store, first, second)
+    }
+
+    fn minimal_store() -> PvgsStore {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+        let known_profiles = HashSet::new();
+
+        PvgsStore::new(
+            [1u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            known_profiles,
+        )
     }
 
     fn trace_store(profile_digest: [u8; 32]) -> PvgsStore {
@@ -1499,5 +1538,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected_records
         );
+    }
+
+    #[test]
+    fn pending_replay_plans_sorted_and_consumed() {
+        let mut store = minimal_store();
+        let target_ref = Ref {
+            id: "target".to_string(),
+        };
+
+        let plan_two = build_replay_plan(
+            "sess",
+            1,
+            [1u8; 32],
+            ReplayTargetKind::Macro,
+            vec![target_ref.clone()],
+            ReplayFidelity::Low,
+            2,
+        );
+        let plan_one = build_replay_plan(
+            "sess",
+            1,
+            [1u8; 32],
+            ReplayTargetKind::Macro,
+            vec![target_ref],
+            ReplayFidelity::Low,
+            1,
+        );
+
+        store.replay_plans.push(plan_two).unwrap();
+        store.replay_plans.push(plan_one).unwrap();
+
+        let plans = get_pending_replay_plans(&store, "sess");
+        assert_eq!(plans.len(), 2);
+        assert!(plans[0].replay_id < plans[1].replay_id);
+
+        consume_replay_plan(&mut store, &plans[0].replay_id).expect("consume first");
+        let remaining = get_pending_replay_plans(&store, "sess");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].replay_id, plans[1].replay_id);
     }
 }

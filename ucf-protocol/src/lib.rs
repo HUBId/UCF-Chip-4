@@ -48,6 +48,7 @@ pub mod ucf {
             KeyEpochUpdate,
             FrameEvidenceAppend,
             DlpDecisionAppend,
+            ReplayPlanAppend,
         }
 
         /// Required receipt classes for PVGS commits.
@@ -340,6 +341,7 @@ pub mod ucf {
             pub const GV_CBV_NO_OP: &'static str = "RC.GV.CBV.NO_OP";
             pub const GV_CBV_UPDATE_FAILED: &'static str = "RC.GV.CBV.UPDATE_FAILED";
             pub const GV_MILESTONE_MACRO_APPENDED: &'static str = "RC.GV.MILESTONE.MACRO_APPENDED";
+            pub const GV_REPLAY_PLANNED: &'static str = "RC.GV.REPLAY.PLANNED";
             pub const GV_PEV_UPDATED: &'static str = "RC.GV.PEV.UPDATED";
             pub const GV_TOOL_REGISTRY_UPDATED: &'static str = "RC.GV.TOOL_REGISTRY.UPDATED";
             pub const GV_RULESET_CHANGED: &'static str = "RC.GV.RULESET.CHANGED";
@@ -439,6 +441,64 @@ pub mod ucf {
             pub pvgs_receipt_ref: Option<Ref>,
             #[prost(message, repeated, tag = "3")]
             pub dlp_refs: Vec<Ref>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum ReplayTargetKind {
+            Unspecified = 0,
+            Micro = 1,
+            Meso = 2,
+            Macro = 3,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum ReplayFidelity {
+            Low = 0,
+            Med = 1,
+            High = 2,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum ReplayInjectMode {
+            Unspecified = 0,
+            InjectDmnSimulate = 1,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct ReplayPlan {
+            #[prost(string, tag = "1")]
+            pub replay_id: String,
+            #[prost(bytes = "vec", tag = "2")]
+            pub replay_digest: Vec<u8>,
+            #[prost(string, tag = "3")]
+            pub session_id: String,
+            #[prost(bytes = "vec", tag = "4")]
+            pub head_record_digest: Vec<u8>,
+            #[prost(enumeration = "ReplayTargetKind", tag = "5")]
+            pub target_kind: i32,
+            #[prost(message, repeated, tag = "6")]
+            pub target_refs: Vec<Ref>,
+            #[prost(enumeration = "ReplayFidelity", tag = "7")]
+            pub fidelity: i32,
+            #[prost(enumeration = "ReplayInjectMode", tag = "8")]
+            pub inject_mode: i32,
+            #[prost(enumeration = "MagnitudeClass", tag = "9")]
+            pub max_steps_class: i32,
+            #[prost(enumeration = "MagnitudeClass", tag = "10")]
+            pub max_budget_class: i32,
+            #[prost(bool, tag = "11")]
+            pub stop_on_dlp_flag: bool,
+            #[prost(message, optional, tag = "12")]
+            pub proof_receipt_ref: Option<Ref>,
+            #[prost(bool, tag = "13")]
+            pub consumed: bool,
         }
 
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
