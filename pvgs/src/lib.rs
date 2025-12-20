@@ -2492,7 +2492,7 @@ fn optional_proto_digest(value: &Option<Digest32>) -> Option<[u8; 32]> {
 
 fn digest_from_ref(reference: &Ref) -> Option<[u8; 32]> {
     digest_from_hex_str(&reference.id)
-        .or_else(|| reference.id.split(':').last().and_then(digest_from_hex_str))
+        .or_else(|| reference.id.rsplit(':').next().and_then(digest_from_hex_str))
         .or_else(|| digest_from_bytes(reference.id.as_bytes()))
 }
 
