@@ -2154,22 +2154,22 @@ impl<'a> CompletenessChecker<'a> {
         for output_digest in self.outputs_for_session(session_id) {
             if let Some(record) = self.find_record(output_digest) {
                 for digest in dlp_digests_from_gov(record) {
-                    if self.dlp_store.get(digest).is_none() {
-                        if missing_dlp_decisions.insert(digest) {
-                            if !matches!(status, CompletenessStatus::Fail) {
-                                status = CompletenessStatus::Degraded;
-                            }
-                            missing_nodes.insert(digest);
-                            reason_codes
-                                .insert(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
-                            reason_codes.insert(RC_RE_DLP_DECISION_MISSING.to_string());
-                            self.sep_log.append_event(
-                                session_id.to_string(),
-                                SepEventType::EvDlpDecision,
-                                digest,
-                                vec![RC_RE_DLP_DECISION_MISSING.to_string()],
-                            );
+                    if self.dlp_store.get(digest).is_none()
+                        && missing_dlp_decisions.insert(digest)
+                    {
+                        if !matches!(status, CompletenessStatus::Fail) {
+                            status = CompletenessStatus::Degraded;
                         }
+                        missing_nodes.insert(digest);
+                        reason_codes
+                            .insert(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+                        reason_codes.insert(RC_RE_DLP_DECISION_MISSING.to_string());
+                        self.sep_log.append_event(
+                            session_id.to_string(),
+                            SepEventType::EvDlpDecision,
+                            digest,
+                            vec![RC_RE_DLP_DECISION_MISSING.to_string()],
+                        );
                     }
                 }
             }
