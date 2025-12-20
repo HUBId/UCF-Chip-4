@@ -15,6 +15,9 @@ use milestones::{
 use pev::{pev_digest as extract_pev_digest, PevStore, PolicyEcologyVector};
 use prost::Message;
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
+use replay_plan::{
+    build_replay_plan, ref_from_digest, should_generate_replay, ReplayPlanStore, ReplaySignals,
+};
 use sep::{CausalGraph, EdgeType, FrameEventKind, NodeKey, SepEventType, SepLog};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
@@ -24,7 +27,8 @@ use tool_registry_state::{ToolRegistryError, ToolRegistryState};
 use ucf_protocol::ucf::v1::{
     self as protocol, CharacterBaselineVector, Digest32, DlpDecision, DlpDecisionForm,
     ExperienceRecord, FinalizationHeader, MacroMilestone, MacroMilestoneState, PVGSKeyEpoch,
-    PVGSReceipt, ProofReceipt, ReceiptStatus, RecordType, Ref, ToolRegistryContainer,
+    PVGSReceipt, ProofReceipt, ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayPlan,
+    ReplayTargetKind, ToolRegistryContainer,
 };
 use vrf::VrfEngine;
 
@@ -47,6 +51,7 @@ pub enum CommitType {
     KeyEpochUpdate,
     FrameEvidenceAppend,
     DlpDecisionAppend,
+    ReplayPlanAppend,
 }
 
 /// Required checks requested by the caller.
@@ -165,6 +170,13 @@ pub struct CbvCommitOutcome {
     pub applied_updates: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReplayPlanOutcome {
+    pub plan: ReplayPlan,
+    pub receipt: PVGSReceipt,
+    pub proof_receipt: ProofReceipt,
+}
+
 /// In-memory store tracking experience records and proof receipts.
 #[derive(Debug, Clone, Default)]
 pub struct ExperienceStore {
@@ -193,6 +205,7 @@ pub struct PvgsStore {
     pub meso_deriver: MesoDeriver,
     pub macro_deriver: MacroDeriver,
     pub macro_milestones: Vec<MacroMilestone>,
+    pub replay_plans: ReplayPlanStore,
     pub committed_payload_digests: HashSet<[u8; 32]>,
     pub sep_log: SepLog,
     pub causal_graph: CausalGraph,
@@ -230,6 +243,7 @@ impl PvgsStore {
             meso_deriver: MesoDeriver::new_beta(),
             macro_deriver: MacroDeriver::new_beta(),
             macro_milestones: Vec::new(),
+            replay_plans: ReplayPlanStore::default(),
             committed_payload_digests: HashSet::new(),
             sep_log: SepLog::default(),
             causal_graph: CausalGraph::default(),
@@ -267,6 +281,97 @@ impl PvgsStore {
     pub fn update_tool_registry_digest(&mut self, tool_registry_digest: Option<[u8; 32]>) -> bool {
         self.ruleset_state.tool_registry_digest = tool_registry_digest;
         self.ruleset_state.recompute_ruleset_digest()
+    }
+
+    pub fn collect_replay_signals(&self, session_id: &str) -> ReplaySignals {
+        let deny_count_last256 = self
+            .experience_store
+            .records
+            .iter()
+            .rev()
+            .take(256)
+            .filter(|record| record.record_type == RecordType::RtDecision as i32)
+            .count();
+
+        let integrity_degraded_present = self.sep_log.events.iter().any(|event| {
+            event.session_id == session_id
+                && event
+                    .reason_codes
+                    .iter()
+                    .any(|rc| rc == protocol::ReasonCodes::RE_INTEGRITY_DEGRADED)
+        });
+
+        ReplaySignals {
+            deny_count_last256,
+            integrity_degraded_present,
+        }
+    }
+
+    pub fn maybe_plan_replay(
+        &mut self,
+        session_id: &str,
+        keystore: &KeyStore,
+    ) -> Option<ReplayPlanOutcome> {
+        let signals = self.collect_replay_signals(session_id);
+        if !should_generate_replay(session_id, signals.clone()) {
+            return None;
+        }
+
+        if let Some(latest) = self.replay_plans.latest() {
+            if digest_from_bytes(&latest.head_record_digest)
+                .is_some_and(|digest| digest == self.current_head_record_digest)
+            {
+                return None;
+            }
+        }
+
+        let (target_kind, target_refs) = select_replay_targets(self);
+        if target_refs.is_empty() {
+            return None;
+        }
+
+        let fidelity = if signals.integrity_degraded_present {
+            ReplayFidelity::Med
+        } else {
+            ReplayFidelity::Low
+        };
+
+        let counter = self.replay_plans.plans.len() + 1;
+        let plan = build_replay_plan(
+            session_id,
+            self.experience_store.head_id,
+            self.current_head_record_digest,
+            target_kind,
+            target_refs,
+            fidelity,
+            counter,
+        );
+
+        if self.replay_plans.push(plan.clone()).is_err() {
+            return None;
+        }
+
+        let plan_digest = digest_from_bytes(&plan.replay_digest)?;
+        self.committed_payload_digests.insert(plan_digest);
+
+        let (receipt, proof_receipt) = issue_replay_plan_receipts(&plan, self, keystore);
+        self.add_receipt_edges(&receipt);
+        self.experience_store
+            .proof_receipts
+            .insert(plan_digest, proof_receipt.clone());
+
+        self.sep_log.append_event(
+            session_id.to_string(),
+            SepEventType::EvReplay,
+            plan_digest,
+            vec![protocol::ReasonCodes::GV_REPLAY_PLANNED.to_string()],
+        );
+
+        Some(ReplayPlanOutcome {
+            plan,
+            receipt,
+            proof_receipt,
+        })
     }
 
     fn log_ruleset_change(
@@ -824,6 +929,7 @@ fn event_type_for_commit(
         CommitType::ToolRegistryUpdate => SepEventType::EvToolOnboarding,
         CommitType::ExperienceRecordAppend => SepEventType::EvIntent,
         CommitType::DlpDecisionAppend => SepEventType::EvDlpDecision,
+        CommitType::ReplayPlanAppend => SepEventType::EvReplay,
         CommitType::FrameEvidenceAppend => match frame_kind {
             Some(FrameEventKind::ControlFrame) => SepEventType::EvControlFrame,
             Some(FrameEventKind::SignalFrame) => SepEventType::EvSignalFrame,
@@ -831,6 +937,85 @@ fn event_type_for_commit(
         },
         _ => SepEventType::EvRecoveryGov,
     }
+}
+
+fn select_replay_targets(store: &PvgsStore) -> (ReplayTargetKind, Vec<Ref>) {
+    let mut micro_refs: Vec<Ref> = store
+        .micro_milestones
+        .list()
+        .iter()
+        .rev()
+        .take(2)
+        .filter_map(|micro| digest_from_bytes(&micro.micro_digest))
+        .map(ref_from_digest)
+        .collect();
+
+    if !micro_refs.is_empty() {
+        micro_refs.sort_by(|a, b| a.id.cmp(&b.id));
+        return (ReplayTargetKind::Micro, micro_refs);
+    }
+
+    if let Some(meso) = store.meso_milestones.latest() {
+        if let Some(digest) = digest_from_bytes(&meso.meso_digest) {
+            return (ReplayTargetKind::Meso, vec![ref_from_digest(digest)]);
+        }
+    }
+
+    if let Some(macro_milestone) = store.macro_milestones.last() {
+        if let Some(digest) = digest_from_bytes(&macro_milestone.macro_digest) {
+            return (ReplayTargetKind::Macro, vec![ref_from_digest(digest)]);
+        }
+    }
+
+    (ReplayTargetKind::Unspecified, Vec::new())
+}
+
+fn issue_replay_plan_receipts(
+    plan: &ReplayPlan,
+    store: &PvgsStore,
+    keystore: &KeyStore,
+) -> (PVGSReceipt, ProofReceipt) {
+    let bindings = CommitBindings {
+        action_digest: None,
+        decision_digest: None,
+        grant_id: None,
+        charter_version_digest: store.ruleset_state.charter_version_digest.clone(),
+        policy_version_digest: store.ruleset_state.policy_version_digest.clone(),
+        prev_record_digest: store.current_head_record_digest,
+        profile_digest: None,
+        tool_profile_digest: None,
+        pev_digest: store.ruleset_state.pev_digest,
+    };
+
+    let payload_digest = digest_from_bytes(&plan.replay_digest).unwrap_or([0u8; 32]);
+    let receipt_input = ReceiptInput {
+        commit_id: plan.replay_id.clone(),
+        commit_type: protocol::CommitType::ReplayPlanAppend,
+        bindings: protocol::CommitBindings::from(&bindings),
+        required_checks: Vec::new(),
+        required_receipt_kind: RequiredReceiptKind::Write,
+        payload_digests: vec![payload_digest],
+        epoch_id: keystore.current_epoch(),
+    };
+
+    let receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        Vec::new(),
+        keystore,
+    );
+
+    let verified_fields_digest =
+        compute_verified_fields_digest(&bindings, RequiredReceiptKind::Write);
+    let mut proof_receipt = issue_proof_receipt(
+        store.ruleset_state.ruleset_digest,
+        verified_fields_digest,
+        [0u8; 32],
+        keystore,
+    );
+    proof_receipt.receipt_digest = receipt.receipt_digest.clone();
+
+    (receipt, proof_receipt)
 }
 
 fn frame_event_kind_for_request(req: &PvgsCommitRequest) -> FrameEventKind {
@@ -3023,6 +3208,7 @@ impl From<CommitType> for protocol::CommitType {
             CommitType::KeyEpochUpdate => protocol::CommitType::KeyEpochUpdate,
             CommitType::FrameEvidenceAppend => protocol::CommitType::FrameEvidenceAppend,
             CommitType::DlpDecisionAppend => protocol::CommitType::DlpDecisionAppend,
+            CommitType::ReplayPlanAppend => protocol::CommitType::ReplayPlanAppend,
         }
     }
 }
@@ -3057,13 +3243,17 @@ impl From<&CommitBindings> for protocol::CommitBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use milestones::{ExperienceRange, MicroMilestone, MicroMilestoneState, PriorityClass};
+    use milestones::{
+        derive_micro_from_experience_window, ExperienceRange, MicroMilestone, MicroMilestoneState,
+        PriorityClass,
+    };
     use protocol::ReasonCodes;
     use receipts::verify_pvgs_receipt_attestation;
     use sep::{EdgeType, SepEventType};
     use ucf_protocol::ucf::v1::{
-        CoreFrame, GovernanceFrame, MacroMilestoneState, MagnitudeClass, MetabolicFrame,
-        PolicyEcologyDimension, PolicyEcologyVector, Ref, TraitDirection, TraitUpdate,
+        CoreFrame, GovernanceFrame, MacroMilestone, MacroMilestoneState, MagnitudeClass,
+        MetabolicFrame, PolicyEcologyDimension, PolicyEcologyVector, RecordType, Ref,
+        ReplayTargetKind, TraitDirection, TraitUpdate,
     };
     use vrf::VrfEngine;
 
@@ -4908,5 +5098,114 @@ mod tests {
         assert!(last_event
             .reason_codes
             .contains(&ReasonCodes::GV_CBV_NO_CHANGE.to_string()));
+    }
+
+    fn decision_record(idx: usize) -> ExperienceRecord {
+        ExperienceRecord {
+            record_type: RecordType::RtDecision as i32,
+            core_frame: None,
+            metabolic_frame: None,
+            governance_frame: Some(GovernanceFrame {
+                policy_decision_refs: vec![Ref {
+                    id: format!("decision-ref-{idx}"),
+                }],
+                pvgs_receipt_ref: None,
+                dlp_refs: Vec::new(),
+            }),
+            core_frame_ref: Some(Ref {
+                id: format!("core-{idx}"),
+            }),
+            metabolic_frame_ref: None,
+            governance_frame_ref: Some(Ref {
+                id: format!("gov-{idx}"),
+            }),
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        }
+    }
+
+    fn simple_macro(id: &str, digest: [u8; 32]) -> MacroMilestone {
+        MacroMilestone {
+            macro_id: id.to_string(),
+            macro_digest: digest.to_vec(),
+            state: MacroMilestoneState::Draft as i32,
+            trait_updates: Vec::new(),
+            meso_refs: Vec::new(),
+            consistency_class: "LOW".to_string(),
+            identity_anchor_flag: false,
+        }
+    }
+
+    #[test]
+    fn trigger_appends_replay_plan_and_sep_event() {
+        let prev = [7u8; 32];
+        let keystore = KeyStore::new_dev_keystore(1);
+        let mut store = base_store(prev);
+
+        store
+            .macro_milestones
+            .push(simple_macro("macro-1", [1u8; 32]));
+
+        for idx in 0..20 {
+            store.experience_store.records.push(decision_record(idx));
+            store.experience_store.head_id += 1;
+        }
+
+        let outcome = store
+            .maybe_plan_replay("session-a", &keystore)
+            .expect("replay plan created");
+
+        assert_eq!(store.replay_plans.plans.len(), 1);
+        assert_eq!(outcome.plan.replay_id, "replay:session-a:20:1");
+        assert_eq!(outcome.plan.target_kind, ReplayTargetKind::Macro as i32);
+
+        let last_event = store.sep_log.events.last().expect("missing sep event");
+        assert_eq!(last_event.event_type, SepEventType::EvReplay);
+        assert!(last_event
+            .reason_codes
+            .contains(&ReasonCodes::GV_REPLAY_PLANNED.to_string()));
+
+        let duplicate = store.maybe_plan_replay("session-a", &keystore);
+        assert!(duplicate.is_none());
+        assert_eq!(store.replay_plans.plans.len(), 1);
+    }
+
+    #[test]
+    fn selects_micro_targets_deterministically() {
+        let prev = [8u8; 32];
+        let keystore = KeyStore::new_dev_keystore(1);
+        let mut store = base_store(prev);
+
+        let base_record = decision_record(1);
+        let digest = compute_experience_record_digest(&base_record);
+        let records = vec![(1, digest, base_record.clone()), (2, digest, base_record)];
+
+        let micro_one = derive_micro_from_experience_window("session-b", 1, 1, prev, &records)
+            .expect("micro one");
+        let micro_two = derive_micro_from_experience_window("session-b", 2, 2, prev, &records)
+            .expect("micro two");
+
+        store.micro_milestones.push(micro_one).unwrap();
+        store.micro_milestones.push(micro_two).unwrap();
+
+        for idx in 0..20 {
+            store.experience_store.records.push(decision_record(idx));
+        }
+
+        let outcome = store
+            .maybe_plan_replay("session-b", &keystore)
+            .expect("replay plan created");
+
+        assert_eq!(outcome.plan.target_kind, ReplayTargetKind::Micro as i32);
+        assert_eq!(outcome.plan.target_refs.len(), 2);
+        let ids: Vec<_> = outcome
+            .plan
+            .target_refs
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
     }
 }
