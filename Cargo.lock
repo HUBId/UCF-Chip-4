@@ -176,6 +176,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlp_store"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "ucf-protocol",
+]
+
+[[package]]
 name = "ed25519"
 version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -402,6 +410,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "cbv",
+ "dlp_store",
  "ed25519-dalek",
  "hex",
  "keys",
@@ -430,6 +439,7 @@ name = "query"
 version = "0.1.0"
 dependencies = [
  "cbv",
+ "dlp_store",
  "hex",
  "keys",
  "pev",

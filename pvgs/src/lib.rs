@@ -5,6 +5,7 @@ use cbv::{
     cbv_attestation_preimage, compute_cbv_verified_fields_digest, derive_next_cbv,
     CbvDeriverConfig, CbvStore,
 };
+use dlp_store::DlpDecisionStore;
 use ed25519_dalek::Signer;
 use keys::{verify_key_epoch_signature, KeyEpochHistory, KeyStore};
 use pev::{pev_digest as extract_pev_digest, PevStore, PolicyEcologyVector};
@@ -17,9 +18,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tool_registry_state::{ToolRegistryError, ToolRegistryState};
 use ucf_protocol::ucf::v1::{
-    self as protocol, CharacterBaselineVector, Digest32, ExperienceRecord, FinalizationHeader,
-    MacroMilestone, MacroMilestoneState, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReceiptStatus,
-    RecordType, Ref, ToolRegistryContainer,
+    self as protocol, CharacterBaselineVector, Digest32, DlpDecision, DlpDecisionForm,
+    ExperienceRecord, FinalizationHeader, MacroMilestone, MacroMilestoneState, PVGSKeyEpoch,
+    PVGSReceipt, ProofReceipt, ReceiptStatus, RecordType, Ref, ToolRegistryContainer,
 };
 use vrf::VrfEngine;
 
@@ -41,6 +42,7 @@ pub enum CommitType {
     CbvUpdate,
     KeyEpochUpdate,
     FrameEvidenceAppend,
+    DlpDecisionAppend,
 }
 
 /// Required checks requested by the caller.
@@ -138,6 +140,7 @@ pub struct PvgsCommitRequest {
     pub epoch_id: u64,
     pub key_epoch: Option<PVGSKeyEpoch>,
     pub experience_record_payload: Option<Vec<u8>>,
+    pub dlp_decision_payload: Option<Vec<u8>>,
     pub tool_registry_container: Option<Vec<u8>>,
     pub pev: Option<PolicyEcologyVector>,
 }
@@ -171,6 +174,7 @@ pub struct PvgsStore {
     pub key_epoch_history: KeyEpochHistory,
     pub cbv_store: CbvStore,
     pub pev_store: PevStore,
+    pub dlp_store: DlpDecisionStore,
     pub tool_registry_state: ToolRegistryState,
     pub committed_payload_digests: HashSet<[u8; 32]>,
     pub sep_log: SepLog,
@@ -202,6 +206,7 @@ impl PvgsStore {
             key_epoch_history: KeyEpochHistory::default(),
             cbv_store: CbvStore::default(),
             pev_store: PevStore::default(),
+            dlp_store: DlpDecisionStore::default(),
             tool_registry_state: ToolRegistryState::default(),
             committed_payload_digests: HashSet::new(),
             sep_log: SepLog::default(),
@@ -668,6 +673,7 @@ fn event_type_for_commit(
         CommitType::PevUpdate => SepEventType::EvPevUpdate,
         CommitType::ToolRegistryUpdate => SepEventType::EvToolOnboarding,
         CommitType::ExperienceRecordAppend => SepEventType::EvIntent,
+        CommitType::DlpDecisionAppend => SepEventType::EvDlpDecision,
         CommitType::FrameEvidenceAppend => match frame_kind {
             Some(FrameEventKind::ControlFrame) => SepEventType::EvControlFrame,
             Some(FrameEventKind::SignalFrame) => SepEventType::EvSignalFrame,
@@ -719,6 +725,10 @@ pub fn verify_and_commit(
 
     if req.commit_type == CommitType::ExperienceRecordAppend {
         return verify_experience_record_append(req, store, keystore, vrf_engine);
+    }
+
+    if req.commit_type == CommitType::DlpDecisionAppend {
+        return verify_dlp_decision_append(req, store, keystore);
     }
 
     let receipt_input = to_receipt_input(&req);
@@ -1524,6 +1534,146 @@ fn verify_experience_record_append(
     (receipt, Some(proof_receipt))
 }
 
+fn verify_dlp_decision_append(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let payload = match req.dlp_decision_payload.take() {
+        Some(payload) => payload,
+        None => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let payload_digest = *blake3::hash(&payload).as_bytes();
+    if req.payload_digests.is_empty() {
+        req.payload_digests = vec![payload_digest];
+    }
+
+    let receipt_input = to_receipt_input(&req);
+    let mut reject_reason_codes = Vec::new();
+
+    if req.payload_digests.len() != 1 || req.payload_digests[0] != payload_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if req.epoch_id != keystore.current_epoch() {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+    }
+
+    if req.bindings.prev_record_digest != store.current_head_record_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+    }
+
+    if !req
+        .required_checks
+        .iter()
+        .any(|check| matches!(check, RequiredCheck::SchemaOk))
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    let decision = match DlpDecision::decode(payload.as_slice()) {
+        Ok(decision) => decision,
+        Err(_) => {
+            reject_reason_codes
+                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes,
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: Some(payload_digest),
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let Some(digest) = decision
+        .dlp_decision_digest
+        .as_deref()
+        .and_then(digest_from_bytes)
+    else {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(payload_digest),
+            event_reason_codes: None,
+        });
+    };
+
+    if store.committed_payload_digests.contains(&payload_digest) {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_REPLAY_MISMATCH.to_string());
+    }
+
+    let decision_form =
+        DlpDecisionForm::try_from(decision.decision_form).unwrap_or(DlpDecisionForm::Unspecified);
+    if matches!(decision_form, DlpDecisionForm::Unspecified) {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if store.dlp_store.insert(decision.clone()).is_err() {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if !reject_reason_codes.is_empty() {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(digest),
+            event_reason_codes: None,
+        });
+    }
+
+    let event_reason_codes = store
+        .dlp_store
+        .get(digest)
+        .map(|stored| stored.reason_codes.clone())
+        .unwrap_or(decision.reason_codes.clone());
+
+    store.committed_payload_digests.insert(payload_digest);
+
+    finalize_receipt(FinalizeReceiptArgs {
+        req: &req,
+        receipt_input: &receipt_input,
+        status: ReceiptStatus::Accepted,
+        reject_reason_codes,
+        store,
+        keystore,
+        frame_kind: None,
+        event_object_digest: Some(digest),
+        event_reason_codes: Some(event_reason_codes),
+    })
+}
+
 fn build_finalization_header(
     req: &PvgsCommitRequest,
     record_digest: [u8; 32],
@@ -1644,6 +1794,7 @@ fn log_experience_events(
 
     if let RecordType::RtOutput = record_type {
         let mut dlp_digests: Vec<[u8; 32]> = Vec::new();
+        let mut output_reason_codes: Option<Vec<String>> = None;
 
         if let Some(gov) = &record.governance_frame {
             for reference in &gov.dlp_refs {
@@ -1659,21 +1810,25 @@ fn log_experience_events(
             }
         }
 
-        let dlp_reason = vec![protocol::ReasonCodes::CD_DLP_EXPORT_BLOCKED.to_string()];
         for digest in &dlp_digests {
+            let reason_codes = store
+                .dlp_store
+                .get(*digest)
+                .map(|dlp| dlp.reason_codes.clone())
+                .unwrap_or_else(|| vec![protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()]);
+            if output_reason_codes.is_none() {
+                output_reason_codes = Some(reason_codes.clone());
+            }
             store.sep_log.append_event(
                 commit_id.to_string(),
                 SepEventType::EvDlpDecision,
                 *digest,
-                dlp_reason.clone(),
+                reason_codes,
             );
         }
 
-        let output_reason = if dlp_digests.is_empty() {
-            vec![protocol::ReasonCodes::RE_INTEGRITY_OK.to_string()]
-        } else {
-            dlp_reason.clone()
-        };
+        let output_reason = output_reason_codes
+            .unwrap_or_else(|| vec![protocol::ReasonCodes::RE_INTEGRITY_OK.to_string()]);
 
         store.sep_log.append_event(
             commit_id.to_string(),
@@ -2195,6 +2350,7 @@ impl From<CommitType> for protocol::CommitType {
             CommitType::CbvUpdate => protocol::CommitType::CbvUpdate,
             CommitType::KeyEpochUpdate => protocol::CommitType::KeyEpochUpdate,
             CommitType::FrameEvidenceAppend => protocol::CommitType::FrameEvidenceAppend,
+            CommitType::DlpDecisionAppend => protocol::CommitType::DlpDecisionAppend,
         }
     }
 }
@@ -2277,6 +2433,7 @@ mod tests {
             epoch_id: 1,
             key_epoch: None,
             experience_record_payload: None,
+            dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
         }
@@ -2318,6 +2475,7 @@ mod tests {
                 epoch_id: keystore.current_epoch(),
                 key_epoch: Some(epoch.clone()),
                 experience_record_payload: None,
+                dlp_decision_payload: None,
                 tool_registry_container: None,
                 pev: None,
             },
@@ -2430,6 +2588,7 @@ mod tests {
             epoch_id,
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
+            dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
         }
@@ -2750,6 +2909,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: Some(backward_epoch),
             experience_record_payload: None,
+            dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
         };
@@ -2811,6 +2971,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: Some(epoch),
             experience_record_payload: None,
+            dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
         };
@@ -2848,6 +3009,7 @@ mod tests {
             epoch_id: 1,
             key_epoch: None,
             experience_record_payload: None,
+            dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
         };
@@ -2862,6 +3024,67 @@ mod tests {
         let last_event = store.sep_log.events.last().expect("missing frame event");
         assert_eq!(last_event.event_type, SepEventType::EvControlFrame);
         assert_eq!(last_event.object_digest, [1u8; 32]);
+    }
+
+    #[test]
+    fn dlp_decision_append_stores_and_logs() {
+        let prev = [10u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+        let dlp_digest = [0xAAu8; 32];
+
+        let decision = DlpDecision {
+            dlp_decision_digest: Some(dlp_digest.to_vec()),
+            decision_form: DlpDecisionForm::Block as i32,
+            reason_codes: vec![
+                ReasonCodes::CD_DLP_SECRET_PATTERN.to_string(),
+                ReasonCodes::CD_DLP_EXPORT_BLOCKED.to_string(),
+            ],
+        };
+
+        let req = PvgsCommitRequest {
+            commit_id: "dlp-append".to_string(),
+            commit_type: CommitType::DlpDecisionAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            dlp_decision_payload: Some(decision.encode_to_vec()),
+            tool_registry_container: None,
+            pev: None,
+        };
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof.is_none());
+
+        let stored = store.dlp_store.get(dlp_digest).expect("missing decision");
+        assert_eq!(
+            stored.reason_codes,
+            vec![
+                ReasonCodes::CD_DLP_EXPORT_BLOCKED.to_string(),
+                ReasonCodes::CD_DLP_SECRET_PATTERN.to_string(),
+            ]
+        );
+
+        let event = store.sep_log.events.last().expect("missing sep event");
+        assert_eq!(event.event_type, SepEventType::EvDlpDecision);
+        assert_eq!(event.object_digest, dlp_digest);
+        assert_eq!(event.reason_codes, stored.reason_codes);
     }
 
     #[test]
@@ -2894,6 +3117,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
+            dlp_decision_payload: None,
             tool_registry_container: None,
             pev: Some(pev.clone()),
         };
@@ -2972,6 +3196,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
+            dlp_decision_payload: None,
             tool_registry_container: None,
             pev: Some(pev),
         };
@@ -3044,6 +3269,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
+            dlp_decision_payload: None,
             tool_registry_container: Some(container.encode_to_vec()),
             pev: None,
         };
