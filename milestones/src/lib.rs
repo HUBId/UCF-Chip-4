@@ -5,6 +5,13 @@ use prost::Message;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{Digest32, ExperienceRecord, RecordType, Ref};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+pub mod meso_deriver;
+pub use meso_deriver::{compute_meso_digest, MesoDeriver, MesoDeriverConfig};
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, PartialEq, Eq, Message)]
 pub struct ExperienceRange {
     #[prost(uint64, tag = "1")]
@@ -15,6 +22,7 @@ pub struct ExperienceRange {
     pub head_record_digest: Vec<u8>,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
 #[repr(i32)]
 pub enum MicroMilestoneState {
@@ -23,6 +31,7 @@ pub enum MicroMilestoneState {
     Finalized = 2,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
 #[repr(i32)]
 pub enum PriorityClass {
@@ -31,12 +40,14 @@ pub enum PriorityClass {
     High = 2,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, PartialEq, Eq, Message)]
 pub struct HormoneProfile {
     #[prost(bytes = "vec", optional, tag = "1")]
     pub profile_digest: Option<Vec<u8>>,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, PartialEq, Eq, Message)]
 pub struct MicroMilestone {
     #[prost(string, tag = "1")]
@@ -57,6 +68,7 @@ pub struct MicroMilestone {
     pub proof_receipt_ref: Option<Ref>,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, PartialEq, Eq, Message)]
 pub struct MesoMilestone {
     #[prost(string, tag = "1")]
@@ -71,8 +83,13 @@ pub struct MesoMilestone {
     pub state: i32,
     #[prost(message, optional, tag = "6")]
     pub proof_receipt_ref: Option<Ref>,
+    #[prost(message, optional, tag = "7")]
+    pub hormone_profile: Option<HormoneProfile>,
+    #[prost(string, repeated, tag = "8")]
+    pub theme_tags: Vec<String>,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, PartialEq, Eq, Message)]
 pub struct MacroMilestone {
     #[prost(string, tag = "1")]
@@ -103,7 +120,7 @@ pub enum ValidationError {
     LowConsistencyClass,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MicroMilestoneStore {
     items: Vec<MicroMilestone>,
 }
@@ -128,7 +145,7 @@ impl MicroMilestoneStore {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MesoMilestoneStore {
     items: Vec<MesoMilestone>,
 }
@@ -142,6 +159,10 @@ impl MesoMilestoneStore {
 
     pub fn latest(&self) -> Option<&MesoMilestone> {
         self.items.last()
+    }
+
+    pub fn list(&self) -> &[MesoMilestone] {
+        &self.items
     }
 }
 
@@ -191,6 +212,9 @@ fn validate_micro(micro: &MicroMilestone) -> Result<(), ValidationError> {
 }
 
 fn validate_meso(meso: &MesoMilestone) -> Result<(), ValidationError> {
+    if meso.meso_digest.len() != 32 {
+        return Err(ValidationError::MissingDigest);
+    }
     if meso.micro_refs.is_empty() {
         return Err(ValidationError::InvalidRange);
     }
@@ -322,7 +346,7 @@ fn compute_micro_digest(micro: &MicroMilestone) -> Digest32 {
     Digest32(hasher.finalize().into())
 }
 
-fn new_domain_hasher(domain: &str) -> Hasher {
+pub(crate) fn new_domain_hasher(domain: &str) -> Hasher {
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain.as_bytes());
     hasher

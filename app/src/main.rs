@@ -35,6 +35,7 @@ fn main() {
         key_epoch: None,
         experience_record_payload: None,
         macro_milestone: None,
+        meso_milestone: None,
         dlp_decision_payload: None,
         tool_registry_container: None,
         pev: None,
