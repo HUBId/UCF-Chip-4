@@ -63,6 +63,21 @@ pub struct ExportAttempt {
     pub decision_present: bool,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportAudit {
+    pub record_digest: [u8; 32],
+    pub experience_id: Option<u64>,
+    pub output_artifact_digest: Option<[u8; 32]>,
+    pub dlp_decision_digest: [u8; 32],
+    pub dlp_form: DlpDecisionForm,
+    pub dlp_reason_codes: Vec<String>,
+    pub blocked: bool,
+    pub decision_present: bool,
+    pub ruleset_digest: Option<[u8; 32]>,
+    pub policy_decision_digest: Option<[u8; 32]>,
+}
+
 pub trait QueryInspector {
     fn fetch(&self, request: QueryRequest) -> Result<QueryResult, QueryError>;
     fn prepare_commit(&self, envelope: Envelope) -> Result<PvgsCommitRequest, QueryError>;
@@ -343,12 +358,91 @@ pub fn list_export_attempts(store: &PvgsStore, session_id: &str) -> Vec<ExportAt
     attempts
 }
 
+const RC_RE_DLP_DECISION_MISSING: &str = "RC.RE.DLP_DECISION.MISSING";
+
+/// Return detailed export audits for RT_OUTPUT records in a deterministic order.
+pub fn trace_exports(store: &PvgsStore, session_id: &str) -> Vec<ExportAudit> {
+    let mut audits = Vec::new();
+
+    let mut output_records: Vec<[u8; 32]> = store
+        .sep_log
+        .events
+        .iter()
+        .filter(|event| {
+            event.session_id == session_id && matches!(event.event_type, SepEventType::EvOutput)
+        })
+        .map(|event| event.object_digest)
+        .collect();
+
+    output_records.sort();
+    output_records.dedup();
+
+    for record_digest in output_records {
+        let Some(record) = find_record(store, record_digest) else {
+            continue;
+        };
+
+        let mut dlp_digests = dlp_digests_from_record(record);
+        dlp_digests.sort();
+
+        for dlp_digest in dlp_digests {
+            let (blocked, decision_present, dlp_form, mut dlp_reason_codes) =
+                classify_export_dlp_decision(&store.dlp_store, dlp_digest);
+
+            dlp_reason_codes.sort();
+
+            let output_artifact_digest = related_digest(record, "output_artifact");
+            let ruleset_digest = related_digest(record, "ruleset");
+            let policy_decision_digest = related_digest(record, "decision");
+            let experience_id = record
+                .finalization_header
+                .as_ref()
+                .map(|header| header.experience_id);
+
+            audits.push(ExportAudit {
+                record_digest,
+                experience_id,
+                output_artifact_digest,
+                dlp_decision_digest: dlp_digest,
+                dlp_form,
+                dlp_reason_codes,
+                blocked,
+                decision_present,
+                ruleset_digest,
+                policy_decision_digest,
+            });
+        }
+    }
+
+    audits.sort_by(|a, b| {
+        a.record_digest
+            .cmp(&b.record_digest)
+            .then_with(|| a.dlp_decision_digest.cmp(&b.dlp_decision_digest))
+    });
+    audits
+}
+
 fn find_record(store: &PvgsStore, record_digest: [u8; 32]) -> Option<&ExperienceRecord> {
     store
         .experience_store
         .records
         .iter()
         .find(|record| compute_experience_record_digest(record) == record_digest)
+}
+
+fn related_digest(record: &ExperienceRecord, target_id: &str) -> Option<[u8; 32]> {
+    let mut refs: Vec<&ucf_protocol::ucf::v1::Ref> = Vec::new();
+
+    if let Some(gov) = &record.governance_frame {
+        refs.extend(gov.policy_decision_refs.iter());
+    }
+
+    if let Some(meta) = &record.metabolic_frame {
+        refs.extend(meta.outcome_refs.iter());
+    }
+
+    refs.into_iter()
+        .find_map(|reference| digest_from_labeled_ref(reference, target_id))
 }
 
 fn dlp_digests_from_record(record: &ExperienceRecord) -> Vec<NodeKey> {
@@ -369,6 +463,28 @@ fn dlp_digests_from_record(record: &ExperienceRecord) -> Vec<NodeKey> {
     }
 
     digests.into_iter().collect()
+}
+
+fn digest_from_labeled_ref(
+    reference: &ucf_protocol::ucf::v1::Ref,
+    target_id: &str,
+) -> Option<[u8; 32]> {
+    let prefix = format!("{target_id}:");
+
+    if let Some(value) = reference.id.strip_prefix(&prefix) {
+        return digest_from_labeled_value(value);
+    }
+
+    None
+}
+
+fn digest_from_labeled_value(value: &str) -> Option<[u8; 32]> {
+    if value.len() == 64 {
+        let bytes = hex::decode(value).ok()?;
+        return digest_from_bytes(&bytes);
+    }
+
+    digest_from_bytes(value.as_bytes())
 }
 
 fn digest_from_ref(reference: &ucf_protocol::ucf::v1::Ref) -> Option<[u8; 32]> {
@@ -420,6 +536,26 @@ fn classify_dlp_decision(
     }
 }
 
+fn classify_export_dlp_decision(
+    store: &DlpDecisionStore,
+    digest: [u8; 32],
+) -> (bool, bool, DlpDecisionForm, Vec<String>) {
+    match store.get(digest) {
+        Some(decision) => {
+            let form = DlpDecisionForm::try_from(decision.decision_form)
+                .unwrap_or(DlpDecisionForm::Unspecified);
+            let blocked = matches!(form, DlpDecisionForm::Block | DlpDecisionForm::Hold);
+            (blocked, true, form, decision.reason_codes.clone())
+        }
+        None => (
+            true,
+            false,
+            DlpDecisionForm::Unspecified,
+            vec![RC_RE_DLP_DECISION_MISSING.to_string()],
+        ),
+    }
+}
+
 fn sorted_edges(edges: &[(EdgeType, NodeKey)]) -> Vec<(EdgeType, NodeKey)> {
     let mut ordered = edges.to_vec();
     ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -448,7 +584,7 @@ mod tests {
     use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
     use ucf_protocol::ucf::v1::{
-        Digest32, DlpDecision, GovernanceFrame, ReceiptStatus, RecordType, Ref,
+        Digest32, DlpDecision, GovernanceFrame, MetabolicFrame, ReceiptStatus, RecordType, Ref,
     };
     use vrf::VrfEngine;
 
@@ -864,18 +1000,47 @@ mod tests {
         commit_id: &str,
         dlp_digest: [u8; 32],
     ) -> [u8; 32] {
+        append_output_record_with_refs(
+            store,
+            keystore,
+            vrf_engine,
+            commit_id,
+            dlp_digest,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn append_output_record_with_refs(
+        store: &mut PvgsStore,
+        keystore: &KeyStore,
+        vrf_engine: &VrfEngine,
+        commit_id: &str,
+        dlp_digest: [u8; 32],
+        related_refs: Vec<Ref>,
+        outcome_refs: Vec<Ref>,
+    ) -> [u8; 32] {
         let governance_frame = GovernanceFrame {
-            policy_decision_refs: Vec::new(),
+            policy_decision_refs: related_refs,
             pvgs_receipt_ref: None,
             dlp_refs: vec![Ref {
                 id: hex::encode(dlp_digest),
             }],
         };
 
+        let metabolic_frame = if outcome_refs.is_empty() {
+            None
+        } else {
+            Some(MetabolicFrame {
+                profile_digest: None,
+                outcome_refs,
+            })
+        };
+
         let record = ExperienceRecord {
             record_type: RecordType::RtOutput as i32,
             core_frame: None,
-            metabolic_frame: None,
+            metabolic_frame,
             governance_frame: Some(governance_frame),
             core_frame_ref: None,
             metabolic_frame_ref: None,
@@ -1090,6 +1255,230 @@ mod tests {
                 .map(|attempt| attempt.record_digest)
                 .collect::<Vec<_>>(),
             expected
+        );
+    }
+
+    #[test]
+    fn trace_exports_blocks_on_dlp_decision() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(3);
+        let vrf_engine = VrfEngine::new_dev(3);
+        let dlp_digest = [11u8; 32];
+        let output_artifact_digest = [12u8; 32];
+        let ruleset_digest = [13u8; 32];
+        let policy_decision_digest = [14u8; 32];
+
+        store_dlp_decision(
+            &mut store,
+            dlp_digest,
+            DlpDecisionForm::Block,
+            vec![ReasonCodes::CD_DLP_SECRET_PATTERN],
+        );
+
+        let commit_id = "trace-blocked";
+        append_output_record_with_refs(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            commit_id,
+            dlp_digest,
+            vec![
+                Ref {
+                    id: format!("output_artifact:{}", hex::encode(output_artifact_digest)),
+                },
+                Ref {
+                    id: format!("ruleset:{}", hex::encode(ruleset_digest)),
+                },
+                Ref {
+                    id: format!("decision:{}", hex::encode(policy_decision_digest)),
+                },
+            ],
+            Vec::new(),
+        );
+
+        let audits = trace_exports(&store, commit_id);
+        assert_eq!(audits.len(), 1);
+        let audit = &audits[0];
+        assert!(audit.blocked);
+        assert!(audit.decision_present);
+        assert_eq!(audit.dlp_decision_digest, dlp_digest);
+        assert_eq!(audit.dlp_form, DlpDecisionForm::Block);
+        assert_eq!(
+            audit.dlp_reason_codes,
+            vec![ReasonCodes::CD_DLP_SECRET_PATTERN.to_string()]
+        );
+        assert_eq!(audit.output_artifact_digest, Some(output_artifact_digest));
+        assert_eq!(audit.ruleset_digest, Some(ruleset_digest));
+        assert_eq!(audit.policy_decision_digest, Some(policy_decision_digest));
+    }
+
+    #[test]
+    fn trace_exports_allows_on_allow_decision() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(3);
+        let vrf_engine = VrfEngine::new_dev(3);
+        let dlp_digest = [15u8; 32];
+
+        store_dlp_decision(
+            &mut store,
+            dlp_digest,
+            DlpDecisionForm::Allow,
+            vec![ReasonCodes::RE_INTEGRITY_OK],
+        );
+
+        let commit_id = "trace-allow";
+        append_output_record_with_refs(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            commit_id,
+            dlp_digest,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let audits = trace_exports(&store, commit_id);
+        assert_eq!(audits.len(), 1);
+        let audit = &audits[0];
+        assert!(!audit.blocked);
+        assert!(audit.decision_present);
+        assert_eq!(audit.dlp_form, DlpDecisionForm::Allow);
+        assert_eq!(
+            audit.dlp_reason_codes,
+            vec![ReasonCodes::RE_INTEGRITY_OK.to_string()]
+        );
+    }
+
+    #[test]
+    fn trace_exports_blocks_when_decision_missing() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(3);
+        let vrf_engine = VrfEngine::new_dev(3);
+        let missing_digest = [21u8; 32];
+
+        let commit_id = "trace-missing";
+        append_output_record_with_refs(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            commit_id,
+            missing_digest,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let audits = trace_exports(&store, commit_id);
+        assert_eq!(audits.len(), 1);
+        let audit = &audits[0];
+        assert!(audit.blocked);
+        assert!(!audit.decision_present);
+        assert_eq!(audit.dlp_form, DlpDecisionForm::Unspecified);
+        assert_eq!(
+            audit.dlp_reason_codes,
+            vec![RC_RE_DLP_DECISION_MISSING.to_string()]
+        );
+    }
+
+    #[test]
+    fn trace_exports_is_deterministic() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(3);
+        let vrf_engine = VrfEngine::new_dev(3);
+
+        let first_dlp = [31u8; 32];
+        let second_dlp = [32u8; 32];
+
+        store_dlp_decision(
+            &mut store,
+            first_dlp,
+            DlpDecisionForm::Allow,
+            vec![ReasonCodes::RE_INTEGRITY_OK],
+        );
+        store_dlp_decision(
+            &mut store,
+            second_dlp,
+            DlpDecisionForm::Allow,
+            vec![ReasonCodes::RE_INTEGRITY_OK],
+        );
+
+        let commit_id = "trace-ordering";
+        let first_record = append_output_record_with_refs(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            commit_id,
+            second_dlp,
+            Vec::new(),
+            Vec::new(),
+        );
+        let second_record = append_output_record_with_refs(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            commit_id,
+            first_dlp,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let mut expected_records = vec![first_record, second_record];
+        expected_records.sort();
+
+        let audits = trace_exports(&store, commit_id);
+        assert_eq!(
+            audits
+                .iter()
+                .map(|audit| audit.record_digest)
+                .collect::<Vec<_>>(),
+            expected_records
         );
     }
 }
