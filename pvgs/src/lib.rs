@@ -1933,6 +1933,8 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+const RC_RE_DLP_DECISION_MISSING: &str = "RC.RE.DLP_DECISION.MISSING";
+
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletenessStatus {
@@ -1953,17 +1955,29 @@ pub struct CompletenessReport {
 #[derive(Debug)]
 pub struct CompletenessChecker<'a> {
     graph: &'a CausalGraph,
-    sep_log: &'a SepLog,
+    sep_log: &'a mut SepLog,
+    dlp_store: &'a DlpDecisionStore,
+    records: &'a [ExperienceRecord],
 }
 
 impl<'a> CompletenessChecker<'a> {
-    pub fn new(graph: &'a CausalGraph, sep_log: &'a SepLog) -> Self {
-        Self { graph, sep_log }
+    pub fn new(
+        graph: &'a CausalGraph,
+        sep_log: &'a mut SepLog,
+        dlp_store: &'a DlpDecisionStore,
+        records: &'a [ExperienceRecord],
+    ) -> Self {
+        Self {
+            graph,
+            sep_log,
+            dlp_store,
+            records,
+        }
     }
 
     /// Evaluate completeness for the provided action digests using graph-based rules.
     pub fn check_actions(
-        &self,
+        &mut self,
         session_id: &str,
         action_digests: Vec<[u8; 32]>,
     ) -> CompletenessReport {
@@ -2133,6 +2147,34 @@ impl<'a> CompletenessChecker<'a> {
             }
         }
 
+        // O-C1: Every RT_OUTPUT governance DLP reference must resolve to a stored decision.
+        // TODO: Elevate to FAIL in production.
+        let mut missing_dlp_decisions: BTreeSet<[u8; 32]> = BTreeSet::new();
+
+        for output_digest in self.outputs_for_session(session_id) {
+            if let Some(record) = self.find_record(output_digest) {
+                for digest in dlp_digests_from_gov(record) {
+                    if self.dlp_store.get(digest).is_none() {
+                        if missing_dlp_decisions.insert(digest) {
+                            if !matches!(status, CompletenessStatus::Fail) {
+                                status = CompletenessStatus::Degraded;
+                            }
+                            missing_nodes.insert(digest);
+                            reason_codes
+                                .insert(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+                            reason_codes.insert(RC_RE_DLP_DECISION_MISSING.to_string());
+                            self.sep_log.append_event(
+                                session_id.to_string(),
+                                SepEventType::EvDlpDecision,
+                                digest,
+                                vec![RC_RE_DLP_DECISION_MISSING.to_string()],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         missing_edges.sort();
 
         CompletenessReport {
@@ -2160,6 +2202,24 @@ impl<'a> CompletenessChecker<'a> {
         })
     }
 
+    fn outputs_for_session(&self, session_id: &str) -> Vec<[u8; 32]> {
+        let mut outputs = std::collections::BTreeSet::new();
+
+        for event in self.sep_log.events.iter().filter(|event| {
+            event.session_id == session_id && matches!(event.event_type, SepEventType::EvOutput)
+        }) {
+            outputs.insert(event.object_digest);
+        }
+
+        outputs.into_iter().collect()
+    }
+
+    fn find_record(&self, record_digest: [u8; 32]) -> Option<&ExperienceRecord> {
+        self.records
+            .iter()
+            .find(|record| compute_experience_record_digest(record) == record_digest)
+    }
+
     fn references(&self, from: [u8; 32], to: &[u8; 32]) -> bool {
         self.graph
             .neighbors(from)
@@ -2175,6 +2235,20 @@ impl<'a> CompletenessChecker<'a> {
 
 fn key_epoch_payload_digest(req: &PvgsCommitRequest) -> Option<[u8; 32]> {
     req.payload_digests.first().copied()
+}
+
+fn dlp_digests_from_gov(record: &ExperienceRecord) -> Vec<[u8; 32]> {
+    let mut digests = std::collections::BTreeSet::new();
+
+    if let Some(gov) = &record.governance_frame {
+        for reference in &gov.dlp_refs {
+            if let Some(digest) = digest_from_ref(reference) {
+                digests.insert(digest);
+            }
+        }
+    }
+
+    digests.into_iter().collect()
 }
 
 fn validate_key_epoch_update(
@@ -3557,7 +3631,9 @@ mod tests {
             vec![],
         );
 
-        let checker = CompletenessChecker::new(&graph, &sep_log);
+        let dlp_store = DlpDecisionStore::default();
+        let records = Vec::new();
+        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
         let report = checker.check_actions("sess-ok", vec![action]);
 
         assert!(report.missing_edges.is_empty());
@@ -3568,8 +3644,10 @@ mod tests {
     #[test]
     fn completeness_fails_when_receipt_missing() {
         let graph = CausalGraph::default();
-        let sep_log = SepLog::default();
-        let checker = CompletenessChecker::new(&graph, &sep_log);
+        let mut sep_log = SepLog::default();
+        let dlp_store = DlpDecisionStore::default();
+        let records = Vec::new();
+        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
 
         let report = checker.check_actions("sess-missing", vec![[9u8; 32]]);
 
@@ -3605,13 +3683,89 @@ mod tests {
             vec![],
         );
 
-        let checker = CompletenessChecker::new(&graph, &sep_log);
+        let dlp_store = DlpDecisionStore::default();
+        let records = Vec::new();
+        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
         let report = checker.check_actions("sess-degraded", vec![action]);
 
         assert_eq!(report.status, CompletenessStatus::Degraded);
         assert!(report
             .reason_codes
             .contains(&ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()));
+    }
+
+    #[test]
+    fn completeness_accepts_present_dlp_decision_for_output() {
+        let graph = CausalGraph::default();
+        let mut sep_log = SepLog::default();
+        let dlp_digest = [42u8; 32];
+
+        let mut dlp_store = DlpDecisionStore::default();
+        let decision = DlpDecision {
+            dlp_decision_digest: Some(dlp_digest.to_vec()),
+            decision_form: DlpDecisionForm::Allow as i32,
+            reason_codes: vec![ReasonCodes::RE_INTEGRITY_OK.to_string()],
+        };
+        dlp_store.insert(decision).unwrap();
+
+        let record = output_record(dlp_digest);
+        let record_digest = compute_experience_record_digest(&record);
+        sep_log.append_event(
+            "sess-o-c1-ok".to_string(),
+            SepEventType::EvOutput,
+            record_digest,
+            Vec::new(),
+        );
+
+        let records = vec![record];
+        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
+        let report = checker.check_actions("sess-o-c1-ok", vec![]);
+
+        assert_eq!(report.status, CompletenessStatus::Ok);
+        assert!(report.missing_nodes.is_empty());
+        assert!(!report
+            .reason_codes
+            .contains(&RC_RE_DLP_DECISION_MISSING.to_string()));
+    }
+
+    #[test]
+    fn completeness_degrades_when_dlp_decision_missing() {
+        let graph = CausalGraph::default();
+        let mut sep_log = SepLog::default();
+        let dlp_digest = [43u8; 32];
+
+        let record = output_record(dlp_digest);
+        let record_digest = compute_experience_record_digest(&record);
+        sep_log.append_event(
+            "sess-o-c1-missing".to_string(),
+            SepEventType::EvOutput,
+            record_digest,
+            Vec::new(),
+        );
+
+        let dlp_store = DlpDecisionStore::default();
+        let records = vec![record];
+        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
+        let report = checker.check_actions("sess-o-c1-missing", vec![]);
+
+        assert_eq!(report.status, CompletenessStatus::Degraded);
+        assert!(report.missing_nodes.contains(&dlp_digest));
+        assert!(report
+            .reason_codes
+            .contains(&ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()));
+        assert!(report
+            .reason_codes
+            .contains(&RC_RE_DLP_DECISION_MISSING.to_string()));
+
+        let has_sep_event = sep_log.events.iter().any(|event| {
+            event.session_id == "sess-o-c1-missing"
+                && event.event_type == SepEventType::EvDlpDecision
+                && event.object_digest == dlp_digest
+                && event
+                    .reason_codes
+                    .contains(&RC_RE_DLP_DECISION_MISSING.to_string())
+        });
+        assert!(has_sep_event);
     }
 
     #[test]
@@ -3631,7 +3785,9 @@ mod tests {
             vec![],
         );
 
-        let checker = CompletenessChecker::new(&graph, &sep_log);
+        let dlp_store = DlpDecisionStore::default();
+        let records = Vec::new();
+        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
         let report_one = checker.check_actions("sess-deterministic", vec![action]);
         let report_two = checker.check_actions("sess-deterministic", vec![action]);
 
@@ -3663,7 +3819,9 @@ mod tests {
             vec![],
         );
 
-        let checker = CompletenessChecker::new(&graph, &sep_log);
+        let dlp_store = DlpDecisionStore::default();
+        let records = Vec::new();
+        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
         let report = checker.check_actions("sess-cf", vec![action]);
 
         assert_eq!(report.status, CompletenessStatus::Degraded);

@@ -60,6 +60,7 @@ pub struct ExportAttempt {
     pub reason_codes: Vec<String>,
     pub timestamp_ms: Option<u64>,
     pub blocked: bool,
+    pub decision_present: bool,
 }
 
 pub trait QueryInspector {
@@ -325,7 +326,8 @@ pub fn list_export_attempts(store: &PvgsStore, session_id: &str) -> Vec<ExportAt
         let decision_digest = dlp_digests.first().copied();
 
         let timestamp_ms = record.and_then(record_timestamp_ms);
-        let (blocked, reason_codes) = classify_dlp_decision(&store.dlp_store, decision_digest);
+        let (blocked, decision_present, reason_codes) =
+            classify_dlp_decision(&store.dlp_store, decision_digest);
 
         attempts.push(ExportAttempt {
             record_digest: event.object_digest,
@@ -333,6 +335,7 @@ pub fn list_export_attempts(store: &PvgsStore, session_id: &str) -> Vec<ExportAt
             reason_codes,
             timestamp_ms,
             blocked,
+            decision_present,
         });
     }
 
@@ -394,9 +397,12 @@ fn record_timestamp_ms(record: &ExperienceRecord) -> Option<u64> {
         .map(|header| header.timestamp_ms)
 }
 
-fn classify_dlp_decision(store: &DlpDecisionStore, digest: Option<NodeKey>) -> (bool, Vec<String>) {
+fn classify_dlp_decision(
+    store: &DlpDecisionStore,
+    digest: Option<NodeKey>,
+) -> (bool, bool, Vec<String>) {
     let Some(dlp_digest) = digest else {
-        return (false, Vec::new());
+        return (false, false, Vec::new());
     };
 
     match store.get(dlp_digest) {
@@ -404,9 +410,13 @@ fn classify_dlp_decision(store: &DlpDecisionStore, digest: Option<NodeKey>) -> (
             let form = DlpDecisionForm::try_from(decision.decision_form)
                 .unwrap_or(DlpDecisionForm::Unspecified);
             let blocked = matches!(form, DlpDecisionForm::Block | DlpDecisionForm::Hold);
-            (blocked, decision.reason_codes.clone())
+            (blocked, true, decision.reason_codes.clone())
         }
-        None => (true, vec![ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()]),
+        None => (
+            true,
+            false,
+            vec![ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()],
+        ),
     }
 }
 
@@ -941,6 +951,7 @@ mod tests {
         );
         assert!(attempts[0].timestamp_ms.is_some());
         assert!(attempts[0].blocked);
+        assert!(!attempts[0].decision_present);
     }
 
     #[test]
@@ -979,6 +990,7 @@ mod tests {
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].dlp_decision_digest, Some(dlp_digest));
         assert!(attempts[0].blocked);
+        assert!(attempts[0].decision_present);
         assert_eq!(
             attempts[0].reason_codes,
             vec![
@@ -1021,6 +1033,7 @@ mod tests {
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].dlp_decision_digest, Some(dlp_digest));
         assert!(!attempts[0].blocked);
+        assert!(attempts[0].decision_present);
         assert_eq!(
             attempts[0].reason_codes,
             vec![ReasonCodes::RE_INTEGRITY_OK.to_string()]
