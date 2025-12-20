@@ -1,0 +1,13 @@
+[package]
+name = "milestones"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ucf-protocol = { path = "../ucf-protocol" }
+blake3 = "1"
+prost = { version = "0.12", features = ["prost-derive"] }
+thiserror = "1"
+
+[dev-dependencies]
+rand = "0.8"
