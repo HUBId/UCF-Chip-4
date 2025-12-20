@@ -340,6 +340,9 @@ mod tests {
             macro_digest: vec![0xAA; 32],
             state: MacroMilestoneState::Finalized as i32,
             trait_updates: updates,
+            meso_refs: Vec::new(),
+            consistency_class: "CONSISTENCY_HIGH".to_string(),
+            identity_anchor_flag: true,
         }
     }
 

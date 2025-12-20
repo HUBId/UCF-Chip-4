@@ -9,7 +9,8 @@ use dlp_store::DlpDecisionStore;
 use ed25519_dalek::Signer;
 use keys::{verify_key_epoch_signature, KeyEpochHistory, KeyStore};
 use milestones::{
-    compute_meso_digest, MesoDeriver, MesoMilestone, MesoMilestoneStore, MicroMilestoneStore,
+    compute_meso_digest, MacroDeriver, MesoDeriver, MesoMilestone, MesoMilestoneStore,
+    MicroMilestoneStore,
 };
 use pev::{pev_digest as extract_pev_digest, PevStore, PolicyEcologyVector};
 use prost::Message;
@@ -190,6 +191,7 @@ pub struct PvgsStore {
     pub micro_milestones: MicroMilestoneStore,
     pub meso_milestones: MesoMilestoneStore,
     pub meso_deriver: MesoDeriver,
+    pub macro_deriver: MacroDeriver,
     pub macro_milestones: Vec<MacroMilestone>,
     pub committed_payload_digests: HashSet<[u8; 32]>,
     pub sep_log: SepLog,
@@ -226,6 +228,7 @@ impl PvgsStore {
             micro_milestones: MicroMilestoneStore::default(),
             meso_milestones: MesoMilestoneStore::default(),
             meso_deriver: MesoDeriver::new_beta(),
+            macro_deriver: MacroDeriver::new_beta(),
             macro_milestones: Vec::new(),
             committed_payload_digests: HashSet::new(),
             sep_log: SepLog::default(),
@@ -578,6 +581,57 @@ impl PvgsStore {
         };
 
         let (receipt, _proof) = verify_meso_milestone_append(req, self, keystore, vrf_engine);
+        if receipt.status == ReceiptStatus::Rejected {
+            return Err(AutoCommitError::Rejected(receipt.reject_reason_codes));
+        }
+
+        Ok(Some(receipt))
+    }
+
+    pub fn auto_commit_next_macro(
+        &mut self,
+        keystore: &KeyStore,
+        vrf_engine: &VrfEngine,
+    ) -> Result<Option<PVGSReceipt>, AutoCommitError> {
+        let mut candidates = self
+            .macro_deriver
+            .derive_candidates(self.meso_milestones.list(), self.micro_milestones.list());
+
+        candidates.sort_by(|a, b| a.macro_id.cmp(&b.macro_id));
+        let Some(macro_milestone) = candidates.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap_or([0u8; 32]);
+
+        let req = PvgsCommitRequest {
+            commit_id: macro_milestone.macro_id.clone(),
+            commit_type: CommitType::MilestoneAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: self.ruleset_state.charter_version_digest.clone(),
+                policy_version_digest: self.ruleset_state.policy_version_digest.clone(),
+                prev_record_digest: self.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: self.ruleset_state.pev_digest,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: vec![macro_digest],
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            macro_milestone: Some(macro_milestone),
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+        };
+
+        let (receipt, _proof) = verify_macro_milestone_append(req, self, keystore, vrf_engine);
         if receipt.status == ReceiptStatus::Rejected {
             return Err(AutoCommitError::Rejected(receipt.reject_reason_codes));
         }
@@ -1277,7 +1331,10 @@ fn verify_macro_milestone_append(
 
     store.add_receipt_edges(&receipt);
     store.macro_milestones.push(macro_milestone.clone());
+    store.macro_deriver.register_committed(&macro_milestone);
     store.committed_payload_digests.insert(macro_digest);
+
+    add_macro_edges(store, macro_digest, &macro_milestone);
 
     store.sep_log.append_event(
         req.commit_id.clone(),
@@ -2434,7 +2491,29 @@ fn optional_proto_digest(value: &Option<Digest32>) -> Option<[u8; 32]> {
 }
 
 fn digest_from_ref(reference: &Ref) -> Option<[u8; 32]> {
-    digest_from_hex_str(&reference.id).or_else(|| digest_from_bytes(reference.id.as_bytes()))
+    digest_from_hex_str(&reference.id)
+        .or_else(|| {
+            reference
+                .id
+                .rsplit(':')
+                .next()
+                .and_then(digest_from_hex_str)
+        })
+        .or_else(|| digest_from_bytes(reference.id.as_bytes()))
+}
+
+fn add_macro_edges(
+    store: &mut PvgsStore,
+    macro_digest: [u8; 32],
+    macro_milestone: &MacroMilestone,
+) {
+    for meso_ref in &macro_milestone.meso_refs {
+        if let Some(meso_digest) = digest_from_ref(meso_ref) {
+            store
+                .causal_graph
+                .add_edge(macro_digest, EdgeType::References, meso_digest);
+        }
+    }
 }
 
 fn digest_from_hex_str(value: &str) -> Option<[u8; 32]> {
@@ -3095,6 +3174,9 @@ mod tests {
             macro_digest: vec![1u8; 32],
             state: MacroMilestoneState::Finalized as i32,
             trait_updates: updates,
+            meso_refs: Vec::new(),
+            consistency_class: "CONSISTENCY_HIGH".to_string(),
+            identity_anchor_flag: true,
         }
     }
 
@@ -3104,6 +3186,28 @@ mod tests {
             macro_digest: vec![2u8; 32],
             state: state as i32,
             trait_updates: Vec::new(),
+            meso_refs: Vec::new(),
+            consistency_class: "CONSISTENCY_HIGH".to_string(),
+            identity_anchor_flag: true,
+        }
+    }
+
+    fn micro_with_priority(id: u64, priority: PriorityClass) -> MicroMilestone {
+        let range = ExperienceRange {
+            start_experience_id: id * 10,
+            end_experience_id: id * 10 + 5,
+            head_record_digest: vec![1u8; 32],
+        };
+
+        MicroMilestone {
+            micro_id: format!("micro:s:{id}:{}", id * 10 + 5),
+            experience_range: Some(range),
+            summary_digest: vec![2u8; 32],
+            hormone_profile: None,
+            priority_class: priority as i32,
+            state: MicroMilestoneState::Sealed as i32,
+            micro_digest: vec![id as u8; 32],
+            proof_receipt_ref: None,
         }
     }
 
@@ -3476,6 +3580,85 @@ mod tests {
         let second = store
             .auto_commit_next_meso(&keystore, &vrf_engine)
             .expect("second attempt");
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn auto_commit_macro_appends_and_updates_cbv() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        for i in 0..8 {
+            let priority = if i == 0 {
+                PriorityClass::High
+            } else {
+                PriorityClass::Med
+            };
+            store
+                .micro_milestones
+                .push(micro_with_priority(i + 1, priority))
+                .expect("valid micro");
+        }
+
+        for _ in 0..2 {
+            let receipt = store
+                .auto_commit_next_meso(&keystore, &vrf_engine)
+                .expect("auto meso")
+                .expect("meso receipt");
+            assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        }
+
+        assert_eq!(store.meso_milestones.list().len(), 2);
+
+        let macro_receipt = store
+            .auto_commit_next_macro(&keystore, &vrf_engine)
+            .expect("auto macro")
+            .expect("macro receipt");
+
+        assert_eq!(macro_receipt.status, ReceiptStatus::Accepted);
+        assert_eq!(store.macro_milestones.len(), 1);
+
+        let macro_digest = digest_from_bytes(
+            &store
+                .macro_milestones
+                .last()
+                .expect("macro stored")
+                .macro_digest,
+        )
+        .unwrap();
+
+        let neighbors = store.causal_graph.neighbors(macro_digest);
+        for meso in store.meso_milestones.list() {
+            let digest = digest_from_bytes(&meso.meso_digest).unwrap();
+            assert!(neighbors.contains(&(EdgeType::References, digest)));
+        }
+
+        let latest_cbv = store.cbv_store.latest().expect("cbv updated");
+        assert_eq!(latest_cbv.cbv_epoch, 1);
+        assert!(latest_cbv
+            .source_milestone_refs
+            .iter()
+            .any(|r| digest_from_ref(r) == Some(macro_digest)));
+
+        let macro_logged = store.sep_log.events.iter().any(|event| {
+            event
+                .reason_codes
+                .contains(&ReasonCodes::GV_MILESTONE_MACRO_APPENDED.to_string())
+        });
+        assert!(macro_logged);
+
+        let cbv_logged = store.sep_log.events.iter().any(|event| {
+            event
+                .reason_codes
+                .contains(&ReasonCodes::GV_CBV_UPDATED.to_string())
+        });
+        assert!(cbv_logged);
+
+        let second = store
+            .auto_commit_next_macro(&keystore, &vrf_engine)
+            .expect("second macro attempt");
         assert!(second.is_none());
     }
 

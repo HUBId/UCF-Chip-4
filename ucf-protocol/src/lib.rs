@@ -231,6 +231,12 @@ pub mod ucf {
             pub state: i32,
             #[prost(message, repeated, tag = "4")]
             pub trait_updates: Vec<TraitUpdate>,
+            #[prost(message, repeated, tag = "5")]
+            pub meso_refs: Vec<Ref>,
+            #[prost(string, tag = "6")]
+            pub consistency_class: String,
+            #[prost(bool, tag = "7")]
+            pub identity_anchor_flag: bool,
         }
 
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
