@@ -331,6 +331,9 @@ pub mod ucf {
                 "RC.GE.VALIDATION.SCHEMA_INVALID";
             pub const GV_CBV_UPDATED: &'static str = "RC.GV.CBV.UPDATED";
             pub const GV_CBV_NO_CHANGE: &'static str = "RC.GV.CBV.NO_CHANGE";
+            pub const GV_CBV_NO_OP: &'static str = "RC.GV.CBV.NO_OP";
+            pub const GV_CBV_UPDATE_FAILED: &'static str = "RC.GV.CBV.UPDATE_FAILED";
+            pub const GV_MILESTONE_MACRO_APPENDED: &'static str = "RC.GV.MILESTONE.MACRO_APPENDED";
             pub const GV_PEV_UPDATED: &'static str = "RC.GV.PEV.UPDATED";
             pub const GV_TOOL_REGISTRY_UPDATED: &'static str = "RC.GV.TOOL_REGISTRY.UPDATED";
             pub const GV_RULESET_CHANGED: &'static str = "RC.GV.RULESET.CHANGED";

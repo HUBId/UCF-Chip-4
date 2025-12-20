@@ -140,6 +140,7 @@ pub struct PvgsCommitRequest {
     pub epoch_id: u64,
     pub key_epoch: Option<PVGSKeyEpoch>,
     pub experience_record_payload: Option<Vec<u8>>,
+    pub macro_milestone: Option<MacroMilestone>,
     pub dlp_decision_payload: Option<Vec<u8>>,
     pub tool_registry_container: Option<Vec<u8>>,
     pub pev: Option<PolicyEcologyVector>,
@@ -176,6 +177,7 @@ pub struct PvgsStore {
     pub pev_store: PevStore,
     pub dlp_store: DlpDecisionStore,
     pub tool_registry_state: ToolRegistryState,
+    pub macro_milestones: Vec<MacroMilestone>,
     pub committed_payload_digests: HashSet<[u8; 32]>,
     pub sep_log: SepLog,
     pub causal_graph: CausalGraph,
@@ -208,6 +210,7 @@ impl PvgsStore {
             pev_store: PevStore::default(),
             dlp_store: DlpDecisionStore::default(),
             tool_registry_state: ToolRegistryState::default(),
+            macro_milestones: Vec::new(),
             committed_payload_digests: HashSet::new(),
             sep_log: SepLog::default(),
             causal_graph: CausalGraph::default(),
@@ -663,6 +666,19 @@ pub fn compute_tool_registry_verified_fields_digest(
     *hasher.finalize().as_bytes()
 }
 
+fn compute_macro_verified_fields_digest(
+    prev_record_digest: [u8; 32],
+    macro_digest: [u8; 32],
+    epoch_id: u64,
+) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(b"UCF:PVGS:MACRO_VERIFIED_FIELDS");
+    hasher.update(&prev_record_digest);
+    hasher.update(&macro_digest);
+    hasher.update(&epoch_id.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 fn event_type_for_commit(
     commit_type: CommitType,
     frame_kind: Option<FrameEventKind>,
@@ -708,6 +724,14 @@ fn to_receipt_input(req: &PvgsCommitRequest) -> ReceiptInput {
     }
 }
 
+fn macro_source_ref_id(macro_milestone: &MacroMilestone) -> String {
+    format!(
+        "{}:{}",
+        macro_milestone.macro_id,
+        hex::encode(&macro_milestone.macro_digest)
+    )
+}
+
 /// Verify a commit request and emit attested receipts.
 pub fn verify_and_commit(
     req: PvgsCommitRequest,
@@ -715,6 +739,10 @@ pub fn verify_and_commit(
     keystore: &KeyStore,
     vrf_engine: &VrfEngine,
 ) -> (PVGSReceipt, Option<ProofReceipt>) {
+    if req.commit_type == CommitType::MilestoneAppend {
+        return verify_macro_milestone_append(req, store, keystore, vrf_engine);
+    }
+
     if req.commit_type == CommitType::PevUpdate {
         return verify_pev_update(req, store, keystore, vrf_engine);
     }
@@ -1011,6 +1039,234 @@ pub fn verify_and_commit(
     }
 
     (receipt, Some(proof_receipt))
+}
+
+fn verify_macro_milestone_append(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+    vrf_engine: &VrfEngine,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let mut reject_reason_codes = Vec::new();
+    let receipt_input = to_receipt_input(&req);
+
+    if req.epoch_id != keystore.current_epoch() {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    }
+
+    if req.bindings.prev_record_digest != store.current_head_record_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    }
+
+    if !store
+        .known_charter_versions
+        .contains(&req.bindings.charter_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_CHARTER_SCOPE.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    }
+
+    if !store
+        .known_policy_versions
+        .contains(&req.bindings.policy_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_INTEGRITY_REQUIRED.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    }
+
+    let Some(macro_milestone) = req.macro_milestone.clone() else {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    };
+
+    let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap_or([0u8; 32]);
+
+    if req.payload_digests.is_empty() {
+        req.payload_digests = vec![macro_digest];
+    } else if req.payload_digests.len() != 1 || req.payload_digests[0] != macro_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if !reject_reason_codes.is_empty() {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(macro_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    let (ruleset_changed, charter_or_policy_changed) = store.refresh_ruleset_state(
+        &req.bindings.charter_version_digest,
+        &req.bindings.policy_version_digest,
+    );
+    if ruleset_changed && charter_or_policy_changed {
+        store.log_ruleset_change(&req.commit_id, SepEventType::EvCharterUpdate, Vec::new());
+    }
+
+    let verified_fields_digest = compute_macro_verified_fields_digest(
+        req.bindings.prev_record_digest,
+        macro_digest,
+        req.epoch_id,
+    );
+
+    let vrf_digest = vrf_engine.eval_record_vrf(
+        req.bindings.prev_record_digest,
+        macro_digest,
+        &req.bindings.charter_version_digest,
+        req.bindings.profile_digest.unwrap_or([0u8; 32]),
+        req.epoch_id,
+    );
+
+    let mut proof_receipt = issue_proof_receipt(
+        store.ruleset_state.ruleset_digest,
+        verified_fields_digest,
+        vrf_digest,
+        keystore,
+    );
+
+    let receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        reject_reason_codes.clone(),
+        keystore,
+    );
+
+    proof_receipt.receipt_digest = receipt.receipt_digest.clone();
+
+    store.add_receipt_edges(&receipt);
+    store.macro_milestones.push(macro_milestone.clone());
+    store.committed_payload_digests.insert(macro_digest);
+
+    store.sep_log.append_event(
+        req.commit_id.clone(),
+        SepEventType::EvRecoveryGov,
+        macro_digest,
+        vec![protocol::ReasonCodes::GV_MILESTONE_MACRO_APPENDED.to_string()],
+    );
+
+    attempt_cbv_update_from_macro(store, keystore, vrf_engine, macro_milestone, macro_digest);
+
+    (receipt, Some(proof_receipt))
+}
+
+fn attempt_cbv_update_from_macro(
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+    vrf_engine: &VrfEngine,
+    macro_milestone: MacroMilestone,
+    macro_digest: [u8; 32],
+) {
+    if cbv_update_already_applied(store, &macro_milestone) {
+        store.sep_log.append_event(
+            macro_milestone.macro_id.clone(),
+            SepEventType::EvRecoveryGov,
+            macro_digest,
+            vec![protocol::ReasonCodes::GV_CBV_NO_OP.to_string()],
+        );
+        return;
+    }
+
+    let charter_version = store.ruleset_state.charter_version_digest.clone();
+    let policy_version = store.ruleset_state.policy_version_digest.clone();
+    let pev_digest = store.ruleset_state.pev_digest;
+    let cbv_config = CbvDeriverConfig::default();
+    match store.commit_cbv_from_macro(
+        &macro_milestone,
+        keystore,
+        vrf_engine,
+        &charter_version,
+        &policy_version,
+        pev_digest,
+        cbv_config,
+    ) {
+        Ok(outcome) => {
+            store.committed_payload_digests.insert(
+                outcome
+                    .cbv
+                    .cbv_digest
+                    .as_deref()
+                    .and_then(digest_from_bytes)
+                    .unwrap_or([0u8; 32]),
+            );
+        }
+        Err(_) => {
+            store.sep_log.append_event(
+                macro_milestone.macro_id,
+                SepEventType::EvRecoveryGov,
+                macro_digest,
+                vec![
+                    protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string(),
+                    protocol::ReasonCodes::GV_CBV_UPDATE_FAILED.to_string(),
+                ],
+            );
+        }
+    }
+}
+
+fn cbv_update_already_applied(store: &PvgsStore, macro_milestone: &MacroMilestone) -> bool {
+    let source_id = macro_source_ref_id(macro_milestone);
+    store
+        .cbv_store
+        .latest()
+        .is_some_and(|cbv| cbv.source_milestone_refs.iter().any(|r| r.id == source_id))
 }
 
 fn verify_pev_update(
@@ -2506,6 +2762,7 @@ mod tests {
             epoch_id: 1,
             key_epoch: None,
             experience_record_payload: None,
+            macro_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
@@ -2548,6 +2805,7 @@ mod tests {
                 epoch_id: keystore.current_epoch(),
                 key_epoch: Some(epoch.clone()),
                 experience_record_payload: None,
+                macro_milestone: None,
                 dlp_decision_payload: None,
                 tool_registry_container: None,
                 pev: None,
@@ -2570,6 +2828,49 @@ mod tests {
             macro_digest: vec![1u8; 32],
             state: MacroMilestoneState::Finalized as i32,
             trait_updates: updates,
+        }
+    }
+
+    fn macro_with_state(id: &str, state: MacroMilestoneState) -> MacroMilestone {
+        MacroMilestone {
+            macro_id: id.to_string(),
+            macro_digest: vec![2u8; 32],
+            state: state as i32,
+            trait_updates: Vec::new(),
+        }
+    }
+
+    fn make_macro_request(
+        macro_milestone: &MacroMilestone,
+        store: &PvgsStore,
+        epoch_id: u64,
+    ) -> PvgsCommitRequest {
+        let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap();
+
+        PvgsCommitRequest {
+            commit_id: macro_milestone.macro_id.clone(),
+            commit_type: CommitType::MilestoneAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: vec![macro_digest],
+            epoch_id,
+            key_epoch: None,
+            experience_record_payload: None,
+            macro_milestone: Some(macro_milestone.clone()),
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
         }
     }
 
@@ -2661,10 +2962,91 @@ mod tests {
             epoch_id,
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
+            macro_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
         }
+    }
+
+    #[test]
+    fn macro_append_triggers_cbv_update() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let macro_milestone = macro_with_updates(
+            "macro-1",
+            vec![cbv_update(
+                "baseline_caution_offset",
+                TraitDirection::IncreaseStrictness,
+                MagnitudeClass::Low,
+            )],
+        );
+        let req = make_macro_request(&macro_milestone, &store, 1);
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof.is_some());
+        let latest_cbv = store.cbv_store.latest().expect("cbv missing");
+        assert_eq!(latest_cbv.cbv_epoch, 1);
+
+        assert!(store.sep_log.events.iter().any(|e| e
+            .reason_codes
+            .contains(&ReasonCodes::GV_MILESTONE_MACRO_APPENDED.to_string())));
+        assert!(store.sep_log.events.iter().any(|e| e
+            .reason_codes
+            .contains(&ReasonCodes::GV_CBV_UPDATED.to_string())));
+    }
+
+    #[test]
+    fn macro_append_is_idempotent_for_cbv() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let macro_milestone = macro_with_updates(
+            "macro-2",
+            vec![cbv_update(
+                "baseline_approval_strictness_offset",
+                TraitDirection::IncreaseStrictness,
+                MagnitudeClass::Low,
+            )],
+        );
+        let req = make_macro_request(&macro_milestone, &store, 1);
+
+        verify_and_commit(req.clone(), &mut store, &keystore, &vrf_engine);
+        verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        let latest_cbv = store.cbv_store.latest().expect("cbv missing");
+        assert_eq!(latest_cbv.cbv_epoch, 1);
+        let no_op_logged = store.sep_log.events.iter().any(|e| {
+            e.reason_codes
+                .contains(&ReasonCodes::GV_CBV_NO_OP.to_string())
+        });
+        assert!(no_op_logged || store.sep_log.events.len() == 2);
+    }
+
+    #[test]
+    fn macro_append_logs_degraded_on_cbv_failure() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let macro_milestone = macro_with_state("macro-3", MacroMilestoneState::Draft);
+        let req = make_macro_request(&macro_milestone, &store, 1);
+
+        let (receipt, _proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(store.cbv_store.latest().is_none());
+        assert!(store.sep_log.events.iter().any(|e| {
+            e.reason_codes
+                .contains(&ReasonCodes::GV_CBV_UPDATE_FAILED.to_string())
+                && e.reason_codes
+                    .contains(&ReasonCodes::RE_INTEGRITY_DEGRADED.to_string())
+        }));
     }
 
     #[test]
@@ -2982,6 +3364,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: Some(backward_epoch),
             experience_record_payload: None,
+            macro_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
@@ -3044,6 +3427,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: Some(epoch),
             experience_record_payload: None,
+            macro_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
@@ -3082,6 +3466,7 @@ mod tests {
             epoch_id: 1,
             key_epoch: None,
             experience_record_payload: None,
+            macro_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
@@ -3136,6 +3521,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
+            macro_milestone: None,
             dlp_decision_payload: Some(decision.encode_to_vec()),
             tool_registry_container: None,
             pev: None,
@@ -3190,6 +3576,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
+            macro_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: Some(pev.clone()),
@@ -3269,6 +3656,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
+            macro_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: Some(pev),
@@ -3342,6 +3730,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
+            macro_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: Some(container.encode_to_vec()),
             pev: None,
