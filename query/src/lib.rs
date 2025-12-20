@@ -335,7 +335,7 @@ pub fn list_export_attempts(store: &PvgsStore, session_id: &str) -> Vec<ExportAt
     attempts
 }
 
-fn find_record<'a>(store: &'a PvgsStore, record_digest: [u8; 32]) -> Option<&'a ExperienceRecord> {
+fn find_record(store: &PvgsStore, record_digest: [u8; 32]) -> Option<&ExperienceRecord> {
     store
         .experience_store
         .records
