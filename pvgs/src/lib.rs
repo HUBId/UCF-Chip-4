@@ -2154,8 +2154,7 @@ impl<'a> CompletenessChecker<'a> {
         for output_digest in self.outputs_for_session(session_id) {
             if let Some(record) = self.find_record(output_digest) {
                 for digest in dlp_digests_from_gov(record) {
-                    if self.dlp_store.get(digest).is_none()
-                        && missing_dlp_decisions.insert(digest)
+                    if self.dlp_store.get(digest).is_none() && missing_dlp_decisions.insert(digest)
                     {
                         if !matches!(status, CompletenessStatus::Fail) {
                             status = CompletenessStatus::Degraded;
