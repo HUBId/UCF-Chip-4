@@ -74,6 +74,22 @@ impl CbvStore {
             .and_then(|cbv| cbv.cbv_digest.as_deref())
             .map(vec_to_digest)
     }
+
+    pub fn latest_epoch_and_source(&self) -> Option<(u64, Option<[u8; 32]>)> {
+        let latest = self.latest()?;
+        let source = latest
+            .source_milestone_refs
+            .first()
+            .and_then(|r| r.id.split(':').nth(1))
+            .and_then(|hex| hex::decode(hex).ok())
+            .and_then(|bytes| bytes.try_into().ok());
+
+        Some((latest.cbv_epoch, source))
+    }
+}
+
+pub fn get_latest_cbv_epoch_and_source(store: &CbvStore) -> Option<(u64, Option<[u8; 32]>)> {
+    store.latest_epoch_and_source()
 }
 
 /// Compute the canonical CBV digest excluding proof references and signatures.

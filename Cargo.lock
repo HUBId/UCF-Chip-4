@@ -74,6 +74,7 @@ name = "cbv"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "hex",
  "prost",
  "serde",
  "serde_yaml",
