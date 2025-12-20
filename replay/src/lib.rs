@@ -492,6 +492,7 @@ mod tests {
             epoch_id,
             key_epoch: None,
             experience_record_payload: None,
+            dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
         }
@@ -558,6 +559,7 @@ mod tests {
             epoch_id,
             key_epoch: None,
             experience_record_payload: Some(payload),
+            dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
         }

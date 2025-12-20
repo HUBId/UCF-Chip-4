@@ -1,13 +1,15 @@
 #![forbid(unsafe_code)]
 
 use cbv::CharacterBaselineVector;
+use dlp_store::DlpDecisionStore;
 use pev::{pev_digest, PolicyEcologyVector};
 use pvgs::{compute_experience_record_digest, PvgsCommitRequest, PvgsStore};
 use sep::{EdgeType, NodeKey, SepEventInternal, SepEventType, SepLog};
 use std::collections::{BTreeSet, VecDeque};
+use std::convert::TryFrom;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{
-    ExperienceRecord, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes,
+    DlpDecisionForm, ExperienceRecord, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes,
 };
 use wire::{AuthContext, Envelope};
 
@@ -54,7 +56,8 @@ pub struct RecordTrace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportAttempt {
     pub record_digest: NodeKey,
-    pub dlp_decision_digests: Vec<NodeKey>,
+    pub dlp_decision_digest: Option<NodeKey>,
+    pub reason_codes: Vec<String>,
     pub timestamp_ms: Option<u64>,
     pub blocked: bool,
 }
@@ -319,13 +322,15 @@ pub fn list_export_attempts(store: &PvgsStore, session_id: &str) -> Vec<ExportAt
     }) {
         let record = find_record(store, event.object_digest);
         let dlp_digests = record.map(dlp_digests_from_record).unwrap_or_default();
+        let decision_digest = dlp_digests.first().copied();
 
         let timestamp_ms = record.and_then(record_timestamp_ms);
-        let blocked = is_blocked_by_dlp(&store.sep_log, &dlp_digests);
+        let (blocked, reason_codes) = classify_dlp_decision(&store.dlp_store, decision_digest);
 
         attempts.push(ExportAttempt {
             record_digest: event.object_digest,
-            dlp_decision_digests: dlp_digests,
+            dlp_decision_digest: decision_digest,
+            reason_codes,
             timestamp_ms,
             blocked,
         });
@@ -389,15 +394,20 @@ fn record_timestamp_ms(record: &ExperienceRecord) -> Option<u64> {
         .map(|header| header.timestamp_ms)
 }
 
-fn is_blocked_by_dlp(log: &SepLog, dlp_digests: &[NodeKey]) -> bool {
-    log.events.iter().any(|event| {
-        matches!(event.event_type, SepEventType::EvDlpDecision)
-            && dlp_digests.contains(&event.object_digest)
-            && event.reason_codes.iter().any(|code| {
-                code == ReasonCodes::CD_DLP_SECRET_PATTERN
-                    || code == ReasonCodes::CD_DLP_EXPORT_BLOCKED
-            })
-    })
+fn classify_dlp_decision(store: &DlpDecisionStore, digest: Option<NodeKey>) -> (bool, Vec<String>) {
+    let Some(dlp_digest) = digest else {
+        return (false, Vec::new());
+    };
+
+    match store.get(dlp_digest) {
+        Some(decision) => {
+            let form = DlpDecisionForm::try_from(decision.decision_form)
+                .unwrap_or(DlpDecisionForm::Unspecified);
+            let blocked = matches!(form, DlpDecisionForm::Block | DlpDecisionForm::Hold);
+            (blocked, decision.reason_codes.clone())
+        }
+        None => (true, vec![ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()]),
+    }
 }
 
 fn sorted_edges(edges: &[(EdgeType, NodeKey)]) -> Vec<(EdgeType, NodeKey)> {
@@ -427,7 +437,9 @@ mod tests {
     };
     use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
-    use ucf_protocol::ucf::v1::{Digest32, GovernanceFrame, ReceiptStatus, RecordType, Ref};
+    use ucf_protocol::ucf::v1::{
+        Digest32, DlpDecision, GovernanceFrame, ReceiptStatus, RecordType, Ref,
+    };
     use vrf::VrfEngine;
 
     fn store_with_epochs() -> (PvgsStore, PVGSKeyEpoch, PVGSKeyEpoch) {
@@ -806,6 +818,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
+            dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
         };
@@ -819,24 +832,28 @@ mod tests {
         assert_eq!(trace.dlp_decisions, vec![dlp_digest]);
     }
 
-    #[test]
-    fn list_export_attempts_returns_output() {
-        let mut known_charter_versions = HashSet::new();
-        known_charter_versions.insert("charter".to_string());
-        let mut known_policy_versions = HashSet::new();
-        known_policy_versions.insert("policy".to_string());
+    fn store_dlp_decision(
+        store: &mut PvgsStore,
+        digest: [u8; 32],
+        form: DlpDecisionForm,
+        reasons: Vec<&str>,
+    ) {
+        let decision = DlpDecision {
+            dlp_decision_digest: Some(digest.to_vec()),
+            decision_form: form as i32,
+            reason_codes: reasons.into_iter().map(String::from).collect(),
+        };
 
-        let mut store = PvgsStore::new(
-            [0u8; 32],
-            "charter".to_string(),
-            "policy".to_string(),
-            known_charter_versions,
-            known_policy_versions,
-            HashSet::new(),
-        );
-        let keystore = KeyStore::new_dev_keystore(3);
-        let vrf_engine = VrfEngine::new_dev(3);
-        let dlp_digest = [5u8; 32];
+        store.dlp_store.insert(decision).unwrap();
+    }
+
+    fn append_output_record(
+        store: &mut PvgsStore,
+        keystore: &KeyStore,
+        vrf_engine: &VrfEngine,
+        commit_id: &str,
+        dlp_digest: [u8; 32],
+    ) -> [u8; 32] {
         let governance_frame = GovernanceFrame {
             policy_decision_refs: Vec::new(),
             pvgs_receipt_ref: None,
@@ -859,7 +876,6 @@ mod tests {
             finalization_header: None,
         };
 
-        let commit_id = "export-list";
         let req = PvgsCommitRequest {
             commit_id: commit_id.to_string(),
             commit_type: CommitType::ExperienceRecordAppend,
@@ -880,12 +896,37 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
+            dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
         };
 
-        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        let (receipt, _) = verify_and_commit(req, store, keystore, vrf_engine);
         assert_eq!(receipt.status, ReceiptStatus::Accepted);
+
+        store.experience_store.head_record_digest
+    }
+
+    #[test]
+    fn list_export_attempts_returns_output() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(3);
+        let vrf_engine = VrfEngine::new_dev(3);
+        let dlp_digest = [5u8; 32];
+        let commit_id = "export-list";
+        append_output_record(&mut store, &keystore, &vrf_engine, commit_id, dlp_digest);
 
         let attempts = list_export_attempts(&store, commit_id);
         assert_eq!(attempts.len(), 1);
@@ -893,8 +934,149 @@ mod tests {
             attempts[0].record_digest,
             store.experience_store.head_record_digest
         );
-        assert_eq!(attempts[0].dlp_decision_digests, vec![dlp_digest]);
+        assert_eq!(attempts[0].dlp_decision_digest, Some(dlp_digest));
+        assert_eq!(
+            attempts[0].reason_codes,
+            vec![ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()]
+        );
         assert!(attempts[0].timestamp_ms.is_some());
         assert!(attempts[0].blocked);
+    }
+
+    #[test]
+    fn list_export_attempts_reflects_block_decision() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(3);
+        let vrf_engine = VrfEngine::new_dev(3);
+        let dlp_digest = [6u8; 32];
+
+        store_dlp_decision(
+            &mut store,
+            dlp_digest,
+            DlpDecisionForm::Block,
+            vec![
+                ReasonCodes::CD_DLP_SECRET_PATTERN,
+                ReasonCodes::CD_DLP_EXPORT_BLOCKED,
+            ],
+        );
+
+        let commit_id = "export-blocked";
+        append_output_record(&mut store, &keystore, &vrf_engine, commit_id, dlp_digest);
+
+        let attempts = list_export_attempts(&store, commit_id);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].dlp_decision_digest, Some(dlp_digest));
+        assert!(attempts[0].blocked);
+        assert_eq!(
+            attempts[0].reason_codes,
+            vec![
+                ReasonCodes::CD_DLP_EXPORT_BLOCKED.to_string(),
+                ReasonCodes::CD_DLP_SECRET_PATTERN.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_export_attempts_reflects_allow_decision() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(3);
+        let vrf_engine = VrfEngine::new_dev(3);
+        let dlp_digest = [7u8; 32];
+
+        store_dlp_decision(
+            &mut store,
+            dlp_digest,
+            DlpDecisionForm::Allow,
+            vec![ReasonCodes::RE_INTEGRITY_OK],
+        );
+
+        let commit_id = "export-allowed";
+        append_output_record(&mut store, &keystore, &vrf_engine, commit_id, dlp_digest);
+
+        let attempts = list_export_attempts(&store, commit_id);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].dlp_decision_digest, Some(dlp_digest));
+        assert!(!attempts[0].blocked);
+        assert_eq!(
+            attempts[0].reason_codes,
+            vec![ReasonCodes::RE_INTEGRITY_OK.to_string()]
+        );
+    }
+
+    #[test]
+    fn list_export_attempts_are_sorted_by_record_digest() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(3);
+        let vrf_engine = VrfEngine::new_dev(3);
+
+        let digest_a = [1u8; 32];
+        let digest_b = [2u8; 32];
+        store_dlp_decision(
+            &mut store,
+            digest_a,
+            DlpDecisionForm::Allow,
+            vec![ReasonCodes::RE_INTEGRITY_OK],
+        );
+        store_dlp_decision(
+            &mut store,
+            digest_b,
+            DlpDecisionForm::Block,
+            vec![ReasonCodes::CD_DLP_EXPORT_BLOCKED],
+        );
+
+        let commit_id = "export-order";
+        let first_record =
+            append_output_record(&mut store, &keystore, &vrf_engine, commit_id, digest_b);
+        let second_record =
+            append_output_record(&mut store, &keystore, &vrf_engine, commit_id, digest_a);
+
+        let mut expected = vec![first_record, second_record];
+        expected.sort();
+
+        let attempts = list_export_attempts(&store, commit_id);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.record_digest)
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 }

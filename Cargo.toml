@@ -18,6 +18,7 @@ members = [
     "tool_registry_state",
     "replay",
     "gem",
+    "dlp_store",
 ]
 resolver = "2"
 

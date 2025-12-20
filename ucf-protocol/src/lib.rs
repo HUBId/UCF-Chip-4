@@ -47,6 +47,7 @@ pub mod ucf {
             CbvUpdate,
             KeyEpochUpdate,
             FrameEvidenceAppend,
+            DlpDecisionAppend,
         }
 
         /// Required receipt classes for PVGS commits.
@@ -337,6 +338,28 @@ pub mod ucf {
             pub const RE_INTEGRITY_OK: &'static str = "RC.RE.INTEGRITY.OK";
             pub const CD_DLP_EXPORT_BLOCKED: &'static str = "RC.CD.DLP.EXPORT_BLOCKED";
             pub const CD_DLP_SECRET_PATTERN: &'static str = "RC.CD.DLP.SECRET_PATTERN";
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum DlpDecisionForm {
+            Unspecified = 0,
+            Allow = 1,
+            Redact = 2,
+            Block = 3,
+            Hold = 4,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct DlpDecision {
+            #[prost(bytes = "vec", optional, tag = "1")]
+            pub dlp_decision_digest: Option<Vec<u8>>,
+            #[prost(enumeration = "DlpDecisionForm", tag = "2")]
+            pub decision_form: i32,
+            #[prost(string, repeated, tag = "3")]
+            pub reason_codes: Vec<String>,
         }
 
         /// Lightweight reference type for future graph links.
