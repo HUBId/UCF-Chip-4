@@ -16,3 +16,5 @@ pev = { path = "../pev" }
 keys = { path = "../keys" }
 wire = { path = "../wire" }
 ucf-protocol = { path = "../ucf-protocol" }
+hex = "0.4"
+prost = { workspace = true }

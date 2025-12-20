@@ -430,8 +430,10 @@ name = "query"
 version = "0.1.0"
 dependencies = [
  "cbv",
+ "hex",
  "keys",
  "pev",
+ "prost",
  "pvgs",
  "receipts",
  "sep",

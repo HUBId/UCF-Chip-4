@@ -335,6 +335,8 @@ pub mod ucf {
             pub const GV_RULESET_CHANGED: &'static str = "RC.GV.RULESET.CHANGED";
             pub const RE_REPLAY_MISMATCH: &'static str = "RC.RE.REPLAY.MISMATCH";
             pub const RE_INTEGRITY_OK: &'static str = "RC.RE.INTEGRITY.OK";
+            pub const CD_DLP_EXPORT_BLOCKED: &'static str = "RC.CD.DLP.EXPORT_BLOCKED";
+            pub const CD_DLP_SECRET_PATTERN: &'static str = "RC.CD.DLP.SECRET_PATTERN";
         }
 
         /// Lightweight reference type for future graph links.
