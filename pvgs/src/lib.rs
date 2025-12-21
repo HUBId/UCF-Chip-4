@@ -128,6 +128,7 @@ impl Default for PvgsConfig {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnlockPermit {
     pub session_id: String,
