@@ -76,12 +76,9 @@ impl MacroDeriver {
                     break;
                 }
 
-                if let Some(macro_milestone) = propose_macro_for_chunk(
-                    &session_id,
-                    chunk,
-                    &micro_by_digest,
-                    &self.config,
-                ) {
+                if let Some(macro_milestone) =
+                    propose_macro_for_chunk(&session_id, chunk, &micro_by_digest, &self.config)
+                {
                     candidates.push(macro_milestone);
                 }
             }
