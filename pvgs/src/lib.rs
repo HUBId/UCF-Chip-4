@@ -6165,6 +6165,34 @@ mod tests {
     }
 
     #[test]
+    fn planned_rotation_updates_epoch_and_rejects_lower_value() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let mut keystore = KeyStore::new_dev_keystore(0);
+        let mut vrf_engine = VrfEngine::new_dev(0);
+
+        {
+            let mut planner = PvgsPlanner::new(&mut store, &mut keystore, &mut vrf_engine);
+            let epoch = planner
+                .planned_rotate_keys(2, 5555)
+                .expect("initial rotation should succeed");
+
+            let latest = store.key_epoch_history.current().expect("missing epoch");
+            assert_eq!(latest.key_epoch_id, 2);
+            assert_eq!(latest.announcement_digest, epoch.announcement_digest);
+        }
+
+        assert_eq!(keystore.current_epoch(), 2);
+
+        let mut planner = PvgsPlanner::new(&mut store, &mut keystore, &mut vrf_engine);
+        let err = planner
+            .planned_rotate_keys(1, 6666)
+            .expect_err("non-monotonic rotation should fail");
+
+        assert!(matches!(err, Error::NonMonotonic { last: 2, next: 1 }));
+    }
+
+    #[test]
     fn key_epoch_rejects_non_monotonic() {
         let prev = [7u8; 32];
         let mut store = base_store(prev);
@@ -6962,6 +6990,28 @@ mod tests {
     }
 
     #[test]
+    fn completeness_failure_seals_session_and_logs_incident() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+
+        let report = store.check_completeness("sess-complete-fail", vec![[9u8; 32]]);
+
+        assert_eq!(report.status, CompletenessStatus::Fail);
+        assert!(report
+            .reason_codes
+            .contains(&ReasonCodes::RE_INTEGRITY_FAIL.to_string()));
+        assert!(store.forensic_mode);
+
+        let seal = sep::seal("sess-complete-fail", &store.sep_log);
+        assert_ne!(seal.final_event_digest, [0u8; 32]);
+        assert!(store
+            .sep_log
+            .events
+            .iter()
+            .any(|event| event.event_type == SepEventType::EvIncident));
+    }
+
+    #[test]
     fn completeness_degrades_when_record_missing() {
         let mut graph = CausalGraph::default();
         let mut sep_log = SepLog::default();
@@ -7002,6 +7052,68 @@ mod tests {
         assert!(report
             .reason_codes
             .contains(&ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()));
+    }
+
+    #[test]
+    fn sep_overflow_triggers_incident_and_seal() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        store.limits.max_sep_events = 1;
+        store.sep_log.limits.max_sep_events = 1;
+
+        store
+            .record_sep_event(
+                "sess-overflow",
+                SepEventType::EvDecision,
+                [1u8; 32],
+                vec![ReasonCodes::RE_INTEGRITY_OK.to_string()],
+            )
+            .expect("first event should fit");
+        let err = store
+            .record_sep_event(
+                "sess-overflow",
+                SepEventType::EvDecision,
+                [2u8; 32],
+                vec![ReasonCodes::RE_INTEGRITY_OK.to_string()],
+            )
+            .expect_err("overflow should fail");
+
+        assert_eq!(err, SepError::Overflow);
+        assert!(store.forensic_mode);
+
+        let seal = sep::seal("sess-overflow", &store.sep_log);
+        assert_ne!(seal.final_event_digest, [0u8; 32]);
+        assert!(store
+            .sep_log
+            .events
+            .iter()
+            .any(|event| event.event_type == SepEventType::EvIncident));
+    }
+
+    #[test]
+    fn replay_mismatch_auto_seals() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        store.config.auto_seal_on_replay_mismatch = true;
+        store.critical_triggers.replay_mismatch = true;
+
+        store
+            .record_sep_event(
+                "sess-replay-mismatch",
+                SepEventType::EvDecision,
+                [4u8; 32],
+                vec![ReasonCodes::RE_REPLAY_MISMATCH.to_string()],
+            )
+            .expect("replay mismatch should be recorded");
+
+        assert!(store.forensic_mode);
+        assert!(store
+            .sep_log
+            .events
+            .iter()
+            .any(|event| event.event_type == SepEventType::EvIncident));
+        let seal = sep::seal("sess-replay-mismatch", &store.sep_log);
+        assert_ne!(seal.final_event_digest, [0u8; 32]);
     }
 
     #[test]
