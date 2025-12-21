@@ -44,6 +44,8 @@ pub enum CommitType {
     RecordAppend,
     ExperienceRecordAppend,
     MilestoneAppend,
+    MacroMilestonePropose,
+    MacroMilestoneFinalize,
     ConsistencyFeedbackAppend,
     CharterUpdate,
     ToolRegistryUpdate,
@@ -941,6 +943,8 @@ fn event_type_for_commit(
         CommitType::DlpDecisionAppend => SepEventType::EvDlpDecision,
         CommitType::ReplayPlanAppend => SepEventType::EvReplay,
         CommitType::ConsistencyFeedbackAppend => SepEventType::EvRecoveryGov,
+        CommitType::MacroMilestonePropose => SepEventType::EvRecoveryGov,
+        CommitType::MacroMilestoneFinalize => SepEventType::EvRecoveryGov,
         CommitType::FrameEvidenceAppend => match frame_kind {
             Some(FrameEventKind::ControlFrame) => SepEventType::EvControlFrame,
             Some(FrameEventKind::SignalFrame) => SepEventType::EvSignalFrame,
@@ -1069,7 +1073,12 @@ pub fn verify_and_commit(
     keystore: &KeyStore,
     vrf_engine: &VrfEngine,
 ) -> (PVGSReceipt, Option<ProofReceipt>) {
-    if req.commit_type == CommitType::MilestoneAppend {
+    if matches!(
+        req.commit_type,
+        CommitType::MilestoneAppend
+            | CommitType::MacroMilestonePropose
+            | CommitType::MacroMilestoneFinalize
+    ) {
         if req.meso_milestone.is_some() {
             return verify_meso_milestone_append(req, store, keystore, vrf_engine);
         }
@@ -3451,6 +3460,8 @@ impl From<CommitType> for protocol::CommitType {
             CommitType::RecordAppend => protocol::CommitType::RecordAppend,
             CommitType::ExperienceRecordAppend => protocol::CommitType::ExperienceRecordAppend,
             CommitType::MilestoneAppend => protocol::CommitType::MilestoneAppend,
+            CommitType::MacroMilestonePropose => protocol::CommitType::MacroMilestonePropose,
+            CommitType::MacroMilestoneFinalize => protocol::CommitType::MacroMilestoneFinalize,
             CommitType::ConsistencyFeedbackAppend => {
                 protocol::CommitType::ConsistencyFeedbackAppend
             }
@@ -3625,6 +3636,9 @@ mod tests {
             meso_refs: Vec::new(),
             consistency_class: "CONSISTENCY_HIGH".to_string(),
             identity_anchor_flag: true,
+            proof_receipt_ref: None,
+            consistency_digest: None,
+            consistency_feedback_ref: None,
         }
     }
 
@@ -3637,6 +3651,9 @@ mod tests {
             meso_refs: Vec::new(),
             consistency_class: "CONSISTENCY_HIGH".to_string(),
             identity_anchor_flag: true,
+            proof_receipt_ref: None,
+            consistency_digest: None,
+            consistency_feedback_ref: None,
         }
     }
 
@@ -5579,6 +5596,9 @@ mod tests {
             meso_refs: Vec::new(),
             consistency_class: "LOW".to_string(),
             identity_anchor_flag: false,
+            proof_receipt_ref: None,
+            consistency_digest: None,
+            consistency_feedback_ref: None,
         }
     }
 

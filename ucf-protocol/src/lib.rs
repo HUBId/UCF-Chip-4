@@ -40,6 +40,8 @@ pub mod ucf {
             RecordAppend,
             ExperienceRecordAppend,
             MilestoneAppend,
+            MacroMilestonePropose,
+            MacroMilestoneFinalize,
             ConsistencyFeedbackAppend,
             CharterUpdate,
             ToolRegistryUpdate,
@@ -192,6 +194,7 @@ pub mod ucf {
             Unknown = 0,
             Draft = 1,
             Finalized = 2,
+            Proposed = 3,
         }
 
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -239,6 +242,12 @@ pub mod ucf {
             pub consistency_class: String,
             #[prost(bool, tag = "7")]
             pub identity_anchor_flag: bool,
+            #[prost(message, optional, tag = "8")]
+            pub proof_receipt_ref: Option<Ref>,
+            #[prost(bytes = "vec", optional, tag = "9")]
+            pub consistency_digest: Option<Vec<u8>>,
+            #[prost(message, optional, tag = "10")]
+            pub consistency_feedback_ref: Option<Ref>,
         }
 
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

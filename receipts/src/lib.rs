@@ -253,6 +253,8 @@ fn commit_type_label(commit_type: &protocol::CommitType) -> &'static str {
         protocol::CommitType::RecordAppend => "RecordAppend",
         protocol::CommitType::ExperienceRecordAppend => "ExperienceRecordAppend",
         protocol::CommitType::MilestoneAppend => "MilestoneAppend",
+        protocol::CommitType::MacroMilestonePropose => "MacroMilestonePropose",
+        protocol::CommitType::MacroMilestoneFinalize => "MacroMilestoneFinalize",
         protocol::CommitType::CharterUpdate => "CharterUpdate",
         protocol::CommitType::ToolRegistryUpdate => "ToolRegistryUpdate",
         protocol::CommitType::RecoveryUpdate => "RecoveryUpdate",
