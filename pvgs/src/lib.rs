@@ -967,10 +967,7 @@ impl PvgsStore {
 
         let evicted = self.cbv_store.push(cbv.clone());
         if !evicted.is_empty() {
-            let evicted_digests = evicted
-                .iter()
-                .map(compute_cbv_digest)
-                .collect::<Vec<_>>();
+            let evicted_digests = evicted.iter().map(compute_cbv_digest).collect::<Vec<_>>();
             self.log_retention_evictions(&macro_milestone.macro_id, evicted_digests);
         }
 
