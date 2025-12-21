@@ -2,7 +2,7 @@
 
 use blake3::Hasher;
 use hex::encode;
-use limits::DEFAULT_LIMITS;
+use limits::{StoreLimits, DEFAULT_LIMITS};
 use prost::Message;
 use std::str::FromStr;
 use thiserror::Error;
@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 
 const REPLAY_PLAN_DOMAIN: &[u8] = b"UCF:HASH:REPLAY_PLAN";
 const MAX_TARGET_REFS: usize = DEFAULT_LIMITS.max_replay_target_refs;
-const MAX_PENDING_PLANS: usize = DEFAULT_LIMITS.max_pending_replay_plans;
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +76,7 @@ pub enum ReplayPlanError {
 #[derive(Debug, Default, Clone)]
 pub struct ReplayPlanStore {
     pub plans: Vec<ReplayPlan>,
+    pub limits: StoreLimits,
 }
 
 impl ReplayPlanStore {
@@ -105,13 +105,18 @@ impl ReplayPlanStore {
         }
 
         self.plans.push(plan);
+        self.enforce_limits();
         Ok(())
     }
 
     pub fn list_pending(&self) -> Vec<ReplayPlan> {
         let mut pending: Vec<_> = self.plans.iter().filter(|p| !p.consumed).cloned().collect();
         pending.sort_by(|a, b| a.replay_id.cmp(&b.replay_id));
-        pending.truncate(MAX_PENDING_PLANS);
+        pending.truncate(
+            self.limits
+                .max_pending_replay_plans
+                .min(self.limits.max_replay_plans),
+        );
         pending
     }
 
@@ -126,6 +131,34 @@ impl ReplayPlanStore {
 
     pub fn latest(&self) -> Option<&ReplayPlan> {
         self.plans.last()
+    }
+
+    fn enforce_limits(&mut self) {
+        let max_plans = self.limits.max_replay_plans;
+
+        while self.plans.len() > max_plans {
+            if let Some((index, _)) = self
+                .plans
+                .iter()
+                .enumerate()
+                .filter(|(_, plan)| plan.consumed)
+                .min_by(|(_, a), (_, b)| a.replay_id.cmp(&b.replay_id))
+            {
+                self.plans.remove(index);
+                continue;
+            }
+
+            if let Some((index, _)) = self
+                .plans
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| a.replay_id.cmp(&b.replay_id))
+            {
+                self.plans.remove(index);
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -277,5 +310,106 @@ mod tests {
         assert_eq!(plan_one.replay_digest, plan_two.replay_digest);
         assert_eq!(plan_one.target_refs[0].id, "target-a");
         assert_eq!(plan_one.trigger_reason_codes, plan_two.trigger_reason_codes);
+    }
+
+    #[test]
+    fn evicts_consumed_plans_first() {
+        let mut store = ReplayPlanStore::default();
+        store.limits.max_replay_plans = 2;
+
+        let mut plan_a = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "session".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![Ref {
+                id: "target-a".to_string(),
+            }],
+            fidelity: ReplayFidelity::Low,
+            counter: 0,
+            trigger_reason_codes: vec![],
+        });
+        plan_a.replay_id = "a".to_string();
+        plan_a.consumed = true;
+        plan_a.replay_digest.clear();
+
+        let mut plan_b = plan_a.clone();
+        plan_b.replay_id = "b".to_string();
+        plan_b.consumed = false;
+
+        let mut plan_c = plan_a.clone();
+        plan_c.replay_id = "c".to_string();
+        plan_c.consumed = false;
+
+        store.push(plan_a).unwrap();
+        store.push(plan_b.clone()).unwrap();
+        store.push(plan_c.clone()).unwrap();
+
+        assert_eq!(store.plans.len(), 2);
+        assert!(store.plans.iter().any(|p| p.replay_id == "b"));
+        assert!(store.plans.iter().any(|p| p.replay_id == "c"));
+    }
+
+    #[test]
+    fn evicts_oldest_replay_id_when_no_consumed() {
+        let mut store = ReplayPlanStore::default();
+        store.limits.max_replay_plans = 2;
+
+        let mut base_plan = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "session".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![Ref {
+                id: "target-a".to_string(),
+            }],
+            fidelity: ReplayFidelity::Low,
+            counter: 0,
+            trigger_reason_codes: vec![],
+        });
+        base_plan.replay_digest.clear();
+
+        for id in ["b", "a", "c"] {
+            let mut plan = base_plan.clone();
+            plan.replay_id = id.to_string();
+            store.push(plan).unwrap();
+        }
+
+        assert_eq!(store.plans.len(), 2);
+        assert!(store.plans.iter().any(|p| p.replay_id == "b"));
+        assert!(store.plans.iter().any(|p| p.replay_id == "c"));
+        assert!(!store.plans.iter().any(|p| p.replay_id == "a"));
+    }
+
+    #[test]
+    fn list_pending_respects_replay_limit() {
+        let mut store = ReplayPlanStore::default();
+        store.limits.max_replay_plans = 2;
+        store.limits.max_pending_replay_plans = 3;
+
+        let mut base_plan = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "session".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![Ref {
+                id: "target-a".to_string(),
+            }],
+            fidelity: ReplayFidelity::Low,
+            counter: 0,
+            trigger_reason_codes: vec![],
+        });
+        base_plan.replay_digest.clear();
+
+        for id in ["b", "a", "c"] {
+            let mut plan = base_plan.clone();
+            plan.replay_id = id.to_string();
+            store.push(plan).unwrap();
+        }
+
+        let pending = store.list_pending();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].replay_id, "b");
+        assert_eq!(pending[1].replay_id, "c");
     }
 }

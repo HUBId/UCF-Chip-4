@@ -9,6 +9,8 @@ pub struct StoreLimits {
     pub consistency_history_max: usize,
     /// Maximum number of causal graph edges retained per node.
     pub max_graph_edges_per_node: usize,
+    /// Maximum number of replay plans retained (pending + consumed) before eviction.
+    pub max_replay_plans: usize,
     /// Maximum number of replay target references allowed on a plan.
     pub max_replay_target_refs: usize,
     /// Maximum number of pending replay plans that are returned.
@@ -24,6 +26,7 @@ pub const DEFAULT_LIMITS: StoreLimits = StoreLimits {
     consistency_signal_window: 8,
     consistency_history_max: 256,
     max_graph_edges_per_node: 128,
+    max_replay_plans: 128,
     max_replay_target_refs: 16,
     max_pending_replay_plans: 128,
     max_experience_records: 4096,
