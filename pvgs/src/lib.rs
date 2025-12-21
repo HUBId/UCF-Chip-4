@@ -99,6 +99,31 @@ impl Default for CriticalTriggerConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PvgsConfig {
+    pub auto_seal_on_replay_mismatch: bool,
+}
+
+impl PvgsConfig {
+    pub fn beta() -> Self {
+        Self {
+            auto_seal_on_replay_mismatch: false,
+        }
+    }
+
+    pub fn production() -> Self {
+        Self {
+            auto_seal_on_replay_mismatch: true,
+        }
+    }
+}
+
+impl Default for PvgsConfig {
+    fn default() -> Self {
+        Self::beta()
+    }
+}
+
 fn critical_trigger_reason_code(trig: CriticalTrigger) -> String {
     match trig {
         CriticalTrigger::ReplayMismatch => protocol::ReasonCodes::RE_REPLAY_MISMATCH.to_string(),
@@ -470,6 +495,7 @@ pub struct PvgsStore {
     pub current_head_record_digest: [u8; 32],
     pub experience_store: ExperienceStore,
     pub limits: StoreLimits,
+    pub config: PvgsConfig,
     pub critical_triggers: CriticalTriggerConfig,
     pub receipts: HashMap<[u8; 32], PVGSReceipt>,
     pub known_charter_versions: HashSet<String>,
@@ -505,6 +531,45 @@ impl PvgsStore {
         known_policy_versions: HashSet<String>,
         known_profiles: HashSet<[u8; 32]>,
     ) -> Self {
+        Self::new_with_config(
+            current_head_record_digest,
+            charter_version_digest,
+            policy_version_digest,
+            known_charter_versions,
+            known_policy_versions,
+            known_profiles,
+            PvgsConfig::default(),
+        )
+    }
+
+    pub fn new_production(
+        current_head_record_digest: [u8; 32],
+        charter_version_digest: String,
+        policy_version_digest: String,
+        known_charter_versions: HashSet<String>,
+        known_policy_versions: HashSet<String>,
+        known_profiles: HashSet<[u8; 32]>,
+    ) -> Self {
+        Self::new_with_config(
+            current_head_record_digest,
+            charter_version_digest,
+            policy_version_digest,
+            known_charter_versions,
+            known_policy_versions,
+            known_profiles,
+            PvgsConfig::production(),
+        )
+    }
+
+    pub fn new_with_config(
+        current_head_record_digest: [u8; 32],
+        charter_version_digest: String,
+        policy_version_digest: String,
+        known_charter_versions: HashSet<String>,
+        known_policy_versions: HashSet<String>,
+        known_profiles: HashSet<[u8; 32]>,
+        config: PvgsConfig,
+    ) -> Self {
         let limits = StoreLimits::default();
         let experience_store = ExperienceStore {
             head_record_digest: current_head_record_digest,
@@ -515,6 +580,7 @@ impl PvgsStore {
             current_head_record_digest,
             experience_store,
             limits,
+            config,
             critical_triggers: CriticalTriggerConfig::default(),
             receipts: HashMap::new(),
             known_charter_versions,
@@ -741,7 +807,10 @@ impl PvgsStore {
         session_id: &str,
         replay_mismatch: bool,
     ) -> Result<(), SepError> {
-        if replay_mismatch && self.critical_triggers.replay_mismatch {
+        if self.config.auto_seal_on_replay_mismatch
+            && replay_mismatch
+            && self.critical_triggers.replay_mismatch
+        {
             let _ = self.handle_critical_trigger(session_id, CriticalTrigger::ReplayMismatch)?;
         }
 
@@ -4859,6 +4928,62 @@ mod tests {
             .map(|b| format!("{:02x}", b))
             .collect();
         assert_eq!(seal.seal_id, format!("seal:session-crit:{prefix}"));
+    }
+
+    #[test]
+    fn replay_mismatch_does_not_auto_seal_in_beta_profile() {
+        let mut store = base_store([7u8; 32]);
+
+        store
+            .record_sep_event(
+                "session-beta",
+                SepEventType::EvDecision,
+                [3u8; 32],
+                vec![ReasonCodes::RE_REPLAY_MISMATCH.to_string()],
+            )
+            .expect("event recorded");
+
+        assert_eq!(store.sep_log.events.len(), 1);
+        assert!(store
+            .sep_log
+            .events
+            .iter()
+            .all(|event| event.event_type != SepEventType::EvIncident));
+    }
+
+    #[test]
+    fn replay_mismatch_auto_seals_in_production_profile() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+        let mut known_profiles = HashSet::new();
+        known_profiles.insert([9u8; 32]);
+
+        let mut store = PvgsStore::new_production(
+            [7u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            known_profiles,
+        );
+
+        store
+            .record_sep_event(
+                "session-prod",
+                SepEventType::EvDecision,
+                [3u8; 32],
+                vec![ReasonCodes::RE_REPLAY_MISMATCH.to_string()],
+            )
+            .expect("event recorded");
+
+        assert_eq!(store.sep_log.events.len(), 3);
+        assert!(store
+            .sep_log
+            .events
+            .iter()
+            .any(|event| event.event_type == SepEventType::EvIncident));
     }
 
     #[test]
