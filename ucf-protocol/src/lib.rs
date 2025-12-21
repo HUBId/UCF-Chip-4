@@ -371,6 +371,7 @@ pub mod ucf {
             pub const GV_CONSISTENCY_MED_CLUSTER: &'static str = "RC.GV.CONSISTENCY.MED_CLUSTER";
             pub const GV_REPLAY_PLANNED: &'static str = "RC.GV.REPLAY.PLANNED";
             pub const GV_REPLAY_DENY_CLUSTER: &'static str = "RC.GV.REPLAY.DENY_CLUSTER";
+            pub const GV_REPLAY_SPOTCHECK: &'static str = "RC.GV.REPLAY.SPOTCHECK";
             pub const GV_PEV_UPDATED: &'static str = "RC.GV.PEV.UPDATED";
             pub const GV_TOOL_REGISTRY_UPDATED: &'static str = "RC.GV.TOOL_REGISTRY.UPDATED";
             pub const GV_RULESET_CHANGED: &'static str = "RC.GV.RULESET.CHANGED";

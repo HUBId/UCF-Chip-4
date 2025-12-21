@@ -3,6 +3,7 @@
 use blake3::Hasher;
 use pvgs::{compute_experience_record_digest, PvgsStore};
 use sep::{EdgeType, SepEventType};
+use std::collections::HashSet;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{ExperienceRecord, ReasonCodes, RecordType, Ref};
 
@@ -14,6 +15,7 @@ const POLICY_BUNDLE_DOMAIN: &[u8] = b"UCF:HASH:POLICY_REPLAY_BUNDLE";
 const ACTION_MANIFEST_DOMAIN: &[u8] = b"UCF:HASH:ACTION_MANIFEST";
 const DEFAULT_MAX_ACTION_ENTRIES: usize = 256;
 const DEFAULT_MAX_POLICY_ENTRIES: usize = 256;
+const SEED_WINDOW: usize = 8;
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +98,13 @@ pub struct ReplayResult {
     pub mismatches: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpotCheckReport {
+    pub status: ReplayStatus,
+    pub mismatches: Vec<String>,
+    pub reason_codes: Vec<String>,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ReplayError {
     #[error("mismatched bundle lengths")]
@@ -171,6 +180,7 @@ pub fn verify_policy_replay(
         &mut store.sep_log,
         status,
         &mismatches,
+        &[],
     );
 
     Ok(ReplayResult { status, mismatches })
@@ -262,9 +272,94 @@ pub fn verify_action_manifest(
         &mut store.sep_log,
         status,
         &mismatches,
+        &[],
     );
 
     ReplayResult { status, mismatches }
+}
+
+pub fn daily_spot_check(
+    session_id: &str,
+    manifest: &ActionManifest,
+    seed_digest: [u8; 32],
+    sample_size: usize,
+    store: &mut PvgsStore,
+) -> SpotCheckReport {
+    let mut sorted_entries = manifest.entries.clone();
+    sorted_entries.sort_by(|a, b| a.action_digest.cmp(&b.action_digest));
+
+    let total_entries = sorted_entries.len();
+    let target_samples = sample_size.max(1);
+
+    let seed_bytes: [u8; SEED_WINDOW] = seed_digest[..SEED_WINDOW]
+        .try_into()
+        .expect("slice matches SEED_WINDOW");
+    let seed_value = u64::from_le_bytes(seed_bytes);
+
+    let step = if total_entries == 0 {
+        1
+    } else {
+        std::cmp::max(1, (total_entries + target_samples - 1) / target_samples)
+    };
+    let offset = if total_entries == 0 {
+        0
+    } else {
+        (seed_value as usize) % total_entries
+    };
+
+    let mut sampled_entries = Vec::new();
+    let mut seen = HashSet::new();
+    let mut index = offset;
+
+    while sampled_entries.len() < total_entries.min(target_samples) {
+        if !seen.insert(index) {
+            break;
+        }
+
+        if let Some(entry) = sorted_entries.get(index) {
+            sampled_entries.push(entry.clone());
+        }
+
+        if total_entries == 0 {
+            break;
+        }
+
+        index = (index + step) % total_entries;
+    }
+
+    let mut sampled_manifest = ActionManifest {
+        manifest_id: manifest.manifest_id.clone(),
+        manifest_digest: [0u8; 32],
+        ruleset_digest: manifest.ruleset_digest,
+        entries: sampled_entries,
+    };
+    sampled_manifest.manifest_digest = sampled_manifest.recompute_digest();
+
+    let replay_result = verify_action_manifest(session_id, &sampled_manifest, store);
+
+    let mut reason_codes = vec![ReasonCodes::GV_REPLAY_SPOTCHECK.to_string()];
+    match replay_result.status {
+        ReplayStatus::Mismatch => {
+            reason_codes.push(ReasonCodes::RE_REPLAY_MISMATCH.to_string());
+            reason_codes.extend(replay_result.mismatches.iter().cloned());
+        }
+        _ => reason_codes.push(ReasonCodes::RE_INTEGRITY_OK.to_string()),
+    }
+
+    log_replay_event(
+        session_id,
+        sampled_manifest.manifest_digest,
+        &mut store.sep_log,
+        replay_result.status,
+        &replay_result.mismatches,
+        &reason_codes,
+    );
+
+    SpotCheckReport {
+        status: replay_result.status,
+        mismatches: replay_result.mismatches,
+        reason_codes,
+    }
 }
 
 fn log_replay_event(
@@ -273,15 +368,18 @@ fn log_replay_event(
     log: &mut sep::SepLog,
     status: ReplayStatus,
     mismatches: &[String],
+    base_reasons: &[String],
 ) {
-    let mut reasons = Vec::new();
+    let mut reasons: Vec<String> = base_reasons.to_vec();
     match status {
         ReplayStatus::Mismatch => reasons.push(ReasonCodes::RE_REPLAY_MISMATCH.to_string()),
         _ => reasons.push(ReasonCodes::RE_INTEGRITY_OK.to_string()),
     }
 
-    if !mismatches.is_empty() {
-        reasons.extend(mismatches.iter().cloned());
+    for mismatch in mismatches {
+        if !reasons.contains(mismatch) {
+            reasons.push(mismatch.clone());
+        }
     }
 
     let _ = log.append_event(
@@ -658,5 +756,65 @@ mod tests {
         assert!(replay_event
             .reason_codes
             .contains(&ReasonCodes::RE_REPLAY_MISMATCH.to_string()));
+    }
+
+    #[test]
+    fn daily_spot_check_logs_spotcheck_reason() {
+        let (mut store, _, _, _) = create_session_state();
+        let manifest = generate_action_manifest("session-1", &store);
+        let report = daily_spot_check("session-1", &manifest, [7u8; 32], 1, &mut store);
+
+        assert_eq!(report.status, ReplayStatus::Match);
+        assert!(report
+            .reason_codes
+            .contains(&ReasonCodes::GV_REPLAY_SPOTCHECK.to_string()));
+
+        let replay_event = store
+            .sep_log
+            .events
+            .iter()
+            .rev()
+            .find(|event| matches!(event.event_type, SepEventType::EvReplay))
+            .cloned()
+            .expect("replay event logged");
+        assert!(replay_event
+            .reason_codes
+            .contains(&ReasonCodes::GV_REPLAY_SPOTCHECK.to_string()));
+    }
+
+    #[test]
+    fn daily_spot_check_reports_mismatches() {
+        let (mut store, _action, _decision, receipt_digest) = create_session_state();
+        let manifest = generate_action_manifest("session-1", &store);
+
+        if let Some(receipt) = store.receipts.get_mut(&receipt_digest) {
+            receipt.bindings.action_digest = Some(ucf_protocol::ucf::v1::Digest32([9u8; 32]));
+        }
+
+        let report = daily_spot_check("session-1", &manifest, [5u8; 32], 1, &mut store);
+
+        assert_eq!(report.status, ReplayStatus::Mismatch);
+        assert!(report
+            .reason_codes
+            .contains(&ReasonCodes::RE_REPLAY_MISMATCH.to_string()));
+        assert!(report
+            .reason_codes
+            .contains(&ReasonCodes::GV_REPLAY_SPOTCHECK.to_string()));
+        assert!(!report.mismatches.is_empty());
+
+        let replay_event = store
+            .sep_log
+            .events
+            .iter()
+            .rev()
+            .find(|event| matches!(event.event_type, SepEventType::EvReplay))
+            .cloned()
+            .expect("replay event logged");
+        assert!(replay_event
+            .reason_codes
+            .contains(&ReasonCodes::RE_REPLAY_MISMATCH.to_string()));
+        assert!(replay_event
+            .reason_codes
+            .contains(&ReasonCodes::GV_REPLAY_SPOTCHECK.to_string()));
     }
 }
