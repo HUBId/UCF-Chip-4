@@ -3,9 +3,11 @@
 use blake3::Hasher;
 use hex::encode;
 use prost::Message;
+use std::str::FromStr;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{
-    Digest32, MagnitudeClass, Ref, ReplayFidelity, ReplayInjectMode, ReplayPlan, ReplayTargetKind,
+    Digest32, MagnitudeClass, ReasonCodes, Ref, ReplayFidelity, ReplayInjectMode, ReplayPlan,
+    ReplayTargetKind,
 };
 
 #[cfg(feature = "serde")]
@@ -20,6 +22,43 @@ const MAX_PENDING_PLANS: usize = 128;
 pub struct ReplaySignals {
     pub deny_count_last256: usize,
     pub integrity_degraded_present: bool,
+    pub latest_consistency_class: Option<ConsistencyClass>,
+    pub recent_consistency_counts: ConsistencyCounts,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsistencyClass {
+    Low,
+    Med,
+    High,
+}
+
+impl FromStr for ConsistencyClass {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case("consistency_low") {
+            return Ok(Self::Low);
+        }
+
+        if value.eq_ignore_ascii_case("consistency_med") {
+            return Ok(Self::Med);
+        }
+
+        if value.eq_ignore_ascii_case("consistency_high") {
+            return Ok(Self::High);
+        }
+
+        Err(())
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConsistencyCounts {
+    pub low_count: usize,
+    pub med_count: usize,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -41,6 +80,8 @@ pub struct ReplayPlanStore {
 
 impl ReplayPlanStore {
     pub fn push(&mut self, mut plan: ReplayPlan) -> Result<(), ReplayPlanError> {
+        sort_plan_components(&mut plan);
+
         if plan.replay_id.is_empty() {
             return Err(ReplayPlanError::MissingReplayId);
         }
@@ -88,42 +129,74 @@ impl ReplayPlanStore {
 }
 
 pub fn should_generate_replay(_session_id: &str, signals: ReplaySignals) -> bool {
-    signals.deny_count_last256 >= 20 || signals.integrity_degraded_present
+    !replay_trigger_reasons(&signals).is_empty()
 }
 
-pub fn build_replay_plan(
-    session_id: &str,
-    head_experience_id: u64,
-    head_record_digest: [u8; 32],
-    target_kind: ReplayTargetKind,
-    target_refs: Vec<Ref>,
-    fidelity: ReplayFidelity,
-    counter: usize,
-) -> ReplayPlan {
+pub fn replay_trigger_reasons(signals: &ReplaySignals) -> Vec<String> {
+    let mut reason_codes = Vec::new();
+
+    if signals.latest_consistency_class == Some(ConsistencyClass::Low)
+        || signals.recent_consistency_counts.low_count > 0
+    {
+        reason_codes.push(ReasonCodes::GV_CONSISTENCY_LOW.to_string());
+    }
+
+    if signals.recent_consistency_counts.med_count >= 3 {
+        reason_codes.push(ReasonCodes::GV_CONSISTENCY_MED_CLUSTER.to_string());
+    }
+
+    if signals.deny_count_last256 >= 20 {
+        reason_codes.push(ReasonCodes::GV_REPLAY_DENY_CLUSTER.to_string());
+    }
+
+    if signals.integrity_degraded_present {
+        reason_codes.push(ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+    }
+
+    reason_codes.sort();
+    reason_codes.dedup();
+    reason_codes
+}
+
+pub struct BuildReplayPlanArgs {
+    pub session_id: String,
+    pub head_experience_id: u64,
+    pub head_record_digest: [u8; 32],
+    pub target_kind: ReplayTargetKind,
+    pub target_refs: Vec<Ref>,
+    pub fidelity: ReplayFidelity,
+    pub counter: usize,
+    pub trigger_reason_codes: Vec<String>,
+}
+
+pub fn build_replay_plan(args: BuildReplayPlanArgs) -> ReplayPlan {
     let mut plan = ReplayPlan {
-        replay_id: format!("replay:{session_id}:{head_experience_id}:{counter}"),
+        replay_id: format!(
+            "replay:{}:{}:{}",
+            args.session_id, args.head_experience_id, args.counter
+        ),
         replay_digest: Vec::new(),
-        session_id: session_id.to_string(),
-        head_record_digest: head_record_digest.to_vec(),
-        target_kind: target_kind as i32,
-        target_refs,
-        fidelity: fidelity as i32,
+        session_id: args.session_id,
+        head_record_digest: args.head_record_digest.to_vec(),
+        target_kind: args.target_kind as i32,
+        target_refs: args.target_refs,
+        fidelity: args.fidelity as i32,
         inject_mode: ReplayInjectMode::InjectDmnSimulate as i32,
         max_steps_class: MagnitudeClass::Low as i32,
         max_budget_class: MagnitudeClass::Low as i32,
         stop_on_dlp_flag: true,
         proof_receipt_ref: None,
         consumed: false,
+        trigger_reason_codes: args.trigger_reason_codes,
     };
 
+    sort_plan_components(&mut plan);
     plan.replay_digest = compute_replay_plan_digest(&plan).0.to_vec();
     plan
 }
 
 pub fn compute_replay_plan_digest(plan: &ReplayPlan) -> Digest32 {
-    let mut canonical = plan.clone();
-    canonical.proof_receipt_ref = None;
-    canonical.replay_digest.clear();
+    let canonical = canonical_plan(plan);
 
     let bytes = canonical.encode_to_vec();
     let mut hasher = Hasher::new();
@@ -132,6 +205,76 @@ pub fn compute_replay_plan_digest(plan: &ReplayPlan) -> Digest32 {
     Digest32(*hasher.finalize().as_bytes())
 }
 
+fn canonical_plan(plan: &ReplayPlan) -> ReplayPlan {
+    let mut canonical = plan.clone();
+    canonical.proof_receipt_ref = None;
+    canonical.replay_digest.clear();
+    canonical.trigger_reason_codes.sort();
+    canonical.trigger_reason_codes.dedup();
+    canonical.target_refs.sort_by(|a, b| a.id.cmp(&b.id));
+    canonical
+}
+
+fn sort_plan_components(plan: &mut ReplayPlan) {
+    plan.trigger_reason_codes.sort();
+    plan.trigger_reason_codes.dedup();
+    plan.target_refs.sort_by(|a, b| a.id.cmp(&b.id));
+}
+
 pub fn ref_from_digest(digest: [u8; 32]) -> Ref {
     Ref { id: encode(digest) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_plan_digest_sorts_components() {
+        let plan_one = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "session".to_string(),
+            head_experience_id: 42,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![
+                Ref {
+                    id: "target-b".to_string(),
+                },
+                Ref {
+                    id: "target-a".to_string(),
+                },
+            ],
+            fidelity: ReplayFidelity::Low,
+            counter: 1,
+            trigger_reason_codes: vec![
+                ReasonCodes::GV_CONSISTENCY_MED_CLUSTER.to_string(),
+                ReasonCodes::GV_CONSISTENCY_LOW.to_string(),
+            ],
+        });
+
+        let plan_two = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "session".to_string(),
+            head_experience_id: 42,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![
+                Ref {
+                    id: "target-a".to_string(),
+                },
+                Ref {
+                    id: "target-b".to_string(),
+                },
+            ],
+            fidelity: ReplayFidelity::Low,
+            counter: 1,
+            trigger_reason_codes: vec![
+                ReasonCodes::GV_CONSISTENCY_LOW.to_string(),
+                ReasonCodes::GV_CONSISTENCY_MED_CLUSTER.to_string(),
+            ],
+        });
+
+        assert_eq!(plan_one.replay_digest, plan_two.replay_digest);
+        assert_eq!(plan_one.target_refs[0].id, "target-a");
+        assert_eq!(plan_one.trigger_reason_codes, plan_two.trigger_reason_codes);
+    }
 }

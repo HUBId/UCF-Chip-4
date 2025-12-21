@@ -91,6 +91,7 @@ pub struct MacroStatusView {
     pub meso_digests: Vec<[u8; 32]>,
     pub trait_update_names: Vec<String>,
     pub consistency_digest: Option<[u8; 32]>,
+    pub consistency_feedback: Option<ConsistencyFeedback>,
     pub proof_receipt_digest: Option<[u8; 32]>,
     pub cbv_epoch_after: Option<u64>,
     pub cbv_digest_after: Option<[u8; 32]>,
@@ -166,6 +167,17 @@ pub fn list_tool_registry_digests(store: &PvgsStore) -> Vec<[u8; 32]> {
     store.tool_registry_state.history.clone()
 }
 
+fn macro_consistency_feedback(
+    store: &PvgsStore,
+    macro_milestone: &MacroMilestone,
+) -> Option<ConsistencyFeedback> {
+    macro_milestone
+        .consistency_digest
+        .as_deref()
+        .and_then(digest_from_bytes)
+        .and_then(|digest| store.consistency_store.get(digest).cloned())
+}
+
 /// List all micro milestones in deterministic order.
 pub fn list_micros(store: &PvgsStore) -> Vec<MicroMilestone> {
     let mut micros = store.micro_milestones.list().to_vec();
@@ -211,7 +223,7 @@ pub fn list_proposed_macros(store: &PvgsStore) -> Vec<MacroStatusView> {
         .macro_milestones
         .list_proposed()
         .into_iter()
-        .map(|milestone| macro_status_from(&milestone, &store.cbv_store, false))
+        .map(|milestone| macro_status_from(&milestone, &store.cbv_store, false, None))
         .collect();
 
     macros.sort_by(|a, b| a.macro_id.cmp(&b.macro_id));
@@ -224,7 +236,11 @@ pub fn list_finalized_macros(store: &PvgsStore) -> Vec<MacroStatusView> {
         .macro_milestones
         .list_finalized()
         .into_iter()
-        .map(|milestone| macro_status_from(&milestone, &store.cbv_store, true))
+        .map(|milestone| {
+            let consistency_feedback = macro_consistency_feedback(store, &milestone);
+
+            macro_status_from(&milestone, &store.cbv_store, true, consistency_feedback)
+        })
         .collect();
 
     macros.sort_by(|a, b| a.macro_id.cmp(&b.macro_id));
@@ -234,24 +250,34 @@ pub fn list_finalized_macros(store: &PvgsStore) -> Vec<MacroStatusView> {
 /// Retrieve the latest known status for a macro id.
 pub fn get_macro_status(store: &PvgsStore, macro_id: &str) -> Option<MacroStatusView> {
     if let Some(macro_milestone) = store.macro_milestones.get_proposed(macro_id) {
-        return Some(macro_status_from(macro_milestone, &store.cbv_store, false));
+        return Some(macro_status_from(
+            macro_milestone,
+            &store.cbv_store,
+            false,
+            None,
+        ));
     }
 
     store
         .macro_milestones
         .get_finalized(macro_id)
-        .map(|macro_milestone| macro_status_from(macro_milestone, &store.cbv_store, true))
+        .map(|macro_milestone| {
+            let consistency_feedback = macro_consistency_feedback(store, macro_milestone);
+
+            macro_status_from(
+                macro_milestone,
+                &store.cbv_store,
+                true,
+                consistency_feedback,
+            )
+        })
 }
 
 /// Retrieve the stored consistency feedback for a finalized macro if available.
 pub fn get_consistency_for_macro(store: &PvgsStore, macro_id: &str) -> Option<ConsistencyFeedback> {
-    let digest = store
-        .macro_milestones
-        .get_finalized(macro_id)
-        .and_then(|macro_milestone| macro_milestone.consistency_digest.as_deref())
-        .and_then(digest_from_bytes)?;
+    let macro_milestone = store.macro_milestones.get_finalized(macro_id)?;
 
-    store.consistency_store.get(digest).cloned()
+    macro_consistency_feedback(store, macro_milestone)
 }
 
 pub fn get_pending_replay_plans(store: &PvgsStore, session_id: &str) -> Vec<ReplayPlan> {
@@ -310,6 +336,7 @@ fn macro_status_from(
     macro_milestone: &MacroMilestone,
     cbv_store: &CbvStore,
     include_cbv: bool,
+    consistency_feedback: Option<ConsistencyFeedback>,
 ) -> MacroStatusView {
     let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap_or([0u8; 32]);
 
@@ -354,6 +381,7 @@ fn macro_status_from(
             .consistency_digest
             .as_deref()
             .and_then(digest_from_bytes),
+        consistency_feedback,
         proof_receipt_digest: macro_milestone
             .proof_receipt_ref
             .as_ref()
@@ -778,7 +806,7 @@ mod tests {
         compute_ruleset_digest, verify_and_commit, CommitBindings, CommitType, RequiredCheck,
         RequiredReceiptKind,
     };
-    use replay_plan::build_replay_plan;
+    use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
     use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
     use ucf_protocol::ucf::v1::{
@@ -1052,6 +1080,7 @@ mod tests {
         assert_eq!(proposed.len(), 1);
         assert_eq!(proposed[0].macro_id, "macro-alpha");
         assert_eq!(proposed[0].macro_digest, [1u8; 32]);
+        assert!(proposed[0].consistency_feedback.is_none());
         assert!(list_finalized_macros(&store).is_empty());
     }
 
@@ -1095,12 +1124,26 @@ mod tests {
         assert!(status.cbv_epoch_after.is_some());
         assert!(status.cbv_digest_after.is_some());
 
+        let consistency_feedback = status
+            .consistency_feedback
+            .as_ref()
+            .expect("consistency feedback present");
+        assert_eq!(
+            consistency_feedback.cf_digest.as_deref(),
+            Some(consistency_digest.as_slice())
+        );
+        assert_eq!(
+            consistency_feedback.consistency_class,
+            "CONSISTENCY_HIGH".to_string()
+        );
+
         let stored = get_consistency_for_macro(&store, "macro-high").expect("consistency");
         assert_eq!(stored.consistency_class, "CONSISTENCY_HIGH");
 
         let status = get_macro_status(&store, "macro-high").expect("macro status");
         assert!(status.cbv_epoch_after.is_some());
         assert!(status.cbv_digest_after.is_some());
+        assert!(status.consistency_feedback.is_some());
     }
 
     #[test]
@@ -1822,24 +1865,26 @@ mod tests {
             id: "target".to_string(),
         };
 
-        let plan_two = build_replay_plan(
-            "sess",
-            1,
-            [1u8; 32],
-            ReplayTargetKind::Macro,
-            vec![target_ref.clone()],
-            ReplayFidelity::Low,
-            2,
-        );
-        let plan_one = build_replay_plan(
-            "sess",
-            1,
-            [1u8; 32],
-            ReplayTargetKind::Macro,
-            vec![target_ref],
-            ReplayFidelity::Low,
-            1,
-        );
+        let plan_two = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "sess".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![target_ref.clone()],
+            fidelity: ReplayFidelity::Low,
+            counter: 2,
+            trigger_reason_codes: Vec::new(),
+        });
+        let plan_one = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "sess".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![target_ref],
+            fidelity: ReplayFidelity::Low,
+            counter: 1,
+            trigger_reason_codes: Vec::new(),
+        });
 
         store.replay_plans.push(plan_two).unwrap();
         store.replay_plans.push(plan_one).unwrap();

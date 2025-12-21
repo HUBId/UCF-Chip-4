@@ -17,7 +17,8 @@ use pev::{pev_digest as extract_pev_digest, PevStore, PolicyEcologyVector};
 use prost::Message;
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
 use replay_plan::{
-    build_replay_plan, ref_from_digest, should_generate_replay, ReplayPlanStore, ReplaySignals,
+    build_replay_plan, ref_from_digest, replay_trigger_reasons, should_generate_replay,
+    BuildReplayPlanArgs, ConsistencyClass, ConsistencyCounts, ReplayPlanStore, ReplaySignals,
 };
 use sep::{CausalGraph, EdgeType, FrameEventKind, NodeKey, SepEventType, SepLog};
 use std::collections::{HashMap, HashSet};
@@ -35,6 +36,9 @@ use vrf::VrfEngine;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+
+const CONSISTENCY_SIGNAL_WINDOW: usize = 8;
+const CONSISTENCY_HISTORY_MAX: usize = 256;
 
 /// Commit type supported by PVGS.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -211,6 +215,39 @@ pub struct ExperienceStore {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct ConsistencyHistory {
+    entries: Vec<(String, [u8; 32])>,
+}
+
+impl ConsistencyHistory {
+    pub fn push(&mut self, session_id: String, digest: [u8; 32]) {
+        self.entries.push((session_id, digest));
+
+        if self.entries.len() > CONSISTENCY_HISTORY_MAX {
+            let remove_count = self.entries.len() - CONSISTENCY_HISTORY_MAX;
+            self.entries.drain(0..remove_count);
+        }
+    }
+
+    pub fn recent_for_session(&self, session_id: &str, limit: usize) -> Vec<[u8; 32]> {
+        let mut digests = Vec::new();
+
+        for (entry_session, digest) in self.entries.iter().rev() {
+            if entry_session == session_id {
+                digests.push(*digest);
+
+                if digests.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        digests.reverse();
+        digests
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct MacroMilestoneStore {
     proposed: HashMap<String, MacroMilestone>,
     finalized: HashMap<String, MacroMilestone>,
@@ -380,6 +417,7 @@ pub struct PvgsStore {
     pub pev_store: PevStore,
     pub dlp_store: DlpDecisionStore,
     pub consistency_store: ConsistencyStore,
+    pub consistency_history: ConsistencyHistory,
     pub tool_registry_state: ToolRegistryState,
     pub micro_milestones: MicroMilestoneStore,
     pub meso_milestones: MesoMilestoneStore,
@@ -419,6 +457,7 @@ impl PvgsStore {
             pev_store: PevStore::default(),
             dlp_store: DlpDecisionStore::default(),
             consistency_store: ConsistencyStore::default(),
+            consistency_history: ConsistencyHistory::default(),
             tool_registry_state: ToolRegistryState::default(),
             micro_milestones: MicroMilestoneStore::default(),
             meso_milestones: MesoMilestoneStore::default(),
@@ -483,9 +522,30 @@ impl PvgsStore {
                     .any(|rc| rc == protocol::ReasonCodes::RE_INTEGRITY_DEGRADED)
         });
 
+        let mut latest_consistency_class = None;
+        let mut consistency_counts = ConsistencyCounts::default();
+
+        for digest in self
+            .consistency_history
+            .recent_for_session(session_id, CONSISTENCY_SIGNAL_WINDOW)
+        {
+            if let Some(feedback) = self.consistency_store.get(digest) {
+                if let Ok(class) = feedback.consistency_class.parse::<ConsistencyClass>() {
+                    latest_consistency_class = Some(class.clone());
+                    match class {
+                        ConsistencyClass::Low => consistency_counts.low_count += 1,
+                        ConsistencyClass::Med => consistency_counts.med_count += 1,
+                        ConsistencyClass::High => {}
+                    }
+                }
+            }
+        }
+
         ReplaySignals {
             deny_count_last256,
             integrity_degraded_present,
+            latest_consistency_class,
+            recent_consistency_counts: consistency_counts,
         }
     }
 
@@ -499,6 +559,12 @@ impl PvgsStore {
             return None;
         }
 
+        let trigger_reason_codes = replay_trigger_reasons(&signals);
+
+        if trigger_reason_codes.is_empty() {
+            return None;
+        }
+
         if let Some(latest) = self.replay_plans.latest() {
             if digest_from_bytes(&latest.head_record_digest)
                 .is_some_and(|digest| digest == self.current_head_record_digest)
@@ -507,7 +573,12 @@ impl PvgsStore {
             }
         }
 
-        let (target_kind, target_refs) = select_replay_targets(self);
+        let prefer_macro_targets = trigger_reason_codes.iter().any(|reason| {
+            reason == protocol::ReasonCodes::GV_CONSISTENCY_LOW
+                || reason == protocol::ReasonCodes::GV_CONSISTENCY_MED_CLUSTER
+        });
+
+        let (target_kind, target_refs) = select_replay_targets(self, prefer_macro_targets);
         if target_refs.is_empty() {
             return None;
         }
@@ -519,15 +590,16 @@ impl PvgsStore {
         };
 
         let counter = self.replay_plans.plans.len() + 1;
-        let plan = build_replay_plan(
-            session_id,
-            self.experience_store.head_id,
-            self.current_head_record_digest,
+        let plan = build_replay_plan(BuildReplayPlanArgs {
+            session_id: session_id.to_string(),
+            head_experience_id: self.experience_store.head_id,
+            head_record_digest: self.current_head_record_digest,
             target_kind,
             target_refs,
             fidelity,
             counter,
-        );
+            trigger_reason_codes: trigger_reason_codes.clone(),
+        });
 
         if self.replay_plans.push(plan.clone()).is_err() {
             return None;
@@ -1211,7 +1283,41 @@ fn event_type_for_commit(
     }
 }
 
-fn select_replay_targets(store: &PvgsStore) -> (ReplayTargetKind, Vec<Ref>) {
+fn select_replay_targets(store: &PvgsStore, prefer_macro: bool) -> (ReplayTargetKind, Vec<Ref>) {
+    let micro_refs = latest_micro_refs(store);
+    let meso_ref = latest_meso_ref(store);
+    let macro_ref = latest_macro_ref(store);
+
+    if prefer_macro {
+        if let Some(reference) = macro_ref {
+            return (ReplayTargetKind::Macro, vec![reference]);
+        }
+
+        if let Some(reference) = meso_ref {
+            return (ReplayTargetKind::Meso, vec![reference]);
+        }
+
+        if !micro_refs.is_empty() {
+            return (ReplayTargetKind::Micro, micro_refs);
+        }
+    } else {
+        if !micro_refs.is_empty() {
+            return (ReplayTargetKind::Micro, micro_refs);
+        }
+
+        if let Some(reference) = meso_ref {
+            return (ReplayTargetKind::Meso, vec![reference]);
+        }
+
+        if let Some(reference) = macro_ref {
+            return (ReplayTargetKind::Macro, vec![reference]);
+        }
+    }
+
+    (ReplayTargetKind::Unspecified, Vec::new())
+}
+
+fn latest_micro_refs(store: &PvgsStore) -> Vec<Ref> {
     let mut micro_refs: Vec<Ref> = store
         .micro_milestones
         .list()
@@ -1222,24 +1328,32 @@ fn select_replay_targets(store: &PvgsStore) -> (ReplayTargetKind, Vec<Ref>) {
         .map(ref_from_digest)
         .collect();
 
-    if !micro_refs.is_empty() {
-        micro_refs.sort_by(|a, b| a.id.cmp(&b.id));
-        return (ReplayTargetKind::Micro, micro_refs);
-    }
+    micro_refs.sort_by(|a, b| a.id.cmp(&b.id));
+    micro_refs
+}
 
-    if let Some(meso) = store.meso_milestones.latest() {
-        if let Some(digest) = digest_from_bytes(&meso.meso_digest) {
-            return (ReplayTargetKind::Meso, vec![ref_from_digest(digest)]);
+fn latest_meso_ref(store: &PvgsStore) -> Option<Ref> {
+    store
+        .meso_milestones
+        .latest()
+        .and_then(|meso| digest_from_bytes(&meso.meso_digest))
+        .map(ref_from_digest)
+}
+
+fn latest_macro_ref(store: &PvgsStore) -> Option<Ref> {
+    if let Some(finalized) = store.macro_milestones.latest_finalized() {
+        if let Some(digest) = digest_from_bytes(&finalized.macro_digest) {
+            return Some(ref_from_digest(digest));
         }
     }
 
-    if let Some(macro_milestone) = store.macro_milestones.latest_finalized() {
-        if let Some(digest) = digest_from_bytes(&macro_milestone.macro_digest) {
-            return (ReplayTargetKind::Macro, vec![ref_from_digest(digest)]);
-        }
-    }
+    let mut proposals = store.macro_milestones.list_proposed();
+    proposals.sort_by(|a, b| a.macro_id.cmp(&b.macro_id));
 
-    (ReplayTargetKind::Unspecified, Vec::new())
+    proposals
+        .last()
+        .and_then(|proposal| digest_from_bytes(&proposal.macro_digest))
+        .map(ref_from_digest)
 }
 
 fn issue_replay_plan_receipts(
@@ -3037,6 +3151,9 @@ fn verify_consistency_feedback_append(
         .consistency_store
         .insert(sanitized_feedback)
         .expect("validated feedback");
+    store
+        .consistency_history
+        .push(req.commit_id.clone(), cf_digest);
     store.committed_payload_digests.insert(payload_digest);
 
     store.sep_log.append_event(
@@ -4176,6 +4293,18 @@ mod tests {
             .consistency_store
             .insert(feedback)
             .expect("valid feedback");
+    }
+
+    fn track_consistency_feedback(
+        store: &mut PvgsStore,
+        session_id: &str,
+        digest: [u8; 32],
+        class: &str,
+    ) {
+        store_consistency_feedback(store, digest, class);
+        store
+            .consistency_history
+            .push(session_id.to_string(), digest);
     }
 
     fn micro_with_priority(id: u64, priority: PriorityClass) -> MicroMilestone {
@@ -6383,6 +6512,26 @@ mod tests {
         }
     }
 
+    fn install_macro_target(store: &mut PvgsStore, id: &str, digest: [u8; 32]) {
+        let finalized_macro = simple_macro(id, digest);
+        let proposal = macro_proposal_from(&finalized_macro);
+        let feedback = ConsistencyFeedback {
+            cf_digest: Some([0xBBu8; 32].to_vec()),
+            consistency_class: "CONSISTENCY_HIGH".to_string(),
+            flags: Vec::new(),
+            proof_receipt_ref: None,
+        };
+
+        store
+            .macro_milestones
+            .insert_proposal(proposal)
+            .expect("proposal stored");
+        store
+            .macro_milestones
+            .finalize(finalized_macro, &feedback)
+            .expect("finalized macro stored");
+    }
+
     #[test]
     fn trigger_appends_replay_plan_and_sep_event() {
         let prev = [7u8; 32];
@@ -6467,5 +6616,87 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted);
+    }
+
+    #[test]
+    fn consistency_low_triggers_replay_plan() {
+        let prev = [5u8; 32];
+        let keystore = KeyStore::new_dev_keystore(1);
+        let mut store = base_store(prev);
+
+        install_macro_target(&mut store, "macro-low", [3u8; 32]);
+
+        track_consistency_feedback(&mut store, "session-low", [0xA1u8; 32], "CONSISTENCY_LOW");
+
+        let outcome = store
+            .maybe_plan_replay("session-low", &keystore)
+            .expect("replay plan created");
+
+        assert_eq!(
+            outcome.plan.trigger_reason_codes,
+            vec![ReasonCodes::GV_CONSISTENCY_LOW.to_string()]
+        );
+        assert_eq!(outcome.plan.target_kind, ReplayTargetKind::Macro as i32);
+    }
+
+    #[test]
+    fn consistency_med_cluster_triggers_replay_plan() {
+        let prev = [6u8; 32];
+        let keystore = KeyStore::new_dev_keystore(1);
+        let mut store = base_store(prev);
+
+        install_macro_target(&mut store, "macro-med", [4u8; 32]);
+
+        for idx in 0..3 {
+            let mut digest = [0u8; 32];
+            digest[0] = idx as u8 + 1;
+            track_consistency_feedback(&mut store, "session-med", digest, "CONSISTENCY_MED");
+        }
+
+        let outcome = store
+            .maybe_plan_replay("session-med", &keystore)
+            .expect("replay plan created");
+
+        assert_eq!(
+            outcome.plan.trigger_reason_codes,
+            vec![ReasonCodes::GV_CONSISTENCY_MED_CLUSTER.to_string()]
+        );
+    }
+
+    #[test]
+    fn consistency_high_does_not_trigger_replay() {
+        let prev = [9u8; 32];
+        let keystore = KeyStore::new_dev_keystore(1);
+        let mut store = base_store(prev);
+
+        install_macro_target(&mut store, "macro-high", [5u8; 32]);
+
+        track_consistency_feedback(&mut store, "session-high", [0xC1u8; 32], "CONSISTENCY_HIGH");
+
+        assert!(store.maybe_plan_replay("session-high", &keystore).is_none());
+    }
+
+    #[test]
+    fn consistency_triggers_prefer_macro_targets() {
+        let prev = [11u8; 32];
+        let keystore = KeyStore::new_dev_keystore(1);
+        let mut store = base_store(prev);
+
+        install_macro_target(&mut store, "macro-pref", [0x21u8; 32]);
+        store.micro_milestones.push(sample_micro(1)).unwrap();
+        store.micro_milestones.push(sample_micro(2)).unwrap();
+
+        track_consistency_feedback(&mut store, "session-pref", [0xD1u8; 32], "CONSISTENCY_LOW");
+
+        let outcome = store
+            .maybe_plan_replay("session-pref", &keystore)
+            .expect("replay plan created");
+
+        assert_eq!(outcome.plan.target_kind, ReplayTargetKind::Macro as i32);
+        assert_eq!(outcome.plan.target_refs.len(), 1);
+        assert_eq!(
+            digest_from_ref(outcome.plan.target_refs.first().expect("target")),
+            Some([0x21u8; 32])
+        );
     }
 }
