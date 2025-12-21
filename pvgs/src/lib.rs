@@ -6283,18 +6283,22 @@ mod tests {
         graph.add_edge(record, EdgeType::References, receipt);
         graph.add_edge(profile, EdgeType::References, receipt);
 
-        sep_log.append_event(
-            "sess-ok".to_string(),
-            SepEventType::EvDecision,
-            receipt,
-            vec![],
-        );
-        sep_log.append_frame_event(
-            "sess-ok".to_string(),
-            FrameEventKind::ControlFrame,
-            profile,
-            vec![],
-        );
+        sep_log
+            .append_event(
+                "sess-ok".to_string(),
+                SepEventType::EvDecision,
+                receipt,
+                vec![],
+            )
+            .unwrap();
+        sep_log
+            .append_frame_event(
+                "sess-ok".to_string(),
+                FrameEventKind::ControlFrame,
+                profile,
+                vec![],
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
@@ -6339,18 +6343,22 @@ mod tests {
         graph.add_edge(decision, EdgeType::Authorizes, receipt);
         graph.add_edge(profile, EdgeType::References, receipt);
 
-        sep_log.append_event(
-            "sess-degraded".to_string(),
-            SepEventType::EvDecision,
-            receipt,
-            vec![],
-        );
-        sep_log.append_frame_event(
-            "sess-degraded".to_string(),
-            FrameEventKind::ControlFrame,
-            profile,
-            vec![],
-        );
+        sep_log
+            .append_event(
+                "sess-degraded".to_string(),
+                SepEventType::EvDecision,
+                receipt,
+                vec![],
+            )
+            .unwrap();
+        sep_log
+            .append_frame_event(
+                "sess-degraded".to_string(),
+                FrameEventKind::ControlFrame,
+                profile,
+                vec![],
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
@@ -6381,12 +6389,14 @@ mod tests {
 
         let record = output_record(dlp_digest);
         let record_digest = compute_experience_record_digest(&record);
-        sep_log.append_event(
-            "sess-o-c1-ok".to_string(),
-            SepEventType::EvOutput,
-            record_digest,
-            Vec::new(),
-        );
+        sep_log
+            .append_event(
+                "sess-o-c1-ok".to_string(),
+                SepEventType::EvOutput,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
 
         let records = vec![record];
         let replay_plans = ReplayPlanStore::default();
@@ -6409,12 +6419,14 @@ mod tests {
 
         let record = output_record(dlp_digest);
         let record_digest = compute_experience_record_digest(&record);
-        sep_log.append_event(
-            "sess-o-c1-missing".to_string(),
-            SepEventType::EvOutput,
-            record_digest,
-            Vec::new(),
-        );
+        sep_log
+            .append_event(
+                "sess-o-c1-missing".to_string(),
+                SepEventType::EvOutput,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let records = vec![record];
@@ -6453,12 +6465,14 @@ mod tests {
         graph.add_edge(action, EdgeType::Authorizes, receipt);
         graph.add_edge([3u8; 32], EdgeType::References, receipt);
 
-        sep_log.append_event(
-            "sess-deterministic".to_string(),
-            SepEventType::EvDecision,
-            receipt,
-            vec![],
-        );
+        sep_log
+            .append_event(
+                "sess-deterministic".to_string(),
+                SepEventType::EvDecision,
+                receipt,
+                vec![],
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
@@ -6489,12 +6503,14 @@ mod tests {
         graph.add_edge([14u8; 32], EdgeType::References, action);
         graph.add_edge([14u8; 32], EdgeType::References, receipt);
 
-        sep_log.append_event(
-            "sess-cf".to_string(),
-            SepEventType::EvDecision,
-            receipt,
-            vec![],
-        );
+        sep_log
+            .append_event(
+                "sess-cf".to_string(),
+                SepEventType::EvDecision,
+                receipt,
+                vec![],
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
@@ -6535,12 +6551,14 @@ mod tests {
             None,
         );
         let record_digest = compute_experience_record_digest(&record);
-        sep_log.append_event(
-            "sess-replay-present".to_string(),
-            SepEventType::EvAgentStep,
-            record_digest,
-            Vec::new(),
-        );
+        sep_log
+            .append_event(
+                "sess-replay-present".to_string(),
+                SepEventType::EvAgentStep,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let records = vec![record];
@@ -6567,12 +6585,14 @@ mod tests {
             None,
         );
         let record_digest = compute_experience_record_digest(&record);
-        sep_log.append_event(
-            "sess-replay-missing-plan".to_string(),
-            SepEventType::EvAgentStep,
-            record_digest,
-            Vec::new(),
-        );
+        sep_log
+            .append_event(
+                "sess-replay-missing-plan".to_string(),
+                SepEventType::EvAgentStep,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
@@ -6607,12 +6627,14 @@ mod tests {
         let mut sep_log = SepLog::default();
         let record = replay_record(Vec::new(), None);
         let record_digest = compute_experience_record_digest(&record);
-        sep_log.append_event(
-            "sess-replay-missing-ref".to_string(),
-            SepEventType::EvAgentStep,
-            record_digest,
-            Vec::new(),
-        );
+        sep_log
+            .append_event(
+                "sess-replay-missing-ref".to_string(),
+                SepEventType::EvAgentStep,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
@@ -6663,12 +6685,14 @@ mod tests {
             None,
         );
         let record_digest = compute_experience_record_digest(&record);
-        sep_log.append_event(
-            "sess-replay-invalid-action".to_string(),
-            SepEventType::EvAgentStep,
-            record_digest,
-            Vec::new(),
-        );
+        sep_log
+            .append_event(
+                "sess-replay-invalid-action".to_string(),
+                SepEventType::EvAgentStep,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let records = vec![record];
