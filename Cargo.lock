@@ -581,6 +581,7 @@ dependencies = [
  "pev",
  "prost",
  "receipts",
+ "recovery",
  "replay_plan",
  "sep",
  "serde",
@@ -612,6 +613,7 @@ dependencies = [
  "prost",
  "pvgs",
  "receipts",
+ "recovery",
  "replay_plan",
  "sep",
  "serde",
@@ -671,6 +673,14 @@ dependencies = [
  "serde",
  "serde_yaml",
  "ucf-protocol",
+]
+
+[[package]]
+name = "recovery"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

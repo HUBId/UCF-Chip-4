@@ -597,6 +597,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         }
     }
 
@@ -668,6 +670,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         }
     }
 

@@ -24,6 +24,7 @@ members = [
     "crates/consistency",
     "crates/limits",
     "crates/retention",
+    "crates/recovery",
 ]
 resolver = "2"
 
@@ -41,3 +42,4 @@ prost = { version = "0.12", features = ["prost-derive"] }
 hex = "0.4"
 limits = { path = "crates/limits" }
 ucf-protocol = { path = "ucf-protocol" }
+recovery = { path = "crates/recovery" }

@@ -45,6 +45,9 @@ pub mod ucf {
             ConsistencyFeedbackAppend,
             CharterUpdate,
             ToolRegistryUpdate,
+            RecoveryCaseCreate,
+            RecoveryCaseAdvance,
+            RecoveryApproval,
             RecoveryUpdate,
             PevUpdate,
             CbvUpdate,
@@ -377,6 +380,12 @@ pub mod ucf {
             pub const GV_TOOL_REGISTRY_UPDATED: &'static str = "RC.GV.TOOL_REGISTRY.UPDATED";
             pub const GV_RULESET_CHANGED: &'static str = "RC.GV.RULESET.CHANGED";
             pub const GV_GRAPH_TRIMMED: &'static str = "RC.GV.GRAPH.TRIMMED";
+            pub const GV_RECOVERY_CREATED: &'static str = "RC.GV.RECOVERY.CREATED";
+            pub const GV_RECOVERY_ADVANCED: &'static str = "RC.GV.RECOVERY.ADVANCED";
+            pub const GV_RECOVERY_UNLOCK_GRANTED: &'static str = "RC.GV.RECOVERY.UNLOCK_GRANTED";
+            pub const GV_RECOVERY_INVALID_STATE: &'static str = "RC.GV.RECOVERY.INVALID_STATE";
+            pub const GV_RECOVERY_INVALID_CHECKS: &'static str = "RC.GV.RECOVERY.INVALID_CHECKS";
+            pub const GV_RECOVERY_UNKNOWN_CASE: &'static str = "RC.GV.RECOVERY.UNKNOWN_CASE";
             pub const RE_REPLAY_MISMATCH: &'static str = "RC.RE.REPLAY.MISMATCH";
             pub const RE_REPLAY_PLAN_REF_MISSING: &'static str = "RC.RE.REPLAY.PLAN_REF_MISSING";
             pub const RE_REPLAY_PLAN_MISSING: &'static str = "RC.RE.REPLAY.PLAN_MISSING";
