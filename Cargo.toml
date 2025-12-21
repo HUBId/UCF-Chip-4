@@ -23,6 +23,7 @@ members = [
     "milestones",
     "crates/consistency",
     "crates/limits",
+    "crates/retention",
 ]
 resolver = "2"
 
