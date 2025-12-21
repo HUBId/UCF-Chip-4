@@ -144,8 +144,8 @@ impl RecoveryStore {
         self.cases
             .values()
             .filter(|case| case.session_id == session_id && case.state != RecoveryState::R7Closed)
-            .max_by(|a, b| RecoveryStore::case_ordering(a, b))
             .cloned()
+            .max_by(RecoveryStore::case_ordering)
     }
 
     pub fn list_for_session(&self, session_id: &str) -> Vec<RecoveryCase> {
@@ -156,7 +156,7 @@ impl RecoveryStore {
             .cloned()
             .collect();
 
-        cases.sort_by(|a, b| RecoveryStore::case_ordering(a, b));
+        cases.sort_by(RecoveryStore::case_ordering);
         cases
     }
 
