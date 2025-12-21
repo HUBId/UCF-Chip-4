@@ -299,7 +299,7 @@ pub fn daily_spot_check(
     let step = if total_entries == 0 {
         1
     } else {
-        std::cmp::max(1, (total_entries + target_samples - 1) / target_samples)
+        std::cmp::max(1, total_entries.div_ceil(target_samples))
     };
     let offset = if total_entries == 0 {
         0
