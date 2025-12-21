@@ -77,7 +77,7 @@ impl MacroDeriver {
                 }
 
                 if let Some(macro_milestone) =
-                    derive_macro_for_chunk(&session_id, chunk, &micro_by_digest, &self.config)
+                    propose_macro_for_chunk(&session_id, chunk, &micro_by_digest, &self.config)
                 {
                     candidates.push(macro_milestone);
                 }
@@ -106,7 +106,7 @@ impl MacroDeriver {
     }
 }
 
-fn derive_macro_for_chunk(
+pub fn propose_macro_for_chunk(
     session_id: &str,
     chunk: &[&MesoMilestone],
     micro_by_digest: &HashMap<String, &MicroMilestone>,
@@ -134,11 +134,11 @@ fn derive_macro_for_chunk(
     let mut macro_milestone = MacroMilestone {
         macro_id,
         macro_digest: Vec::new(),
-        state: MacroMilestoneState::Finalized as i32,
+        state: MacroMilestoneState::Proposed as i32,
         trait_updates: trait_updates_for_chunk(chunk, micro_by_digest, config.max_trait_updates),
         meso_refs,
-        consistency_class: "CONSISTENCY_HIGH".to_string(),
-        identity_anchor_flag: true,
+        consistency_class: "CONSISTENCY_DEFAULT".to_string(),
+        identity_anchor_flag: false,
         proof_receipt_ref: None,
         consistency_digest: None,
         consistency_feedback_ref: None,
@@ -213,7 +213,12 @@ fn session_from_meso_id(meso_id: &str) -> String {
 
 pub fn compute_macro_digest(macro_milestone: &MacroMilestone) -> Digest32 {
     let mut canonical = macro_milestone.clone();
+    canonical.state = MacroMilestoneState::Proposed as i32;
+    canonical.identity_anchor_flag = false;
     canonical.macro_digest.clear();
+    canonical.proof_receipt_ref = None;
+    canonical.consistency_digest = None;
+    canonical.consistency_feedback_ref = None;
     let mut hasher = new_domain_hasher("UCF:HASH:MACRO_MILESTONE");
     let mut buf = Vec::new();
     canonical
@@ -221,6 +226,13 @@ pub fn compute_macro_digest(macro_milestone: &MacroMilestone) -> Digest32 {
         .expect("macro milestone encoding");
     hasher.update(&buf);
     Digest32(*hasher.finalize().as_bytes())
+}
+
+pub fn compute_macro_finalization_digest(macro_milestone: &MacroMilestone) -> Digest32 {
+    let mut finalized = macro_milestone.clone();
+    finalized.state = MacroMilestoneState::Finalized as i32;
+    finalized.identity_anchor_flag = true;
+    compute_macro_digest(&finalized)
 }
 
 #[cfg(test)]
