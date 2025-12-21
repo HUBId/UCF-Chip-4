@@ -817,4 +817,56 @@ mod tests {
             .reason_codes
             .contains(&ReasonCodes::GV_REPLAY_SPOTCHECK.to_string()));
     }
+
+    #[test]
+    fn daily_spot_check_is_deterministic_and_marks_mismatches() {
+        let (mut store, _action, _decision, _receipt_digest) = create_session_state();
+        let mut manifest = generate_action_manifest("session-1", &store);
+
+        manifest.entries.push(ActionEntry {
+            action_digest: [2u8; 32],
+            decision_digest: [3u8; 32],
+            receipt_digest: [4u8; 32],
+            record_digest: [5u8; 32],
+            created_at_ms: 1,
+        });
+        manifest.entries.push(ActionEntry {
+            action_digest: [0x11u8; 32],
+            decision_digest: [0x12u8; 32],
+            receipt_digest: [0x13u8; 32],
+            record_digest: [0x14u8; 32],
+            created_at_ms: 2,
+        });
+        manifest.manifest_digest = manifest.recompute_digest();
+
+        let seed = [1u8; 32];
+        let report_one = daily_spot_check("session-1", &manifest, seed, 2, &mut store);
+        let report_two = daily_spot_check("session-1", &manifest, seed, 2, &mut store);
+
+        assert_eq!(report_one.status, ReplayStatus::Mismatch);
+        assert_eq!(report_one.mismatches, report_two.mismatches);
+        assert!(report_one
+            .reason_codes
+            .contains(&ReasonCodes::GV_REPLAY_SPOTCHECK.to_string()));
+        assert!(report_one
+            .reason_codes
+            .contains(&ReasonCodes::RE_REPLAY_MISMATCH.to_string()));
+        assert!(report_one
+            .reason_codes
+            .iter()
+            .any(|rc| rc.contains("mismatch for action")));
+
+        let replay_event = store
+            .sep_log
+            .events
+            .iter()
+            .rev()
+            .find(|event| matches!(event.event_type, SepEventType::EvReplay))
+            .cloned()
+            .expect("replay event logged");
+        assert!(replay_event
+            .reason_codes
+            .iter()
+            .any(|rc| rc.contains("mismatch for action")));
+    }
 }

@@ -6308,6 +6308,50 @@ mod tests {
     }
 
     #[test]
+    fn experience_store_evicts_oldest_record_and_logs_reason() {
+        let mut store = base_store([0u8; 32]);
+        store.limits.max_experience_records = 1;
+        store.experience_store.limits = store.limits;
+        let keystore = KeyStore::new_dev_keystore(8);
+        let vrf_engine = VrfEngine::new_dev(8);
+
+        let first = perception_record([5u8; 32]);
+        let req_one = make_experience_request_with_id(
+            &first,
+            &store,
+            keystore.current_epoch(),
+            "exp-evict-1",
+        );
+        let (_, proof_one) = verify_and_commit(req_one, &mut store, &keystore, &vrf_engine);
+        let first_digest = store.current_head_record_digest;
+
+        let second = perception_record([6u8; 32]);
+        let req_two = make_experience_request_with_id(
+            &second,
+            &store,
+            keystore.current_epoch(),
+            "exp-evict-2",
+        );
+        let (_, proof_two) = verify_and_commit(req_two, &mut store, &keystore, &vrf_engine);
+
+        assert!(proof_one.is_some());
+        assert!(proof_two.is_some());
+        assert_eq!(store.experience_store.records.len(), 1);
+        assert!(!store
+            .experience_store
+            .proof_receipts
+            .contains_key(&first_digest));
+
+        let eviction_logged = store.sep_log.events.iter().any(|event| {
+            event.event_type == SepEventType::EvOutcome
+                && event
+                    .reason_codes
+                    .contains(&"RC.GV.RETENTION.EVICTED".to_string())
+        });
+        assert!(eviction_logged);
+    }
+
+    #[test]
     fn proof_receipt_vrf_digest_is_non_zero() {
         let prev = [0u8; 32];
         let mut store = base_store(prev);

@@ -412,4 +412,49 @@ mod tests {
         assert_eq!(pending[0].replay_id, "b");
         assert_eq!(pending[1].replay_id, "c");
     }
+
+    #[test]
+    fn eviction_prefers_consumed_before_pending_and_is_deterministic() {
+        let mut store = ReplayPlanStore::default();
+        store.limits.max_replay_plans = 2;
+
+        let mut base_plan = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "session".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![Ref {
+                id: "target-a".to_string(),
+            }],
+            fidelity: ReplayFidelity::Low,
+            counter: 0,
+            trigger_reason_codes: vec![],
+        });
+        base_plan.replay_digest.clear();
+
+        let mut consumed_one = base_plan.clone();
+        consumed_one.replay_id = "b".to_string();
+        consumed_one.consumed = true;
+
+        let mut consumed_two = base_plan.clone();
+        consumed_two.replay_id = "a".to_string();
+        consumed_two.consumed = true;
+
+        let mut pending_one = base_plan.clone();
+        pending_one.replay_id = "c".to_string();
+        pending_one.consumed = false;
+
+        let mut pending_two = base_plan.clone();
+        pending_two.replay_id = "d".to_string();
+        pending_two.consumed = false;
+
+        store.push(consumed_one).unwrap();
+        store.push(consumed_two).unwrap();
+        store.push(pending_one.clone()).unwrap();
+        store.push(pending_two.clone()).unwrap();
+
+        let remaining_ids: Vec<_> = store.plans.iter().map(|p| p.replay_id.clone()).collect();
+        assert_eq!(remaining_ids, vec!["c".to_string(), "d".to_string()]);
+        assert!(store.plans.iter().all(|p| p.replay_digest.len() == 32));
+    }
 }

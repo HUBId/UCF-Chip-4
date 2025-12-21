@@ -517,4 +517,23 @@ mod tests {
         assert_eq!(store.latest(), Some(&third));
         assert_eq!(store.list_latest(5), vec![second, third]);
     }
+
+    #[test]
+    fn cbv_store_with_zero_limit_always_evicts() {
+        let mut store = CbvStore::with_limits(StoreLimits {
+            max_cbvs: 0,
+            ..StoreLimits::default()
+        });
+
+        let first = cbv_with_epoch(1);
+        let second = cbv_with_epoch(2);
+
+        let evicted_first = store.push(first.clone());
+        assert_eq!(evicted_first, vec![first.clone()]);
+        assert!(store.latest().is_none());
+
+        let evicted_second = store.push(second.clone());
+        assert_eq!(evicted_second, vec![second]);
+        assert!(store.latest().is_none());
+    }
 }

@@ -231,4 +231,28 @@ mod tests {
         expected.flags.sort();
         assert_eq!(store.get([8u8; 32]), Some(&expected));
     }
+
+    #[test]
+    fn reinserting_feedback_updates_order_for_fifo_eviction() {
+        let mut store = ConsistencyStore::with_limits(StoreLimits {
+            max_consistency_feedbacks: 2,
+            ..StoreLimits::default()
+        });
+
+        let mut first = feedback("CONSISTENCY_HIGH");
+        first.cf_digest = Some([1u8; 32].to_vec());
+        let mut second = feedback("CONSISTENCY_HIGH");
+        second.cf_digest = Some([2u8; 32].to_vec());
+        let mut third = feedback("CONSISTENCY_HIGH");
+        third.cf_digest = Some([3u8; 32].to_vec());
+
+        store.insert(first.clone()).unwrap();
+        store.insert(second.clone()).unwrap();
+        store.insert(first.clone()).unwrap();
+        let (_, evicted) = store.insert(third.clone()).unwrap();
+
+        assert_eq!(evicted, vec![[2u8; 32]]);
+        assert!(store.get([2u8; 32]).is_none());
+        assert_eq!(store.order.back(), Some(&[3u8; 32]));
+    }
 }
