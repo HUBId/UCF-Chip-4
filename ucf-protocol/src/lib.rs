@@ -374,6 +374,7 @@ pub mod ucf {
             pub const GV_PEV_UPDATED: &'static str = "RC.GV.PEV.UPDATED";
             pub const GV_TOOL_REGISTRY_UPDATED: &'static str = "RC.GV.TOOL_REGISTRY.UPDATED";
             pub const GV_RULESET_CHANGED: &'static str = "RC.GV.RULESET.CHANGED";
+            pub const GV_GRAPH_TRIMMED: &'static str = "RC.GV.GRAPH.TRIMMED";
             pub const RE_REPLAY_MISMATCH: &'static str = "RC.RE.REPLAY.MISMATCH";
             pub const RE_REPLAY_PLAN_REF_MISSING: &'static str = "RC.RE.REPLAY.PLAN_REF_MISSING";
             pub const RE_REPLAY_PLAN_MISSING: &'static str = "RC.RE.REPLAY.PLAN_MISSING";

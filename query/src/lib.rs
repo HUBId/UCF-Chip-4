@@ -1286,19 +1286,19 @@ mod tests {
 
         store
             .causal_graph
-            .add_edge(action, EdgeType::Authorizes, receipt);
+            .add_edge(action, EdgeType::Authorizes, receipt, None);
         store
             .causal_graph
-            .add_edge(decision, EdgeType::Authorizes, receipt);
+            .add_edge(decision, EdgeType::Authorizes, receipt, None);
         store
             .causal_graph
-            .add_edge(profile, EdgeType::References, receipt);
+            .add_edge(profile, EdgeType::References, receipt, None);
         store
             .causal_graph
-            .add_edge(record, EdgeType::References, receipt);
+            .add_edge(record, EdgeType::References, receipt, None);
         store
             .causal_graph
-            .add_edge(record, EdgeType::References, action);
+            .add_edge(record, EdgeType::References, action, None);
 
         let result = trace_action(&store, action);
         assert_eq!(result.receipts, vec![receipt]);
@@ -1327,19 +1327,19 @@ mod tests {
             .insert(record, dummy_proof_receipt(record));
         store_one
             .causal_graph
-            .add_edge(action, EdgeType::Authorizes, receipt);
+            .add_edge(action, EdgeType::Authorizes, receipt, None);
         store_one
             .causal_graph
-            .add_edge(decision_b, EdgeType::Authorizes, receipt);
+            .add_edge(decision_b, EdgeType::Authorizes, receipt, None);
         store_one
             .causal_graph
-            .add_edge(decision_a, EdgeType::Authorizes, receipt);
+            .add_edge(decision_a, EdgeType::Authorizes, receipt, None);
         store_one
             .causal_graph
-            .add_edge(record, EdgeType::References, receipt);
+            .add_edge(record, EdgeType::References, receipt, None);
         store_one
             .causal_graph
-            .add_edge(profile, EdgeType::References, receipt);
+            .add_edge(profile, EdgeType::References, receipt, None);
 
         let mut store_two = trace_store(profile);
         store_two
@@ -1348,19 +1348,19 @@ mod tests {
             .insert(record, dummy_proof_receipt(record));
         store_two
             .causal_graph
-            .add_edge(decision_a, EdgeType::Authorizes, receipt);
+            .add_edge(decision_a, EdgeType::Authorizes, receipt, None);
         store_two
             .causal_graph
-            .add_edge(action, EdgeType::Authorizes, receipt);
+            .add_edge(action, EdgeType::Authorizes, receipt, None);
         store_two
             .causal_graph
-            .add_edge(profile, EdgeType::References, receipt);
+            .add_edge(profile, EdgeType::References, receipt, None);
         store_two
             .causal_graph
-            .add_edge(record, EdgeType::References, receipt);
+            .add_edge(record, EdgeType::References, receipt, None);
         store_two
             .causal_graph
-            .add_edge(decision_b, EdgeType::Authorizes, receipt);
+            .add_edge(decision_b, EdgeType::Authorizes, receipt, None);
 
         let result_one = trace_action(&store_one, action);
         let result_two = trace_action(&store_two, action);
