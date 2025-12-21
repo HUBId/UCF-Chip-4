@@ -633,13 +633,12 @@ impl<'a> PvgsPlanner<'a> {
             vec![ReasonCodes::GV_KEY_EPOCH_ROTATED.to_string()],
         )?;
 
-        Ok(
-            self.store
-                .key_epoch_history
-                .current()
-                .cloned()
-                .unwrap_or(epoch),
-        )
+        Ok(self
+            .store
+            .key_epoch_history
+            .current()
+            .cloned()
+            .unwrap_or(epoch))
     }
 }
 
