@@ -245,4 +245,22 @@ mod tests {
         assert_eq!(evicted, vec![first]);
         assert_eq!(store.latest(), Some(&second));
     }
+
+    #[test]
+    fn pev_store_zero_limit_evicts_every_insert() {
+        let mut store = PevStore::with_limits(StoreLimits {
+            max_pevs: 0,
+            ..StoreLimits::default()
+        });
+
+        let first = pev([1u8; 32], Some(1));
+        let evicted_first = store.push(first.clone()).expect("first push");
+        assert_eq!(evicted_first, vec![first]);
+        assert!(store.latest().is_none());
+
+        let second = pev([2u8; 32], Some(2));
+        let evicted_second = store.push(second.clone()).expect("second push");
+        assert_eq!(evicted_second, vec![second]);
+        assert!(store.latest().is_none());
+    }
 }

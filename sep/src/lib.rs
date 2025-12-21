@@ -449,6 +449,37 @@ mod tests {
     }
 
     #[test]
+    fn sep_log_overflow_adds_integrity_failure_reason() {
+        let mut log = SepLog::new(StoreLimits {
+            max_sep_events: 1,
+            ..Default::default()
+        });
+
+        log.append_event(
+            "overflow".to_string(),
+            SepEventType::EvDecision,
+            [1u8; 32],
+            vec!["RC.TEST.ONE".to_string()],
+        )
+        .unwrap();
+
+        let err = log
+            .append_event(
+                "overflow".to_string(),
+                SepEventType::EvDecision,
+                [2u8; 32],
+                Vec::new(),
+            )
+            .unwrap_err();
+
+        assert_eq!(err, SepError::Overflow);
+        let last = log.events.last().expect("overflow event");
+        assert!(last
+            .reason_codes
+            .contains(&ReasonCodes::RE_INTEGRITY_FAIL.to_string()));
+    }
+
+    #[test]
     fn causal_graph_prunes_edges_and_logs_sep_event() {
         let mut graph = CausalGraph::with_limits(StoreLimits {
             max_graph_edges_per_node: 1,
@@ -500,5 +531,48 @@ mod tests {
             })
             .count();
         assert!(trimmed_events >= 2);
+    }
+
+    #[test]
+    fn causal_graph_trimming_is_deterministic() {
+        fn build_graph() -> (CausalGraph, SepLog) {
+            let mut graph = CausalGraph::with_limits(StoreLimits {
+                max_graph_edges_per_node: 1,
+                ..Default::default()
+            });
+            let mut sep_log = SepLog::default();
+
+            let node_a = [1u8; 32];
+            let node_b = [2u8; 32];
+            let node_c = [3u8; 32];
+
+            graph.add_edge(
+                node_a,
+                EdgeType::References,
+                node_b,
+                Some((&mut sep_log, "graph-determinism")),
+            );
+            graph.add_edge(
+                node_a,
+                EdgeType::References,
+                node_c,
+                Some((&mut sep_log, "graph-determinism")),
+            );
+
+            (graph, sep_log)
+        }
+
+        let (graph_one, log_one) = build_graph();
+        let (graph_two, log_two) = build_graph();
+
+        assert_eq!(graph_one.adj, graph_two.adj);
+        assert_eq!(graph_one.rev, graph_two.rev);
+        assert_eq!(log_one.events.len(), log_two.events.len());
+        for (first, second) in log_one.events.iter().zip(log_two.events.iter()) {
+            assert_eq!(first.event_digest, second.event_digest);
+            assert!(first
+                .reason_codes
+                .contains(&ReasonCodes::GV_GRAPH_TRIMMED.to_string()));
+        }
     }
 }
