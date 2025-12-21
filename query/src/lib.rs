@@ -194,7 +194,7 @@ pub fn snapshot(store: &PvgsStore, session_id: Option<&str>) -> PvgsSnapshot {
         cbv.cbv_digest
             .as_deref()
             .and_then(digest_from_bytes)
-            .unwrap_or_else(|| compute_cbv_digest(&cbv))
+            .unwrap_or_else(|| compute_cbv_digest(cbv))
     });
 
     let mut pending_replay_ids: Vec<_> = match session_id {
