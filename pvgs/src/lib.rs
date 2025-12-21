@@ -21,7 +21,9 @@ use replay_plan::{
     build_replay_plan, ref_from_digest, replay_trigger_reasons, should_generate_replay,
     BuildReplayPlanArgs, ConsistencyClass, ConsistencyCounts, ReplayPlanStore, ReplaySignals,
 };
-use sep::{CausalGraph, EdgeType, FrameEventKind, NodeKey, SepError, SepEventType, SepLog};
+use sep::{
+    CausalGraph, EdgeType, FrameEventKind, NodeKey, SepError, SepEventType, SepLog, SessionSeal,
+};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,6 +74,41 @@ pub enum RequiredCheck {
     BindingOk,
     TightenOnly,
     IntegrityOk,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CriticalTrigger {
+    SepOverflow,
+    IntegrityFail,
+    ReplayMismatch,
+    UnauthorizedPath,
+}
+
+fn critical_trigger_reason_code(trig: CriticalTrigger) -> String {
+    match trig {
+        CriticalTrigger::ReplayMismatch => protocol::ReasonCodes::RE_REPLAY_MISMATCH.to_string(),
+        CriticalTrigger::UnauthorizedPath => {
+            protocol::ReasonCodes::RX_REQ_UNAUTHORIZED_PATH.to_string()
+        }
+        CriticalTrigger::SepOverflow | CriticalTrigger::IntegrityFail => {
+            protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string()
+        }
+    }
+}
+
+fn critical_trigger_digest(session_id: &str, trig: CriticalTrigger) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(b"UCF:PVGS:CRITICAL_TRIGGER");
+    hasher.update(session_id.as_bytes());
+    hasher.update(match trig {
+        CriticalTrigger::SepOverflow => b"SEP_OVERFLOW".as_slice(),
+        CriticalTrigger::IntegrityFail => b"INTEGRITY_FAIL".as_slice(),
+        CriticalTrigger::ReplayMismatch => b"REPLAY_MISMATCH".as_slice(),
+        CriticalTrigger::UnauthorizedPath => b"UNAUTHORIZED_PATH".as_slice(),
+    });
+
+    *hasher.finalize().as_bytes()
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -440,6 +477,7 @@ pub struct PvgsStore {
     pub sep_log: SepLog,
     pub causal_graph: CausalGraph,
     pub receipt_gate_enabled: bool,
+    pub forensic_mode: bool,
     pub ruleset_state: RulesetState,
 }
 
@@ -483,6 +521,7 @@ impl PvgsStore {
             sep_log: SepLog::default(),
             causal_graph: CausalGraph::with_limits(limits),
             receipt_gate_enabled: false,
+            forensic_mode: false,
             ruleset_state: RulesetState::new(charter_version_digest, policy_version_digest),
         }
     }
@@ -642,6 +681,38 @@ impl PvgsStore {
             receipt,
             proof_receipt,
         }))
+    }
+
+    pub fn handle_critical_trigger(
+        &mut self,
+        session_id: &str,
+        trig: CriticalTrigger,
+    ) -> Result<SessionSeal, SepError> {
+        if self.limits.max_sep_events > 0 {
+            self.forensic_mode = true;
+        }
+
+        let trigger_reason = critical_trigger_reason_code(trig);
+        let trigger_digest = critical_trigger_digest(session_id, trig);
+
+        self.sep_log.append_event(
+            session_id.to_string(),
+            SepEventType::EvIncident,
+            trigger_digest,
+            vec![trigger_reason.clone()],
+        )?;
+
+        self.sep_log.append_event(
+            session_id.to_string(),
+            SepEventType::EvRecovery,
+            trigger_digest,
+            vec![
+                protocol::ReasonCodes::RX_ACTION_FORENSIC.to_string(),
+                trigger_reason,
+            ],
+        )?;
+
+        Ok(sep::seal(session_id, &self.sep_log))
     }
 
     fn log_ruleset_change(
@@ -4637,6 +4708,42 @@ mod tests {
             consistency_feedback_payload: None,
             macro_consistency_digest: consistency_digest,
         }
+    }
+
+    #[test]
+    fn critical_trigger_logs_incident_and_recovery() {
+        let mut store = base_store([7u8; 32]);
+
+        let seal = store
+            .handle_critical_trigger("session-crit", CriticalTrigger::IntegrityFail)
+            .expect("trigger handled");
+
+        assert!(store.forensic_mode);
+        assert_eq!(store.sep_log.events.len(), 2);
+
+        let incident = &store.sep_log.events[0];
+        assert_eq!(incident.event_type, SepEventType::EvIncident);
+        assert_eq!(
+            incident.reason_codes,
+            vec![ReasonCodes::RE_INTEGRITY_FAIL.to_string()]
+        );
+
+        let recovery = &store.sep_log.events[1];
+        assert_eq!(recovery.event_type, SepEventType::EvRecovery);
+        assert!(recovery
+            .reason_codes
+            .contains(&ReasonCodes::RX_ACTION_FORENSIC.to_string()));
+        assert!(recovery
+            .reason_codes
+            .contains(&ReasonCodes::RE_INTEGRITY_FAIL.to_string()));
+
+        let prefix: String = seal
+            .final_event_digest
+            .iter()
+            .take(4)
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        assert_eq!(seal.seal_id, format!("seal:session-crit:{prefix}"));
     }
 
     #[test]

@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SepEventType {
+    EvIncident,
     EvDecision,
     EvRecoveryGov,
+    EvRecovery,
     EvPevUpdate,
     EvKeyEpoch,
     EvToolOnboarding,
@@ -34,8 +36,10 @@ pub enum SepEventType {
 impl SepEventType {
     fn as_str(&self) -> &'static str {
         match self {
+            SepEventType::EvIncident => "EV_INCIDENT",
             SepEventType::EvDecision => "EV_DECISION",
             SepEventType::EvRecoveryGov => "EV_RECOVERY_GOV",
+            SepEventType::EvRecovery => "EV_RECOVERY",
             SepEventType::EvPevUpdate => "EV_PEV_UPDATE",
             SepEventType::EvKeyEpoch => "EV_KEY_EPOCH",
             SepEventType::EvToolOnboarding => "EV_TOOL_ONBOARDING",
@@ -339,6 +343,7 @@ impl CausalGraph {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSeal {
+    pub seal_id: String,
     pub session_id: String,
     pub final_event_digest: [u8; 32],
     pub created_at_ms: u64,
@@ -359,7 +364,15 @@ pub fn seal(session_id: &str, log: &SepLog) -> SessionSeal {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
+    let digest_prefix: String = final_event_digest
+        .iter()
+        .take(4)
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    let seal_id = format!("seal:{session_id}:{digest_prefix}");
+
     SessionSeal {
+        seal_id,
         session_id: session_id.to_string(),
         final_event_digest,
         created_at_ms,
