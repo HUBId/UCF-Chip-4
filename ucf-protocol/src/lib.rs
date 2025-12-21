@@ -339,6 +339,7 @@ pub mod ucf {
             pub const RE_INTEGRITY_DEGRADED: &'static str = "RC.RE.INTEGRITY.DEGRADED";
             pub const RE_INTEGRITY_FAIL: &'static str = "RC.RE.INTEGRITY.FAIL";
             pub const GE_EXEC_DISPATCH_BLOCKED: &'static str = "RC.GE.EXEC.DISPATCH_BLOCKED";
+            pub const RX_ACTION_FORENSIC: &'static str = "RC.RX.ACTION.FORENSIC";
             pub const PB_DENY_CHARTER_SCOPE: &'static str = "RC.PB.DENY.CHARTER_SCOPE";
             pub const PB_DENY_INTEGRITY_REQUIRED: &'static str = "RC.PB.DENY.INTEGRITY_REQUIRED";
             pub const GE_GRANT_MISSING: &'static str = "RC.GE.GRANT.MISSING";
@@ -382,6 +383,7 @@ pub mod ucf {
             pub const RE_REPLAY_INVALID_EMBEDDED_ACTION: &'static str =
                 "RC.RE.REPLAY.INVALID_EMBEDDED_ACTION";
             pub const RE_INTEGRITY_OK: &'static str = "RC.RE.INTEGRITY.OK";
+            pub const RX_REQ_UNAUTHORIZED_PATH: &'static str = "RC.RX.REQ.UNAUTHORIZED_PATH";
             pub const CD_DLP_EXPORT_BLOCKED: &'static str = "RC.CD.DLP.EXPORT_BLOCKED";
             pub const CD_DLP_SECRET_PATTERN: &'static str = "RC.CD.DLP.SECRET_PATTERN";
         }
