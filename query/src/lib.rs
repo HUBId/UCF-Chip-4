@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use cbv::CharacterBaselineVector;
+use cbv::{
+    compute_cbv_digest, CbvStore, CharacterBaselineVector, MacroMilestone, MacroMilestoneState,
+};
 use dlp_store::DlpDecisionStore;
 use milestones::{MesoMilestone, MicroMilestone};
 use pev::{pev_digest, PolicyEcologyVector};
@@ -10,8 +12,8 @@ use std::collections::{BTreeSet, VecDeque};
 use std::convert::TryFrom;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{
-    DlpDecisionForm, ExperienceRecord, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes,
-    ReplayPlan,
+    ConsistencyFeedback, DlpDecisionForm, ExperienceRecord, PVGSKeyEpoch, PVGSReceipt,
+    ProofReceipt, ReasonCodes, ReplayPlan,
 };
 use wire::{AuthContext, Envelope};
 
@@ -79,6 +81,23 @@ pub struct ExportAudit {
     pub ruleset_digest: Option<[u8; 32]>,
     pub policy_decision_digest: Option<[u8; 32]>,
 }
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroStatusView {
+    pub macro_id: String,
+    pub macro_digest: [u8; 32],
+    pub state: String,
+    pub meso_digests: Vec<[u8; 32]>,
+    pub trait_update_names: Vec<String>,
+    pub consistency_digest: Option<[u8; 32]>,
+    pub proof_receipt_digest: Option<[u8; 32]>,
+    pub cbv_epoch_after: Option<u64>,
+    pub cbv_digest_after: Option<[u8; 32]>,
+}
+
+const MAX_MACRO_VECTOR_ITEMS: usize = 64;
+const MAX_CBV_SCAN: usize = 32;
 
 pub trait QueryInspector {
     fn fetch(&self, request: QueryRequest) -> Result<QueryResult, QueryError>;
@@ -186,6 +205,55 @@ pub fn list_ruleset_changes(log: &SepLog, session_id: Option<&str>) -> Vec<[u8; 
         .collect()
 }
 
+/// List proposed macro milestones in deterministic order.
+pub fn list_proposed_macros(store: &PvgsStore) -> Vec<MacroStatusView> {
+    let mut macros: Vec<_> = store
+        .macro_milestones
+        .list_proposed()
+        .into_iter()
+        .map(|milestone| macro_status_from(&milestone, &store.cbv_store, false))
+        .collect();
+
+    macros.sort_by(|a, b| a.macro_id.cmp(&b.macro_id));
+    macros
+}
+
+/// List finalized macro milestones in deterministic order.
+pub fn list_finalized_macros(store: &PvgsStore) -> Vec<MacroStatusView> {
+    let mut macros: Vec<_> = store
+        .macro_milestones
+        .list_finalized()
+        .into_iter()
+        .map(|milestone| macro_status_from(&milestone, &store.cbv_store, true))
+        .collect();
+
+    macros.sort_by(|a, b| a.macro_id.cmp(&b.macro_id));
+    macros
+}
+
+/// Retrieve the latest known status for a macro id.
+pub fn get_macro_status(store: &PvgsStore, macro_id: &str) -> Option<MacroStatusView> {
+    if let Some(macro_milestone) = store.macro_milestones.get_proposed(macro_id) {
+        return Some(macro_status_from(macro_milestone, &store.cbv_store, false));
+    }
+
+    store
+        .macro_milestones
+        .get_finalized(macro_id)
+        .map(|macro_milestone| macro_status_from(macro_milestone, &store.cbv_store, true))
+}
+
+/// Retrieve the stored consistency feedback for a finalized macro if available.
+pub fn get_consistency_for_macro(store: &PvgsStore, macro_id: &str) -> Option<ConsistencyFeedback> {
+    let digest = store
+        .macro_milestones
+        .get_finalized(macro_id)
+        .and_then(|macro_milestone| macro_milestone.consistency_digest.as_deref())
+        .and_then(digest_from_bytes)?;
+
+    store.consistency_store.get(digest).cloned()
+}
+
 pub fn get_pending_replay_plans(store: &PvgsStore, session_id: &str) -> Vec<ReplayPlan> {
     let mut plans: Vec<_> = store
         .replay_plans
@@ -236,6 +304,100 @@ pub fn list_signal_frames(log: &SepLog, session_id: &str) -> Vec<[u8; 32]> {
         })
         .map(|event| event.object_digest)
         .collect()
+}
+
+fn macro_status_from(
+    macro_milestone: &MacroMilestone,
+    cbv_store: &CbvStore,
+    include_cbv: bool,
+) -> MacroStatusView {
+    let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap_or([0u8; 32]);
+
+    let mut meso_digests: Vec<[u8; 32]> = macro_milestone
+        .meso_refs
+        .iter()
+        .filter_map(digest_from_ref)
+        .collect();
+    meso_digests.sort();
+    meso_digests.dedup();
+    meso_digests.truncate(MAX_MACRO_VECTOR_ITEMS);
+
+    let mut trait_update_names: Vec<String> = macro_milestone
+        .trait_updates
+        .iter()
+        .map(|update| update.trait_name.clone())
+        .collect();
+    trait_update_names.sort();
+    trait_update_names.dedup();
+    trait_update_names.truncate(MAX_MACRO_VECTOR_ITEMS);
+
+    let (cbv_epoch_after, cbv_digest_after) = if include_cbv {
+        cbv_link_for_macro(cbv_store, macro_digest)
+    } else {
+        (None, None)
+    };
+
+    let state = match MacroMilestoneState::try_from(macro_milestone.state)
+        .unwrap_or(MacroMilestoneState::Unknown)
+    {
+        MacroMilestoneState::Finalized => "FINALIZED".to_string(),
+        _ => "PROPOSED".to_string(),
+    };
+
+    MacroStatusView {
+        macro_id: macro_milestone.macro_id.clone(),
+        macro_digest,
+        state,
+        meso_digests,
+        trait_update_names,
+        consistency_digest: macro_milestone
+            .consistency_digest
+            .as_deref()
+            .and_then(digest_from_bytes),
+        proof_receipt_digest: macro_milestone
+            .proof_receipt_ref
+            .as_ref()
+            .and_then(digest_from_ref),
+        cbv_epoch_after,
+        cbv_digest_after,
+    }
+}
+
+fn cbv_link_for_macro(
+    cbv_store: &CbvStore,
+    macro_digest: [u8; 32],
+) -> (Option<u64>, Option<[u8; 32]>) {
+    let mut epoch_after = None;
+    let mut cbv_digest_after = None;
+
+    for cbv in cbv_store.list_latest(MAX_CBV_SCAN).into_iter().rev() {
+        let references_macro = cbv
+            .source_milestone_refs
+            .iter()
+            .any(|reference| macro_ref_matches(reference, macro_digest));
+
+        if references_macro {
+            epoch_after = Some(cbv.cbv_epoch);
+            cbv_digest_after = cbv
+                .cbv_digest
+                .as_deref()
+                .and_then(digest_from_bytes)
+                .or_else(|| Some(compute_cbv_digest(&cbv)));
+            break;
+        }
+    }
+
+    (epoch_after, cbv_digest_after)
+}
+
+fn macro_ref_matches(reference: &ucf_protocol::ucf::v1::Ref, macro_digest: [u8; 32]) -> bool {
+    (reference
+        .id
+        .split_once(':')
+        .and_then(|(_, value)| hex::decode(value).ok())
+        .and_then(|bytes| digest_from_bytes(&bytes))
+        == Some(macro_digest))
+        || digest_from_labeled_ref(reference, "macro") == Some(macro_digest)
 }
 
 const MAX_TRACE_NODES: usize = 256;
@@ -620,8 +782,9 @@ mod tests {
     use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
     use ucf_protocol::ucf::v1::{
-        Digest32, DlpDecision, GovernanceFrame, MetabolicFrame, ReceiptStatus, RecordType, Ref,
-        ReplayFidelity, ReplayTargetKind,
+        ConsistencyFeedback, Digest32, DlpDecision, GovernanceFrame, MacroMilestone,
+        MacroMilestoneState, MagnitudeClass, MetabolicFrame, ReceiptStatus, RecordType, Ref,
+        ReplayFidelity, ReplayTargetKind, TraitDirection, TraitUpdate,
     };
     use vrf::VrfEngine;
 
@@ -712,6 +875,27 @@ mod tests {
             proof_receipt_digest: Digest32([0u8; 32]),
             proof_attestation_key_id: String::new(),
             proof_attestation_sig: Vec::new(),
+        }
+    }
+
+    fn macro_proposal(id: &str, digest: [u8; 32]) -> MacroMilestone {
+        MacroMilestone {
+            macro_id: id.to_string(),
+            macro_digest: digest.to_vec(),
+            state: MacroMilestoneState::Proposed as i32,
+            trait_updates: vec![TraitUpdate {
+                trait_name: "baseline_caution".to_string(),
+                direction: TraitDirection::IncreaseStrictness as i32,
+                magnitude_class: MagnitudeClass::Low as i32,
+            }],
+            meso_refs: vec![Ref {
+                id: hex::encode(digest),
+            }],
+            consistency_class: String::new(),
+            identity_anchor_flag: false,
+            proof_receipt_ref: None,
+            consistency_digest: None,
+            consistency_feedback_ref: None,
         }
     }
 
@@ -853,6 +1037,93 @@ mod tests {
 
         let filtered = list_ruleset_changes(&log, Some("session-b"));
         assert_eq!(filtered, vec![digest_two]);
+    }
+
+    #[test]
+    fn proposed_macro_list_includes_entries() {
+        let mut store = minimal_store();
+        let proposal = macro_proposal("macro-alpha", [1u8; 32]);
+        store
+            .macro_milestones
+            .insert_proposal(proposal)
+            .expect("proposal stored");
+
+        let proposed = list_proposed_macros(&store);
+        assert_eq!(proposed.len(), 1);
+        assert_eq!(proposed[0].macro_id, "macro-alpha");
+        assert_eq!(proposed[0].macro_digest, [1u8; 32]);
+        assert!(list_finalized_macros(&store).is_empty());
+    }
+
+    #[test]
+    fn macro_lists_reflect_finalization_and_cbv_linkage() {
+        let (mut store, _, _) = store_with_epochs();
+        let keystore = KeyStore::new_dev_keystore(3);
+        let vrf_engine = VrfEngine::new_dev(3);
+        let proposal = macro_proposal("macro-high", [2u8; 32]);
+
+        store
+            .macro_milestones
+            .insert_proposal(proposal)
+            .expect("proposal stored");
+
+        let feedback = ConsistencyFeedback {
+            cf_digest: Some([9u8; 32].to_vec()),
+            consistency_class: "CONSISTENCY_HIGH".to_string(),
+            flags: Vec::new(),
+            proof_receipt_ref: None,
+        };
+        let consistency_digest = store
+            .consistency_store
+            .insert(feedback)
+            .expect("feedback stored");
+
+        let receipt = store
+            .finalize_macro("macro-high", consistency_digest, &keystore, &vrf_engine)
+            .expect("macro finalized")
+            .expect("finalization receipt");
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+
+        assert!(list_proposed_macros(&store).is_empty());
+
+        let finalized = list_finalized_macros(&store);
+        assert_eq!(finalized.len(), 1);
+        let status = &finalized[0];
+        assert_eq!(status.macro_id, "macro-high");
+        assert_eq!(status.state, "FINALIZED");
+        assert_eq!(status.consistency_digest, Some(consistency_digest));
+        assert!(status.cbv_epoch_after.is_some());
+        assert!(status.cbv_digest_after.is_some());
+
+        let stored = get_consistency_for_macro(&store, "macro-high").expect("consistency");
+        assert_eq!(stored.consistency_class, "CONSISTENCY_HIGH");
+
+        let status = get_macro_status(&store, "macro-high").expect("macro status");
+        assert!(status.cbv_epoch_after.is_some());
+        assert!(status.cbv_digest_after.is_some());
+    }
+
+    #[test]
+    fn macro_lists_are_sorted_by_macro_id() {
+        let mut store = minimal_store();
+        let later = macro_proposal("macro-z", [3u8; 32]);
+        let earlier = macro_proposal("macro-a", [4u8; 32]);
+
+        store
+            .macro_milestones
+            .insert_proposal(later)
+            .expect("later stored");
+        store
+            .macro_milestones
+            .insert_proposal(earlier)
+            .expect("earlier stored");
+
+        let ids: Vec<_> = list_proposed_macros(&store)
+            .into_iter()
+            .map(|entry| entry.macro_id)
+            .collect();
+
+        assert_eq!(ids, vec!["macro-a".to_string(), "macro-z".to_string()]);
     }
 
     #[test]
