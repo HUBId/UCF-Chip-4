@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hasher;
+use limits::DEFAULT_LIMITS;
 use log::warn;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -174,7 +175,7 @@ pub enum EdgeType {
 }
 
 /// Default maximum number of edges stored per node.
-pub const MAX_EDGES_PER_NODE: usize = 128;
+pub const MAX_EDGES_PER_NODE: usize = DEFAULT_LIMITS.max_causal_edges_per_node;
 
 /// In-memory causal graph index with forward and reverse adjacency.
 #[derive(Debug, Clone, Default)]

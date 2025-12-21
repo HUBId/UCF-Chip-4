@@ -455,6 +455,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
 
 [[package]]
+name = "limits"
+version = "0.1.0"
+
+[[package]]
 name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -566,6 +570,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "keys",
+ "limits",
  "milestones",
  "pev",
  "prost",
@@ -684,6 +689,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "hex",
+ "limits",
  "prost",
  "serde",
  "thiserror",
@@ -724,6 +730,7 @@ name = "sep"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "limits",
  "log",
  "serde",
  "serde_yaml",

@@ -9,6 +9,7 @@ use consistency::{validate_feedback, ConsistencyStore};
 use dlp_store::DlpDecisionStore;
 use ed25519_dalek::Signer;
 use keys::{verify_key_epoch_signature, KeyEpochHistory, KeyStore};
+use limits::DEFAULT_LIMITS;
 use milestones::{
     compute_meso_digest, MacroDeriver, MesoDeriver, MesoMilestone, MesoMilestoneStore,
     MicroMilestoneStore,
@@ -37,8 +38,8 @@ use vrf::VrfEngine;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-const CONSISTENCY_SIGNAL_WINDOW: usize = 8;
-const CONSISTENCY_HISTORY_MAX: usize = 256;
+const CONSISTENCY_SIGNAL_WINDOW: usize = DEFAULT_LIMITS.consistency_signal_window;
+const CONSISTENCY_HISTORY_MAX: usize = DEFAULT_LIMITS.consistency_history_max;
 
 /// Commit type supported by PVGS.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

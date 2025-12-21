@@ -10,6 +10,7 @@ serde = { workspace = true, optional = true, features = ["derive"] }
 hex = "0.4"
 ucf-protocol = { path = "../ucf-protocol" }
 prost = { workspace = true }
+limits = { workspace = true }
 
 [features]
 default = []
