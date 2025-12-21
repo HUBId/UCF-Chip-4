@@ -450,9 +450,10 @@ mod tests {
 
     #[test]
     fn causal_graph_prunes_edges_and_logs_sep_event() {
-        let mut limits = StoreLimits::default();
-        limits.max_graph_edges_per_node = 1;
-        let mut graph = CausalGraph::with_limits(limits);
+        let mut graph = CausalGraph::with_limits(StoreLimits {
+            max_graph_edges_per_node: 1,
+            ..Default::default()
+        });
         let mut sep_log = SepLog::default();
 
         let node_a = [1u8; 32];
