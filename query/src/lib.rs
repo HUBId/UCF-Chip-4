@@ -1023,6 +1023,8 @@ mod tests {
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
         };
 
         let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -1132,6 +1134,8 @@ mod tests {
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
         };
 
         let (receipt, _) = verify_and_commit(req, store, keystore, vrf_engine);
