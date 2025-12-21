@@ -24,6 +24,7 @@ hex = "0.4"
 milestones = { path = "../milestones" }
 consistency = { path = "../crates/consistency" }
 limits = { workspace = true }
+recovery = { path = "../crates/recovery" }
 
 [features]
 default = []

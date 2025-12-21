@@ -17,6 +17,7 @@ use milestones::{
 use pev::{pev_digest as extract_pev_digest, PevStore, PolicyEcologyVector};
 use prost::Message;
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
+use recovery::{RecoveryCase, RecoveryCheck, RecoveryState, RecoveryStore, RecoveryStoreError};
 use replay_plan::{
     build_replay_plan, ref_from_digest, replay_trigger_reasons, should_generate_replay,
     BuildReplayPlanArgs, ConsistencyClass, ConsistencyCounts, ReplayPlanStore, ReplaySignals,
@@ -58,6 +59,9 @@ pub enum CommitType {
     ConsistencyFeedbackAppend,
     CharterUpdate,
     ToolRegistryUpdate,
+    RecoveryCaseCreate,
+    RecoveryCaseAdvance,
+    RecoveryApproval,
     RecoveryUpdate,
     PevUpdate,
     CbvUpdate,
@@ -121,6 +125,32 @@ impl PvgsConfig {
 impl Default for PvgsConfig {
     fn default() -> Self {
         Self::beta()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlockPermit {
+    pub session_id: String,
+    pub permit_digest: [u8; 32],
+    pub issued_at_ms: u64,
+    pub ruleset_digest: [u8; 32],
+}
+
+impl UnlockPermit {
+    pub fn new(session_id: String, issued_at_ms: u64, ruleset_digest: [u8; 32]) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update(b"UCF:PVGS:UNLOCK_PERMIT");
+        hasher.update(session_id.as_bytes());
+        hasher.update(&issued_at_ms.to_le_bytes());
+        hasher.update(&ruleset_digest);
+
+        let permit_digest = *hasher.finalize().as_bytes();
+        Self {
+            session_id,
+            permit_digest,
+            issued_at_ms,
+            ruleset_digest,
+        }
     }
 }
 
@@ -272,6 +302,8 @@ pub struct PvgsCommitRequest {
     pub pev: Option<PolicyEcologyVector>,
     pub consistency_feedback_payload: Option<Vec<u8>>,
     pub macro_consistency_digest: Option<[u8; 32]>,
+    pub recovery_case: Option<RecoveryCase>,
+    pub unlock_permit: Option<UnlockPermit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -515,6 +547,8 @@ pub struct PvgsStore {
     pub macro_milestones: MacroMilestoneStore,
     pub replay_plans: ReplayPlanStore,
     pub committed_payload_digests: HashSet<[u8; 32]>,
+    pub recovery_store: RecoveryStore,
+    pub unlock_permits: HashMap<String, UnlockPermit>,
     pub sep_log: SepLog,
     pub causal_graph: CausalGraph,
     pub receipt_gate_enabled: bool,
@@ -618,6 +652,8 @@ impl<'a> PvgsPlanner<'a> {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (receipt, _) = verify_and_commit(req, self.store, self.keystore, self.vrf_engine);
@@ -720,6 +756,8 @@ impl PvgsStore {
             macro_milestones: MacroMilestoneStore::default(),
             replay_plans: ReplayPlanStore::default(),
             committed_payload_digests: HashSet::new(),
+            recovery_store: RecoveryStore::default(),
+            unlock_permits: HashMap::new(),
             sep_log: SepLog::default(),
             causal_graph: CausalGraph::with_limits(limits),
             receipt_gate_enabled: false,
@@ -914,7 +952,35 @@ impl PvgsStore {
             ],
         )?;
 
-        Ok(sep::seal(session_id, &self.sep_log))
+        let seal = sep::seal(session_id, &self.sep_log);
+        self.auto_create_recovery_case(session_id, &seal);
+
+        Ok(seal)
+    }
+
+    fn auto_create_recovery_case(&mut self, session_id: &str, seal: &SessionSeal) {
+        let prefix: String = seal
+            .final_event_digest
+            .iter()
+            .take(4)
+            .map(|b| format!("{:02x}", b))
+            .collect();
+
+        let recovery_id = format!("recovery:{session_id}:{prefix}");
+        if self.recovery_store.get(&recovery_id).is_some() {
+            return;
+        }
+
+        let case = RecoveryCase {
+            recovery_id,
+            session_id: session_id.to_string(),
+            state: RecoveryState::R0Captured,
+            required_checks: vec![RecoveryCheck::IntegrityOk, RecoveryCheck::ValidationPassed],
+            completed_checks: Vec::new(),
+            trigger_refs: vec![seal.seal_id.clone()],
+        };
+
+        let _ = self.recovery_store.insert_new(case);
     }
 
     fn record_sep_overflow_incident(&mut self, session_id: &str) -> Result<(), SepError> {
@@ -1406,6 +1472,8 @@ impl PvgsStore {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (receipt, _proof) = verify_meso_milestone_append(req, self, keystore, vrf_engine);
@@ -1461,6 +1529,8 @@ impl PvgsStore {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (proposal_receipt, _) =
@@ -1533,6 +1603,8 @@ impl PvgsStore {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: Some(consistency_digest),
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (receipt, _) =
@@ -1766,6 +1838,228 @@ fn compute_meso_verified_fields_digest(
     *hasher.finalize().as_bytes()
 }
 
+fn recovery_reason_for_error(err: RecoveryStoreError) -> String {
+    match err {
+        RecoveryStoreError::Duplicate | RecoveryStoreError::InvalidInitialState => {
+            protocol::ReasonCodes::GV_RECOVERY_INVALID_STATE.to_string()
+        }
+        RecoveryStoreError::InvalidRequiredChecks | RecoveryStoreError::NonMonotonicChecks => {
+            protocol::ReasonCodes::GV_RECOVERY_INVALID_CHECKS.to_string()
+        }
+        RecoveryStoreError::NotFound => protocol::ReasonCodes::GV_RECOVERY_UNKNOWN_CASE.to_string(),
+        RecoveryStoreError::InvalidStateTransition => {
+            protocol::ReasonCodes::GV_RECOVERY_INVALID_STATE.to_string()
+        }
+        RecoveryStoreError::SessionMismatch => {
+            protocol::ReasonCodes::GV_RECOVERY_INVALID_STATE.to_string()
+        }
+    }
+}
+
+fn verify_recovery_case_create(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let receipt_input = to_receipt_input(&req);
+    let mut reject_reason_codes = Vec::new();
+
+    let Some(case) = req.recovery_case.take() else {
+        reject_reason_codes.push(protocol::ReasonCodes::GV_RECOVERY_INVALID_STATE.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    };
+
+    if case.trigger_refs.is_empty() {
+        reject_reason_codes.push(protocol::ReasonCodes::GV_RECOVERY_INVALID_STATE.to_string());
+    }
+
+    if reject_reason_codes.is_empty() {
+        if let Err(err) = store.recovery_store.insert_new(case) {
+            reject_reason_codes.push(recovery_reason_for_error(err));
+        }
+    }
+
+    let status = if reject_reason_codes.is_empty() {
+        ReceiptStatus::Accepted
+    } else {
+        ReceiptStatus::Rejected
+    };
+
+    let event_reason_codes = if matches!(status, ReceiptStatus::Accepted) {
+        Some(vec![protocol::ReasonCodes::GV_RECOVERY_CREATED.to_string()])
+    } else {
+        None
+    };
+
+    finalize_receipt(FinalizeReceiptArgs {
+        req: &req,
+        receipt_input: &receipt_input,
+        status,
+        reject_reason_codes,
+        store,
+        keystore,
+        frame_kind: None,
+        event_object_digest: None,
+        event_reason_codes,
+    })
+}
+
+fn verify_recovery_case_advance(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let receipt_input = to_receipt_input(&req);
+    let mut reject_reason_codes = Vec::new();
+
+    let Some(case) = req.recovery_case.take() else {
+        reject_reason_codes.push(protocol::ReasonCodes::GV_RECOVERY_INVALID_STATE.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    };
+
+    if let Err(err) = store.recovery_store.update(case) {
+        reject_reason_codes.push(recovery_reason_for_error(err));
+    }
+
+    let status = if reject_reason_codes.is_empty() {
+        ReceiptStatus::Accepted
+    } else {
+        ReceiptStatus::Rejected
+    };
+
+    let event_reason_codes = if matches!(status, ReceiptStatus::Accepted) {
+        Some(vec![protocol::ReasonCodes::GV_RECOVERY_ADVANCED.to_string()])
+    } else {
+        None
+    };
+
+    finalize_receipt(FinalizeReceiptArgs {
+        req: &req,
+        receipt_input: &receipt_input,
+        status,
+        reject_reason_codes,
+        store,
+        keystore,
+        frame_kind: None,
+        event_object_digest: None,
+        event_reason_codes,
+    })
+}
+
+fn verify_recovery_approval(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let receipt_input = to_receipt_input(&req);
+    let mut reject_reason_codes = Vec::new();
+
+    let Some(mut permit_payload) = req.unlock_permit.take() else {
+        reject_reason_codes.push(protocol::ReasonCodes::GV_RECOVERY_INVALID_STATE.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    };
+
+    let Some(case) = store
+        .recovery_store
+        .get_active_for_session(&permit_payload.session_id)
+    else {
+        reject_reason_codes.push(protocol::ReasonCodes::GV_RECOVERY_UNKNOWN_CASE.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: None,
+            event_reason_codes: None,
+        });
+    };
+
+    if case.state < RecoveryState::R5Approved {
+        reject_reason_codes.push(protocol::ReasonCodes::GV_RECOVERY_INVALID_STATE.to_string());
+    }
+
+    if permit_payload.permit_digest == [0u8; 32] {
+        permit_payload = UnlockPermit::new(
+            permit_payload.session_id.clone(),
+            permit_payload.issued_at_ms,
+            store.ruleset_state.ruleset_digest,
+        );
+    } else {
+        permit_payload.ruleset_digest = store.ruleset_state.ruleset_digest;
+    }
+
+    let required_checks = vec![RecoveryCheck::IntegrityOk, RecoveryCheck::ValidationPassed];
+    let has_required_checks = required_checks
+        .iter()
+        .all(|chk| case.completed_checks.contains(chk));
+
+    if !has_required_checks {
+        reject_reason_codes.push(protocol::ReasonCodes::GV_RECOVERY_INVALID_CHECKS.to_string());
+    }
+
+    let status = if reject_reason_codes.is_empty() {
+        store
+            .unlock_permits
+            .insert(permit_payload.session_id.clone(), permit_payload.clone());
+        ReceiptStatus::Accepted
+    } else {
+        ReceiptStatus::Rejected
+    };
+
+    let event_reason_codes = if matches!(status, ReceiptStatus::Accepted) {
+        Some(vec![
+            protocol::ReasonCodes::GV_RECOVERY_UNLOCK_GRANTED.to_string()
+        ])
+    } else {
+        None
+    };
+
+    finalize_receipt(FinalizeReceiptArgs {
+        req: &req,
+        receipt_input: &receipt_input,
+        status,
+        reject_reason_codes,
+        store,
+        keystore,
+        frame_kind: None,
+        event_object_digest: None,
+        event_reason_codes,
+    })
+}
+
 fn event_type_for_commit(
     commit_type: CommitType,
     frame_kind: Option<FrameEventKind>,
@@ -1778,6 +2072,9 @@ fn event_type_for_commit(
         CommitType::ExperienceRecordAppend => SepEventType::EvIntent,
         CommitType::DlpDecisionAppend => SepEventType::EvDlpDecision,
         CommitType::ReplayPlanAppend => SepEventType::EvReplay,
+        CommitType::RecoveryCaseCreate => SepEventType::EvRecoveryGov,
+        CommitType::RecoveryCaseAdvance => SepEventType::EvRecoveryGov,
+        CommitType::RecoveryApproval => SepEventType::EvRecoveryGov,
         CommitType::ConsistencyFeedbackAppend => SepEventType::EvRecoveryGov,
         CommitType::MacroMilestonePropose => SepEventType::EvRecoveryGov,
         CommitType::MacroMilestoneFinalize => SepEventType::EvRecoveryGov,
@@ -2000,6 +2297,18 @@ pub fn verify_and_commit(
 
     if req.commit_type == CommitType::DlpDecisionAppend {
         return verify_dlp_decision_append(req, store, keystore);
+    }
+
+    if req.commit_type == CommitType::RecoveryCaseCreate {
+        return verify_recovery_case_create(req, store, keystore);
+    }
+
+    if req.commit_type == CommitType::RecoveryCaseAdvance {
+        return verify_recovery_case_advance(req, store, keystore);
+    }
+
+    if req.commit_type == CommitType::RecoveryApproval {
+        return verify_recovery_approval(req, store, keystore);
     }
 
     let receipt_input = to_receipt_input(&req);
@@ -4709,6 +5018,9 @@ impl From<CommitType> for protocol::CommitType {
             }
             CommitType::CharterUpdate => protocol::CommitType::CharterUpdate,
             CommitType::ToolRegistryUpdate => protocol::CommitType::ToolRegistryUpdate,
+            CommitType::RecoveryCaseCreate => protocol::CommitType::RecoveryCaseCreate,
+            CommitType::RecoveryCaseAdvance => protocol::CommitType::RecoveryCaseAdvance,
+            CommitType::RecoveryApproval => protocol::CommitType::RecoveryApproval,
             CommitType::RecoveryUpdate => protocol::CommitType::RecoveryUpdate,
             CommitType::PevUpdate => protocol::CommitType::PevUpdate,
             CommitType::CbvUpdate => protocol::CommitType::CbvUpdate,
@@ -4749,6 +5061,7 @@ impl From<&CommitBindings> for protocol::CommitBindings {
 
 #[cfg(test)]
 mod tests {
+    use super::UnlockPermit;
     use super::*;
     use milestones::{
         derive_micro_from_experience_window, ExperienceRange, MicroMilestone, MicroMilestoneState,
@@ -4756,6 +5069,7 @@ mod tests {
     };
     use protocol::ReasonCodes;
     use receipts::verify_pvgs_receipt_attestation;
+    use recovery::{RecoveryCase, RecoveryCheck, RecoveryState};
     use sep::{EdgeType, SepEventType};
     use ucf_protocol::ucf::v1::{
         ConsistencyFeedback, CoreFrame, GovernanceFrame, MacroMilestone, MacroMilestoneState,
@@ -4810,6 +5124,61 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+        }
+    }
+
+    fn recovery_case_for(
+        recovery_id: &str,
+        session_id: &str,
+        state: RecoveryState,
+        completed_checks: Vec<RecoveryCheck>,
+    ) -> RecoveryCase {
+        RecoveryCase {
+            recovery_id: recovery_id.to_string(),
+            session_id: session_id.to_string(),
+            state,
+            required_checks: vec![RecoveryCheck::IntegrityOk, RecoveryCheck::ValidationPassed],
+            completed_checks,
+            trigger_refs: vec!["trigger".to_string()],
+        }
+    }
+
+    fn recovery_request(
+        commit_type: CommitType,
+        recovery_case: Option<RecoveryCase>,
+        prev: [u8; 32],
+    ) -> PvgsCommitRequest {
+        PvgsCommitRequest {
+            commit_id: "recovery-commit".to_string(),
+            commit_type,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: prev,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: Vec::new(),
+            epoch_id: 1,
+            key_epoch: None,
+            experience_record_payload: None,
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case,
+            unlock_permit: None,
         }
     }
 
@@ -4856,6 +5225,8 @@ mod tests {
                 pev: None,
                 consistency_feedback_payload: None,
                 macro_consistency_digest: None,
+                recovery_case: None,
+                unlock_permit: None,
             },
             epoch,
         )
@@ -5011,6 +5382,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: consistency_digest,
+            recovery_case: None,
+            unlock_permit: None,
         }
     }
 
@@ -5048,6 +5421,150 @@ mod tests {
             .map(|b| format!("{:02x}", b))
             .collect();
         assert_eq!(seal.seal_id, format!("seal:session-crit:{prefix}"));
+
+        let recovery_case = store
+            .recovery_store
+            .get_active_for_session("session-crit")
+            .expect("recovery case created");
+        assert_eq!(recovery_case.state, RecoveryState::R0Captured);
+        assert_eq!(
+            recovery_case.recovery_id,
+            format!("recovery:session-crit:{prefix}")
+        );
+    }
+
+    #[test]
+    fn recovery_state_advances_sequentially() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let base_case = recovery_case_for(
+            "rec-1",
+            "session-crit",
+            RecoveryState::R0Captured,
+            Vec::new(),
+        );
+
+        let create_req = recovery_request(
+            CommitType::RecoveryCaseCreate,
+            Some(base_case.clone()),
+            store.current_head_record_digest,
+        );
+        let (create_receipt, _) = verify_and_commit(create_req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(create_receipt.status, ReceiptStatus::Accepted);
+
+        let mut jump_case = recovery_case_for(
+            "rec-1",
+            "session-crit",
+            RecoveryState::R2Validated,
+            Vec::new(),
+        );
+        jump_case.required_checks = base_case.required_checks.clone();
+
+        let bad_advance = recovery_request(
+            CommitType::RecoveryCaseAdvance,
+            Some(jump_case),
+            store.current_head_record_digest,
+        );
+        let (bad_receipt, _) = verify_and_commit(bad_advance, &mut store, &keystore, &vrf_engine);
+        assert_eq!(bad_receipt.status, ReceiptStatus::Rejected);
+
+        let mut r1_case = base_case.clone();
+        r1_case.state = RecoveryState::R1Triaged;
+        let good_advance = recovery_request(
+            CommitType::RecoveryCaseAdvance,
+            Some(r1_case),
+            store.current_head_record_digest,
+        );
+        let (advance_receipt, _) =
+            verify_and_commit(good_advance, &mut store, &keystore, &vrf_engine);
+        assert_eq!(advance_receipt.status, ReceiptStatus::Accepted);
+    }
+
+    #[test]
+    fn unlock_permit_requires_approved_state() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let base_case = recovery_case_for(
+            "rec-approve",
+            "session-crit",
+            RecoveryState::R0Captured,
+            Vec::new(),
+        );
+
+        let create_req = recovery_request(
+            CommitType::RecoveryCaseCreate,
+            Some(base_case.clone()),
+            store.current_head_record_digest,
+        );
+        let (create_receipt, _) = verify_and_commit(create_req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(create_receipt.status, ReceiptStatus::Accepted);
+
+        let mut early_permit = UnlockPermit::new(
+            "session-crit".to_string(),
+            now_ms(),
+            store.ruleset_state.ruleset_digest,
+        );
+        early_permit.permit_digest = [0u8; 32];
+
+        let mut early_unlock = recovery_request(
+            CommitType::RecoveryApproval,
+            None,
+            store.current_head_record_digest,
+        );
+        early_unlock.unlock_permit = Some(early_permit.clone());
+        let (early_receipt, _) =
+            verify_and_commit(early_unlock, &mut store, &keystore, &vrf_engine);
+        assert_eq!(early_receipt.status, ReceiptStatus::Rejected);
+
+        let mut completed = Vec::new();
+        let states = [
+            RecoveryState::R1Triaged,
+            RecoveryState::R2Validated,
+            RecoveryState::R3Mitigated,
+            RecoveryState::R4Remediated,
+            RecoveryState::R5Approved,
+        ];
+
+        for state in states {
+            if state >= RecoveryState::R2Validated {
+                completed.push(RecoveryCheck::IntegrityOk);
+            }
+            if state >= RecoveryState::R5Approved {
+                completed.push(RecoveryCheck::ValidationPassed);
+            }
+
+            let mut case =
+                recovery_case_for("rec-approve", "session-crit", state, completed.clone());
+            case.required_checks = base_case.required_checks.clone();
+
+            let req = recovery_request(
+                CommitType::RecoveryCaseAdvance,
+                Some(case),
+                store.current_head_record_digest,
+            );
+            let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+            assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        }
+
+        let mut approved_permit = UnlockPermit::new(
+            "session-crit".to_string(),
+            now_ms(),
+            store.ruleset_state.ruleset_digest,
+        );
+        approved_permit.permit_digest = [0u8; 32];
+        let mut unlock_req = recovery_request(
+            CommitType::RecoveryApproval,
+            None,
+            store.current_head_record_digest,
+        );
+        unlock_req.unlock_permit = Some(approved_permit.clone());
+        let (unlock_receipt, _) = verify_and_commit(unlock_req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(unlock_receipt.status, ReceiptStatus::Accepted);
+        assert!(store.unlock_permits.contains_key("session-crit"));
     }
 
     #[test]
@@ -5148,6 +5665,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: Some(feedback.encode_to_vec()),
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -5211,6 +5730,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -5462,6 +5983,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         }
     }
 
@@ -6242,6 +6765,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (receipt, proof) = verify_and_commit(backward_req, &mut store, &keystore, &vrf_engine);
@@ -6308,6 +6833,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (receipt, proof) = verify_and_commit(dup_req, &mut store, &keystore, &vrf_engine);
@@ -6350,6 +6877,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let keystore = KeyStore::new_dev_keystore(1);
@@ -6408,6 +6937,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -6466,6 +6997,8 @@ mod tests {
             pev: Some(pev.clone()),
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -6549,6 +7082,8 @@ mod tests {
             pev: Some(pev),
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (_, pev_proof) = verify_and_commit(pev_req, &mut store, &keystore, &vrf_engine);
@@ -6626,6 +7161,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);

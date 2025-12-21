@@ -7,6 +7,7 @@ use dlp_store::DlpDecisionStore;
 use milestones::{MesoMilestone, MicroMilestone};
 use pev::{pev_digest, PolicyEcologyVector};
 use pvgs::{compute_experience_record_digest, CompletenessStatus, PvgsCommitRequest, PvgsStore};
+use recovery::RecoveryCase;
 use sep::{EdgeType, NodeKey, SepEventInternal, SepEventType, SepLog};
 use std::collections::{BTreeSet, VecDeque};
 use std::convert::TryFrom;
@@ -163,6 +164,29 @@ pub fn get_latest_pev_digest(store: &PvgsStore) -> Option<[u8; 32]> {
 }
 
 /// List all known PEV version digests in insertion order.
+
+pub fn is_session_sealed(store: &PvgsStore, session_id: &str) -> bool {
+    store.forensic_mode
+        && store.sep_log.events.iter().any(|event| {
+            event.session_id == session_id && event.event_type == SepEventType::EvRecovery
+        })
+}
+
+pub fn has_unlock_permit(store: &PvgsStore, session_id: &str) -> bool {
+    store.unlock_permits.contains_key(session_id)
+}
+
+pub fn get_unlock_permit_digest(store: &PvgsStore, session_id: &str) -> Option<[u8; 32]> {
+    store
+        .unlock_permits
+        .get(session_id)
+        .map(|permit| permit.permit_digest)
+}
+
+pub fn get_recovery_case(store: &PvgsStore, session_id: &str) -> Option<RecoveryCase> {
+    store.recovery_store.get_active_for_session(session_id)
+}
+
 pub fn list_pev_versions(store: &PvgsStore) -> Vec<[u8; 32]> {
     store
         .pev_store
@@ -1431,6 +1455,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -1542,6 +1568,8 @@ mod tests {
             pev: None,
             consistency_feedback_payload: None,
             macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
         };
 
         let (receipt, _) = verify_and_commit(req, store, keystore, vrf_engine);
