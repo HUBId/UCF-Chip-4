@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 pub mod meso_deriver;
 pub use meso_deriver::{compute_meso_digest, MesoDeriver, MesoDeriverConfig};
 pub mod macro_deriver;
-pub use macro_deriver::{compute_macro_digest, MacroDeriver, MacroDeriverConfig};
+pub use macro_deriver::{
+    compute_macro_digest, compute_macro_finalization_digest, propose_macro_for_chunk, MacroDeriver,
+    MacroDeriverConfig,
+};
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, PartialEq, Eq, Message)]
