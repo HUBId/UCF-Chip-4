@@ -6954,7 +6954,8 @@ mod tests {
 
         let outcome = store
             .maybe_plan_replay("session-a", &keystore)
-            .expect("replay plan created");
+            .expect("replay plan created")
+            .expect("replay plan outcome");
 
         assert_eq!(store.replay_plans.plans.len(), 1);
         assert_eq!(outcome.plan.replay_id, "replay:session-a:20:1");
@@ -6967,7 +6968,7 @@ mod tests {
             .contains(&ReasonCodes::GV_REPLAY_PLANNED.to_string()));
 
         let duplicate = store.maybe_plan_replay("session-a", &keystore);
-        assert!(duplicate.is_none());
+        assert!(duplicate.expect("duplicate planning result").is_none());
         assert_eq!(store.replay_plans.plans.len(), 1);
     }
 
@@ -6995,7 +6996,8 @@ mod tests {
 
         let outcome = store
             .maybe_plan_replay("session-b", &keystore)
-            .expect("replay plan created");
+            .expect("replay plan created")
+            .expect("replay plan outcome");
 
         assert_eq!(outcome.plan.target_kind, ReplayTargetKind::Micro as i32);
         assert_eq!(outcome.plan.target_refs.len(), 2);
@@ -7022,7 +7024,8 @@ mod tests {
 
         let outcome = store
             .maybe_plan_replay("session-low", &keystore)
-            .expect("replay plan created");
+            .expect("replay plan created")
+            .expect("replay plan outcome");
 
         assert_eq!(
             outcome.plan.trigger_reason_codes,
@@ -7047,7 +7050,8 @@ mod tests {
 
         let outcome = store
             .maybe_plan_replay("session-med", &keystore)
-            .expect("replay plan created");
+            .expect("replay plan created")
+            .expect("replay plan outcome");
 
         assert_eq!(
             outcome.plan.trigger_reason_codes,
@@ -7065,7 +7069,10 @@ mod tests {
 
         track_consistency_feedback(&mut store, "session-high", [0xC1u8; 32], "CONSISTENCY_HIGH");
 
-        assert!(store.maybe_plan_replay("session-high", &keystore).is_none());
+        assert!(store
+            .maybe_plan_replay("session-high", &keystore)
+            .expect("replay planning result")
+            .is_none());
     }
 
     #[test]
@@ -7082,7 +7089,8 @@ mod tests {
 
         let outcome = store
             .maybe_plan_replay("session-pref", &keystore)
-            .expect("replay plan created");
+            .expect("replay plan created")
+            .expect("replay plan outcome");
 
         assert_eq!(outcome.plan.target_kind, ReplayTargetKind::Macro as i32);
         assert_eq!(outcome.plan.target_refs.len(), 1);
