@@ -6,7 +6,10 @@ use cbv::{
 use dlp_store::DlpDecisionStore;
 use milestones::{MesoMilestone, MicroMilestone};
 use pev::{pev_digest, PolicyEcologyVector};
-use pvgs::{compute_experience_record_digest, PvgsCommitRequest, PvgsStore};
+use pvgs::{
+    compute_experience_record_digest, CompletenessChecker, CompletenessStatus, PvgsCommitRequest,
+    PvgsStore,
+};
 use sep::{EdgeType, NodeKey, SepEventInternal, SepEventType, SepLog};
 use std::collections::{BTreeSet, VecDeque};
 use std::convert::TryFrom;
@@ -97,6 +100,21 @@ pub struct MacroStatusView {
     pub cbv_digest_after: Option<[u8; 32]>,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PvgsSnapshot {
+    pub head_experience_id: u64,
+    pub head_record_digest: [u8; 32],
+    pub ruleset_digest: Option<[u8; 32]>,
+    pub prev_ruleset_digest: Option<[u8; 32]>,
+    pub latest_cbv_epoch: Option<u64>,
+    pub latest_cbv_digest: Option<[u8; 32]>,
+    pub latest_pev_digest: Option<[u8; 32]>,
+    pub pending_replay_ids: Vec<String>,
+    pub completeness_status: Option<String>,
+    pub last_seal_digest: Option<[u8; 32]>,
+}
+
 const MAX_MACRO_VECTOR_ITEMS: usize = 64;
 const MAX_CBV_SCAN: usize = 32;
 
@@ -165,6 +183,85 @@ pub fn get_current_tool_registry_digest(store: &PvgsStore) -> Option<[u8; 32]> {
 /// List all committed tool registry digests in insertion order.
 pub fn list_tool_registry_digests(store: &PvgsStore) -> Vec<[u8; 32]> {
     store.tool_registry_state.history.clone()
+}
+
+/// Build a deterministic snapshot of key PVGS state for operational inspection.
+pub fn snapshot(store: &PvgsStore, session_id: Option<&str>) -> PvgsSnapshot {
+    let latest_cbv = store.get_latest_cbv();
+
+    let latest_cbv_epoch = latest_cbv.as_ref().map(|cbv| cbv.cbv_epoch);
+    let latest_cbv_digest = latest_cbv.as_ref().map(|cbv| {
+        cbv.cbv_digest
+            .as_deref()
+            .and_then(digest_from_bytes)
+            .unwrap_or_else(|| compute_cbv_digest(&cbv))
+    });
+
+    let mut pending_replay_ids: Vec<_> = match session_id {
+        Some(session) => get_pending_replay_plans(store, session),
+        None => store.replay_plans.list_pending(),
+    }
+    .into_iter()
+    .map(|plan| plan.replay_id)
+    .collect();
+
+    pending_replay_ids.sort();
+    pending_replay_ids.dedup();
+    pending_replay_ids.truncate(128);
+
+    let completeness_status = session_id.and_then(|session| {
+        let action_digests: Vec<_> = store
+            .sep_log
+            .events
+            .iter()
+            .filter(|event| event.session_id == session)
+            .filter(|event| matches!(event.event_type, SepEventType::EvDecision))
+            .map(|event| event.object_digest)
+            .collect();
+
+        if action_digests.is_empty() {
+            return None;
+        }
+
+        let mut sep_log = store.sep_log.clone();
+        let mut checker = CompletenessChecker::new(
+            &store.causal_graph,
+            &mut sep_log,
+            &store.dlp_store,
+            &store.replay_plans,
+            &store.experience_store.records,
+        );
+        let status = checker.check_actions(session, action_digests).status;
+
+        match status {
+            CompletenessStatus::Ok => Some("OK".to_string()),
+            CompletenessStatus::Degraded => Some("DEGRADED".to_string()),
+            CompletenessStatus::Fail => Some("FAIL".to_string()),
+        }
+    });
+
+    let last_seal_digest = session_id.and_then(|session| {
+        store
+            .sep_log
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.session_id == session)
+            .map(|event| event.event_digest)
+    });
+
+    PvgsSnapshot {
+        head_experience_id: store.experience_store.head_id,
+        head_record_digest: store.experience_store.head_record_digest,
+        ruleset_digest: get_current_ruleset_digest(store),
+        prev_ruleset_digest: get_previous_ruleset_digest(store),
+        latest_cbv_epoch,
+        latest_cbv_digest,
+        latest_pev_digest: get_latest_pev_digest(store),
+        pending_replay_ids,
+        completeness_status,
+        last_seal_digest,
+    }
 }
 
 fn macro_consistency_feedback(
