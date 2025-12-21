@@ -1,158 +1,232 @@
 #![forbid(unsafe_code)]
 
-use cbv::CharacterBaselineVector;
-use keys::{KeyEpochHistory, KeyStore};
-use pvgs::{
-    compute_verified_fields_digest, CommitBindings, CommitType, PvgsCommitRequest, RequiredCheck,
-    RulesetState,
-};
-use query::{QueryRequest, QueryResult};
-use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
-use sep::{SepEventInternal, SepEventType, SepLog};
-use ucf_protocol::ucf::v1::ReceiptStatus;
-use vrf::VrfEngine;
-use wire::AuthContext;
+use std::collections::HashSet;
+
+use clap::{Parser, Subcommand};
+use hex::encode;
+use pvgs::PvgsStore;
+use query::{snapshot, PvgsSnapshot};
+
+#[derive(Parser)]
+#[command(author, version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    #[command(name = "pvgs-dump")]
+    PvgsDump {
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
 
 fn main() {
-    let commit_request = PvgsCommitRequest {
-        commit_id: "boot-seed".into(),
-        commit_type: CommitType::ReceiptRequest,
-        bindings: CommitBindings {
-            action_digest: Some([1u8; 32]),
-            decision_digest: Some([2u8; 32]),
-            grant_id: Some("grant".into()),
-            charter_version_digest: "charter".into(),
-            policy_version_digest: "policy".into(),
-            prev_record_digest: [0u8; 32],
-            profile_digest: Some([0u8; 32]),
-            tool_profile_digest: None,
-            pev_digest: None,
-        },
-        required_receipt_kind: pvgs::RequiredReceiptKind::Read,
-        required_checks: vec![RequiredCheck::IntegrityOk],
-        payload_digests: vec![[3u8; 32]],
-        epoch_id: 0,
-        key_epoch: None,
-        experience_record_payload: None,
-        macro_milestone: None,
-        meso_milestone: None,
-        dlp_decision_payload: None,
-        tool_registry_container: None,
-        pev: None,
-        consistency_feedback_payload: None,
-        macro_consistency_digest: None,
-    };
+    let cli = Cli::parse();
 
-    let keystore = KeyStore::new_dev_keystore(0);
-    let vrf_engine = VrfEngine::new_dev(keystore.current_epoch());
-    let mut history = KeyEpochHistory::default();
-    let receipt_input = ReceiptInput {
-        commit_id: commit_request.commit_id.clone(),
-        commit_type: commit_request.commit_type.into(),
-        bindings: (&commit_request.bindings).into(),
-        required_checks: commit_request
-            .required_checks
-            .iter()
-            .copied()
-            .map(Into::into)
-            .collect(),
-        required_receipt_kind: commit_request.required_receipt_kind,
-        payload_digests: commit_request.payload_digests.clone(),
-        epoch_id: commit_request.epoch_id,
-    };
+    match cli.command {
+        Command::PvgsDump { session } => {
+            let store = PvgsStore::new(
+                [0u8; 32],
+                "charter:bootstrap".into(),
+                "policy:bootstrap".into(),
+                HashSet::new(),
+                HashSet::new(),
+                HashSet::new(),
+            );
 
-    let pvgs_receipt = issue_receipt(
-        &receipt_input,
-        ReceiptStatus::Accepted,
-        Vec::new(),
-        &keystore,
-    );
+            let snapshot = snapshot(&store, session.as_deref());
+            println!("{}", format_snapshot(&snapshot));
+        }
+    }
+}
 
-    let verified_fields_digest = compute_verified_fields_digest(
-        &commit_request.bindings,
-        commit_request.required_receipt_kind,
-    );
-    let record_digest = pvgs::compute_record_digest(
-        verified_fields_digest,
-        commit_request.bindings.prev_record_digest,
-        &commit_request.commit_id,
-    );
-    let vrf_digest = vrf_engine.eval_record_vrf(
-        commit_request.bindings.prev_record_digest,
-        record_digest,
-        &commit_request.bindings.charter_version_digest,
-        commit_request.bindings.profile_digest.unwrap_or([0u8; 32]),
-        commit_request.epoch_id,
-    );
+fn format_snapshot(snapshot: &PvgsSnapshot) -> String {
+    let mut lines = Vec::new();
 
-    let mut ruleset_state = RulesetState::new(
-        commit_request.bindings.charter_version_digest.clone(),
-        commit_request.bindings.policy_version_digest.clone(),
-    );
-    ruleset_state.recompute_ruleset_digest();
+    lines.push(format!(
+        "head: id={} digest={}",
+        snapshot.head_experience_id,
+        encode(snapshot.head_record_digest)
+    ));
 
-    let proof_receipt = issue_proof_receipt(
-        ruleset_state.ruleset_digest,
-        verified_fields_digest,
-        vrf_digest,
-        &keystore,
-    );
+    lines.push(format!(
+        "ruleset: current={} prev={}",
+        hex_or_none(snapshot.ruleset_digest),
+        hex_or_none(snapshot.prev_ruleset_digest),
+    ));
 
-    let baseline = CharacterBaselineVector {
-        cbv_epoch: 0,
-        baseline_caution_offset: 0,
-        baseline_novelty_dampening_offset: 0,
-        baseline_approval_strictness_offset: 0,
-        baseline_export_strictness_offset: 0,
-        baseline_chain_conservatism_offset: 0,
-        baseline_cooldown_multiplier_class: 0,
-        cbv_digest: None,
-        source_milestone_refs: Vec::new(),
-        source_event_refs: Vec::new(),
-        proof_receipt_ref: None,
-        pvgs_attestation_key_id: String::new(),
-        pvgs_attestation_sig: Vec::new(),
-    };
+    lines.push(format!(
+        "cbv: epoch={} digest={}",
+        snapshot
+            .latest_cbv_epoch
+            .map_or_else(|| "NONE".to_string(), |epoch| epoch.to_string()),
+        hex_or_none(snapshot.latest_cbv_digest),
+    ));
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let current_epoch = keystore.make_key_epoch_proto(
-        keystore.current_epoch(),
-        now_ms,
-        vrf_engine.vrf_public_key().to_vec(),
-        None,
-    );
-    history.push(current_epoch.clone()).expect("history push");
+    lines.push(format!(
+        "pev_digest: {}",
+        hex_or_none(snapshot.latest_pev_digest)
+    ));
 
-    let mut sep_log = SepLog::default();
-    let sep_event: SepEventInternal = sep_log.append_event(
-        "boot-session".into(),
-        SepEventType::EvDecision,
-        pvgs_receipt.receipt_digest.0,
-        Vec::new(),
-    );
+    lines.push(format!(
+        "pending_replay_plans: {}",
+        snapshot.pending_replay_ids.len()
+    ));
 
-    let auth = AuthContext {
-        subject: "bootstrap".into(),
-        scopes: vec!["init".into()],
-    };
+    for replay_id in &snapshot.pending_replay_ids {
+        lines.push(format!("- {}", replay_id));
+    }
 
-    let query_request = QueryRequest {
-        subject: auth.subject.clone(),
-    };
+    lines.push(format!(
+        "completeness: {}",
+        snapshot
+            .completeness_status
+            .clone()
+            .unwrap_or_else(|| "NONE".to_string())
+    ));
 
-    let _query_result = QueryResult {
-        auth: Some(auth),
-        baseline: Some(baseline),
-        last_commit: Some(pvgs_receipt.clone()),
-        last_verification: Some(proof_receipt),
-        current_epoch: Some(current_epoch),
-        latest_event: Some(sep_event),
-        recent_vrf_digest: Some(vrf_digest),
-    };
+    lines.push(format!(
+        "last_seal: {}",
+        hex_or_none(snapshot.last_seal_digest)
+    ));
 
-    println!("boot ok: {}", query_request.subject);
-    println!("next receipt digest: {:?}", pvgs_receipt.receipt_digest.0);
+    lines.join("\n")
+}
+
+fn hex_or_none(value: Option<[u8; 32]>) -> String {
+    value.map(encode).unwrap_or_else(|| "NONE".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cbv::compute_cbv_digest;
+    use cbv::CharacterBaselineVector;
+    use pev::{pev_digest, PolicyEcologyDimension, PolicyEcologyVector};
+    use query::{get_current_ruleset_digest, get_previous_ruleset_digest};
+    use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
+    use sep::SepEventType;
+    use ucf_protocol::ucf::v1::{ReplayFidelity, ReplayTargetKind};
+
+    #[test]
+    fn pvgs_dump_formats_snapshot() {
+        let head_digest = [1u8; 32];
+        let mut store = PvgsStore::new(
+            head_digest,
+            "charter:v1".into(),
+            "policy:v1".into(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+        );
+
+        store.experience_store.head_id = 7;
+        store.experience_store.head_record_digest = head_digest;
+        store.current_head_record_digest = head_digest;
+        store.ruleset_state.prev_ruleset_digest = Some([9u8; 32]);
+
+        let mut cbv = CharacterBaselineVector {
+            cbv_epoch: 5,
+            baseline_caution_offset: 1,
+            baseline_novelty_dampening_offset: 2,
+            baseline_approval_strictness_offset: 3,
+            baseline_export_strictness_offset: 4,
+            baseline_chain_conservatism_offset: 5,
+            baseline_cooldown_multiplier_class: 6,
+            cbv_digest: None,
+            source_milestone_refs: Vec::new(),
+            source_event_refs: Vec::new(),
+            proof_receipt_ref: None,
+            pvgs_attestation_key_id: String::new(),
+            pvgs_attestation_sig: Vec::new(),
+        };
+        let cbv_digest = compute_cbv_digest(&cbv);
+        cbv.cbv_digest = Some(cbv_digest.to_vec());
+        store.cbv_store.push(cbv);
+
+        let pev = PolicyEcologyVector {
+            dimensions: vec![PolicyEcologyDimension {
+                name: "consistency_bias".into(),
+                value: 10,
+            }],
+            pev_digest: Some([3u8; 32].to_vec()),
+            pev_version_digest: None,
+            pev_epoch: Some(1),
+        };
+        store.pev_store.push(pev).unwrap();
+        store.update_pev_digest(pev_digest(store.pev_store.latest().unwrap()));
+
+        let plan_a = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "sess-1".into(),
+            head_experience_id: store.experience_store.head_id,
+            head_record_digest: head_digest,
+            target_kind: ReplayTargetKind::Micro,
+            target_refs: vec![ucf_protocol::ucf::v1::Ref {
+                id: "micro:a".into(),
+            }],
+            fidelity: ReplayFidelity::Low,
+            counter: 1,
+            trigger_reason_codes: vec!["reason-a".into()],
+        });
+        let plan_b = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "sess-1".into(),
+            head_experience_id: store.experience_store.head_id,
+            head_record_digest: head_digest,
+            target_kind: ReplayTargetKind::Micro,
+            target_refs: vec![ucf_protocol::ucf::v1::Ref {
+                id: "micro:b".into(),
+            }],
+            fidelity: ReplayFidelity::Low,
+            counter: 2,
+            trigger_reason_codes: vec!["reason-b".into()],
+        });
+
+        store.replay_plans.push(plan_a.clone()).unwrap();
+        store.replay_plans.push(plan_b.clone()).unwrap();
+
+        let decision_event = store.sep_log.append_event(
+            "sess-1".into(),
+            SepEventType::EvDecision,
+            [7u8; 32],
+            Vec::new(),
+        );
+
+        let snapshot = snapshot(&store, Some("sess-1"));
+
+        assert_eq!(snapshot.head_experience_id, 7);
+        assert_eq!(snapshot.head_record_digest, head_digest);
+        assert_eq!(snapshot.ruleset_digest, get_current_ruleset_digest(&store));
+        assert_eq!(
+            snapshot.prev_ruleset_digest,
+            get_previous_ruleset_digest(&store)
+        );
+        assert_eq!(snapshot.latest_cbv_epoch, Some(5));
+        assert_eq!(snapshot.latest_cbv_digest, Some(cbv_digest));
+        assert_eq!(snapshot.latest_pev_digest, Some([3u8; 32]));
+        assert_eq!(
+            snapshot.pending_replay_ids,
+            vec![plan_a.replay_id, plan_b.replay_id]
+        );
+        assert_eq!(snapshot.last_seal_digest, Some(decision_event.event_digest));
+
+        let expected = format!(
+            "head: id=7 digest={}\nruleset: current={} prev={}\ncbv: epoch=5 digest={}\npev_digest: {}\npending_replay_plans: 2\n- replay:sess-1:7:1\n- replay:sess-1:7:2\ncompleteness: {}\nlast_seal: {}",
+            encode(head_digest),
+            encode(snapshot.ruleset_digest.unwrap()),
+            encode(snapshot.prev_ruleset_digest.unwrap()),
+            encode(cbv_digest),
+            encode(snapshot.latest_pev_digest.unwrap()),
+            snapshot
+                .completeness_status
+                .clone()
+                .unwrap_or_else(|| "NONE".to_string()),
+            encode(decision_event.event_digest),
+        );
+
+        let output = format_snapshot(&snapshot);
+        assert_eq!(output, expected);
+    }
 }

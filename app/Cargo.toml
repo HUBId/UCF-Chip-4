@@ -13,3 +13,7 @@ keys = { path = "../keys" }
 wire = { path = "../wire" }
 query = { path = "../query" }
 ucf-protocol = { path = "../ucf-protocol" }
+pev = { path = "../pev" }
+replay_plan = { path = "../replay_plan" }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
