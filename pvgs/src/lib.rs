@@ -2022,7 +2022,7 @@ fn verify_recovery_approval(
         permit_payload.ruleset_digest = store.ruleset_state.ruleset_digest;
     }
 
-    let required_checks = vec![RecoveryCheck::IntegrityOk, RecoveryCheck::ValidationPassed];
+    let required_checks = [RecoveryCheck::IntegrityOk, RecoveryCheck::ValidationPassed];
     let has_required_checks = required_checks
         .iter()
         .all(|chk| case.completed_checks.contains(chk));
