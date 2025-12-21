@@ -69,6 +69,12 @@ impl CbvStore {
         self.entries.last()
     }
 
+    /// Return a bounded list of the most recent CBVs in chronological order.
+    pub fn list_latest(&self, limit: usize) -> Vec<CharacterBaselineVector> {
+        let start = self.entries.len().saturating_sub(limit);
+        self.entries[start..].to_vec()
+    }
+
     pub fn latest_digest(&self) -> Option<[u8; 32]> {
         self.latest()
             .and_then(|cbv| cbv.cbv_digest.as_deref())

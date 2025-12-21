@@ -283,6 +283,18 @@ impl MacroMilestoneStore {
         self.proposed.keys().cloned().collect()
     }
 
+    pub fn list_proposed(&self) -> Vec<MacroMilestone> {
+        self.proposed.values().cloned().collect()
+    }
+
+    pub fn list_finalized(&self) -> Vec<MacroMilestone> {
+        self.finalized_order
+            .iter()
+            .filter_map(|id| self.finalized.get(id))
+            .cloned()
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.finalized_order.is_empty() && self.proposed.is_empty()
     }
