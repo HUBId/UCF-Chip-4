@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hasher;
-use limits::{StoreLimits, DEFAULT_LIMITS};
+use limits::StoreLimits;
 use log::warn;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -201,14 +201,12 @@ pub enum EdgeType {
     References,
 }
 
-/// Default maximum number of edges stored per node.
-pub const MAX_EDGES_PER_NODE: usize = DEFAULT_LIMITS.max_causal_edges_per_node;
-
 /// In-memory causal graph index with forward and reverse adjacency.
 #[derive(Debug, Clone, Default)]
 pub struct CausalGraph {
     pub adj: HashMap<NodeKey, Vec<(EdgeType, NodeKey)>>,
     pub rev: HashMap<NodeKey, Vec<(EdgeType, NodeKey)>>,
+    pub limits: StoreLimits,
 }
 
 const EMPTY_EDGES: &[(EdgeType, NodeKey)] = &[];
@@ -219,20 +217,38 @@ impl CausalGraph {
         Self::default()
     }
 
+    /// Create a new empty graph that respects the provided limits.
+    pub fn with_limits(limits: StoreLimits) -> Self {
+        Self {
+            limits,
+            ..Default::default()
+        }
+    }
+
     /// Add an edge to the graph, enforcing per-node limits and dropping the
     /// oldest edge when the limit is exceeded.
-    pub fn add_edge(&mut self, from: NodeKey, et: EdgeType, to: NodeKey) {
+    pub fn add_edge(
+        &mut self,
+        from: NodeKey,
+        et: EdgeType,
+        to: NodeKey,
+        sep_log: Option<(&mut SepLog, &str)>,
+    ) {
         if self.edge_exists(&from, et, &to) {
             return;
         }
 
+        let mut sep_log = sep_log;
+
         if let Some((old_et, old_to)) = self.prune_if_needed(&from, true) {
             self.remove_edge_from(&old_to, old_et, &from, false);
+            self.log_trimmed_edge(sep_log.as_mut(), &from, (old_et, old_to), true);
         }
         self.adj.entry(from).or_default().push((et, to));
 
         if let Some((old_et, old_from)) = self.prune_if_needed(&to, false) {
             self.remove_edge_from(&old_from, old_et, &to, true);
+            self.log_trimmed_edge(sep_log.as_mut(), &to, (old_et, old_from), false);
         }
         self.rev.entry(to).or_default().push((et, from));
     }
@@ -267,7 +283,7 @@ impl CausalGraph {
             &mut self.rev
         };
         let edges = map.get_mut(node)?;
-        if edges.len() < MAX_EDGES_PER_NODE {
+        if edges.len() < self.limits.max_graph_edges_per_node {
             return None;
         }
 
@@ -277,6 +293,29 @@ impl CausalGraph {
             node, forward
         );
         Some(removed)
+    }
+
+    fn log_trimmed_edge(
+        &self,
+        sep_log: Option<&mut (&mut SepLog, &str)>,
+        trimmed_node: &NodeKey,
+        removed_edge: (EdgeType, NodeKey),
+        forward: bool,
+    ) {
+        if let Some((log, session_id)) = sep_log {
+            let (_, neighbor) = removed_edge;
+            if let Err(err) = log.append_event(
+                session_id.to_string(),
+                SepEventType::EvOutcome,
+                *trimmed_node,
+                vec![ReasonCodes::GV_GRAPH_TRIMMED.to_string()],
+            ) {
+                warn!(
+                    "failed to log graph trim for node {:?} (neighbor={:?}, forward={}): {}",
+                    trimmed_node, neighbor, forward, err
+                );
+            }
+        }
     }
 
     fn remove_edge_from(&mut self, node: &NodeKey, et: EdgeType, target: &NodeKey, forward: bool) {
@@ -407,5 +446,58 @@ mod tests {
             seal.final_event_digest,
             log.events.last().unwrap().event_digest
         );
+    }
+
+    #[test]
+    fn causal_graph_prunes_edges_and_logs_sep_event() {
+        let mut limits = StoreLimits::default();
+        limits.max_graph_edges_per_node = 1;
+        let mut graph = CausalGraph::with_limits(limits);
+        let mut sep_log = SepLog::default();
+
+        let node_a = [1u8; 32];
+        let node_b = [2u8; 32];
+        let node_c = [3u8; 32];
+        let node_d = [4u8; 32];
+
+        graph.add_edge(
+            node_a,
+            EdgeType::Causes,
+            node_b,
+            Some((&mut sep_log, "graph-test")),
+        );
+        graph.add_edge(
+            node_a,
+            EdgeType::Causes,
+            node_c,
+            Some((&mut sep_log, "graph-test")),
+        );
+
+        assert_eq!(graph.neighbors(node_a), &[(EdgeType::Causes, node_c)]);
+        assert!(graph.reverse_neighbors(node_b).is_empty());
+
+        graph.add_edge(
+            node_d,
+            EdgeType::Causes,
+            node_c,
+            Some((&mut sep_log, "graph-test")),
+        );
+
+        assert!(graph.neighbors(node_a).is_empty());
+        assert_eq!(
+            graph.reverse_neighbors(node_c),
+            &[(EdgeType::Causes, node_d)]
+        );
+
+        let trimmed_events = sep_log
+            .events
+            .iter()
+            .filter(|event| {
+                event
+                    .reason_codes
+                    .contains(&ReasonCodes::GV_GRAPH_TRIMMED.to_string())
+            })
+            .count();
+        assert!(trimmed_events >= 2);
     }
 }

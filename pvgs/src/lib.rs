@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 
 const CONSISTENCY_SIGNAL_WINDOW: usize = DEFAULT_LIMITS.consistency_signal_window;
 const CONSISTENCY_HISTORY_MAX: usize = DEFAULT_LIMITS.consistency_history_max;
+const GRAPH_TRIM_SESSION_ID: &str = "graph-trim";
 
 /// Commit type supported by PVGS.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -480,7 +481,7 @@ impl PvgsStore {
             replay_plans: ReplayPlanStore::default(),
             committed_payload_digests: HashSet::new(),
             sep_log: SepLog::default(),
-            causal_graph: CausalGraph::default(),
+            causal_graph: CausalGraph::with_limits(limits),
             receipt_gate_enabled: false,
             ruleset_state: RulesetState::new(charter_version_digest, policy_version_digest),
         }
@@ -660,6 +661,18 @@ impl PvgsStore {
             .expect("sep log append failed");
     }
 
+    fn add_graph_edge(
+        &mut self,
+        from: NodeKey,
+        et: EdgeType,
+        to: NodeKey,
+        session_id: Option<&str>,
+    ) {
+        let session_id = session_id.unwrap_or(GRAPH_TRIM_SESSION_ID);
+        self.causal_graph
+            .add_edge(from, et, to, Some((&mut self.sep_log, session_id)));
+    }
+
     fn add_receipt_edges(&mut self, receipt: &PVGSReceipt) {
         let receipt_digest = receipt.receipt_digest.0;
         self.receipts.insert(receipt_digest, receipt.clone());
@@ -668,71 +681,101 @@ impl PvgsStore {
             return;
         }
         if let Some(decision) = optional_proto_digest(&receipt.bindings.decision_digest) {
-            self.causal_graph
-                .add_edge(decision, EdgeType::Authorizes, receipt_digest);
+            self.add_graph_edge(decision, EdgeType::Authorizes, receipt_digest, None);
         }
 
         if let Some(action) = optional_proto_digest(&receipt.bindings.action_digest) {
-            self.causal_graph
-                .add_edge(action, EdgeType::Authorizes, receipt_digest);
+            self.add_graph_edge(action, EdgeType::Authorizes, receipt_digest, None);
         }
 
         if let Some(profile) = optional_proto_digest(&receipt.bindings.profile_digest) {
-            self.causal_graph
-                .add_edge(profile, EdgeType::References, receipt_digest);
+            self.add_graph_edge(profile, EdgeType::References, receipt_digest, None);
         }
 
         if let Some(tool_profile) = optional_proto_digest(&receipt.bindings.tool_profile_digest) {
-            self.causal_graph
-                .add_edge(tool_profile, EdgeType::References, receipt_digest);
+            self.add_graph_edge(tool_profile, EdgeType::References, receipt_digest, None);
         }
     }
 
     fn add_record_edges(
         &mut self,
+        session_id: &str,
         record_digest: [u8; 32],
         prev_record_digest: [u8; 32],
         record: &ExperienceRecord,
     ) {
         if prev_record_digest != [0u8; 32] {
-            self.causal_graph
-                .add_edge(prev_record_digest, EdgeType::Causes, record_digest);
+            self.add_graph_edge(
+                prev_record_digest,
+                EdgeType::Causes,
+                record_digest,
+                Some(session_id),
+            );
         }
 
-        self.add_frame_reference_edges(record_digest, record);
+        self.add_frame_reference_edges(session_id, record_digest, record);
 
         match RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified) {
-            RecordType::RtActionExec => self.add_action_exec_edges(record_digest, record),
-            RecordType::RtOutput => self.add_output_edges(record_digest, record),
+            RecordType::RtActionExec => {
+                self.add_action_exec_edges(session_id, record_digest, record)
+            }
+            RecordType::RtOutput => self.add_output_edges(session_id, record_digest, record),
             RecordType::RtDecision => {}
             _ => {}
         }
     }
 
-    fn add_frame_reference_edges(&mut self, record_digest: NodeKey, record: &ExperienceRecord) {
+    fn add_frame_reference_edges(
+        &mut self,
+        session_id: &str,
+        record_digest: NodeKey,
+        record: &ExperienceRecord,
+    ) {
         if let Some(core_ref) = &record.core_frame_ref {
-            self.add_reference_edges_from_refs(record_digest, std::slice::from_ref(core_ref));
+            self.add_reference_edges_from_refs(
+                session_id,
+                record_digest,
+                std::slice::from_ref(core_ref),
+            );
         }
 
         if let Some(meta_ref) = &record.metabolic_frame_ref {
-            self.add_reference_edges_from_refs(record_digest, std::slice::from_ref(meta_ref));
+            self.add_reference_edges_from_refs(
+                session_id,
+                record_digest,
+                std::slice::from_ref(meta_ref),
+            );
         }
 
         if let Some(gov_ref) = &record.governance_frame_ref {
-            self.add_reference_edges_from_refs(record_digest, std::slice::from_ref(gov_ref));
+            self.add_reference_edges_from_refs(
+                session_id,
+                record_digest,
+                std::slice::from_ref(gov_ref),
+            );
         }
     }
 
-    fn add_action_exec_edges(&mut self, record_digest: NodeKey, record: &ExperienceRecord) {
+    fn add_action_exec_edges(
+        &mut self,
+        session_id: &str,
+        record_digest: NodeKey,
+        record: &ExperienceRecord,
+    ) {
         if let Some(core) = &record.core_frame {
-            self.add_reference_edges_from_refs(record_digest, &core.evidence_refs);
+            self.add_reference_edges_from_refs(session_id, record_digest, &core.evidence_refs);
         }
 
         if let Some(gov) = &record.governance_frame {
-            self.add_reference_edges_from_refs(record_digest, &gov.policy_decision_refs);
+            self.add_reference_edges_from_refs(
+                session_id,
+                record_digest,
+                &gov.policy_decision_refs,
+            );
 
             if let Some(receipt_ref) = &gov.pvgs_receipt_ref {
                 self.add_reference_edges_from_refs(
+                    session_id,
                     record_digest,
                     std::slice::from_ref(receipt_ref),
                 );
@@ -740,11 +783,20 @@ impl PvgsStore {
         }
 
         if let Some(core_ref) = &record.core_frame_ref {
-            self.add_reference_edges_from_refs(record_digest, std::slice::from_ref(core_ref));
+            self.add_reference_edges_from_refs(
+                session_id,
+                record_digest,
+                std::slice::from_ref(core_ref),
+            );
         }
     }
 
-    fn add_output_edges(&mut self, record_digest: NodeKey, record: &ExperienceRecord) {
+    fn add_output_edges(
+        &mut self,
+        session_id: &str,
+        record_digest: NodeKey,
+        record: &ExperienceRecord,
+    ) {
         let mut dlp_refs: Vec<Ref> = Vec::new();
 
         if let Some(gov) = &record.governance_frame {
@@ -756,15 +808,14 @@ impl PvgsStore {
         }
 
         if !dlp_refs.is_empty() {
-            self.add_reference_edges_from_refs(record_digest, &dlp_refs);
+            self.add_reference_edges_from_refs(session_id, record_digest, &dlp_refs);
         }
     }
 
-    fn add_reference_edges_from_refs(&mut self, from: NodeKey, refs: &[Ref]) {
+    fn add_reference_edges_from_refs(&mut self, session_id: &str, from: NodeKey, refs: &[Ref]) {
         for reference in refs {
             if let Some(target) = digest_from_ref(reference) {
-                self.causal_graph
-                    .add_edge(from, EdgeType::References, target);
+                self.add_graph_edge(from, EdgeType::References, target, Some(session_id));
             }
         }
     }
@@ -3044,7 +3095,12 @@ fn verify_experience_record_append(
     finalization_header.record_digest = digest_to_vec(record_digest);
     record.finalization_header = Some(finalization_header);
 
-    store.add_record_edges(record_digest, req.bindings.prev_record_digest, &record);
+    store.add_record_edges(
+        &req.commit_id,
+        record_digest,
+        req.bindings.prev_record_digest,
+        &record,
+    );
     log_experience_events(&req.commit_id, record_digest, &record, store);
     store.append_record(&req.commit_id, record, record_digest, proof_receipt.clone());
 
@@ -3631,16 +3687,12 @@ fn add_macro_edges(
 ) {
     for meso_ref in &macro_milestone.meso_refs {
         if let Some(meso_digest) = digest_from_ref(meso_ref) {
-            store
-                .causal_graph
-                .add_edge(macro_digest, EdgeType::Finalizes, meso_digest);
+            store.add_graph_edge(macro_digest, EdgeType::Finalizes, meso_digest, None);
         }
     }
 
     if let Some(consistency) = consistency_digest {
-        store
-            .causal_graph
-            .add_edge(macro_digest, EdgeType::Finalizes, consistency);
+        store.add_graph_edge(macro_digest, EdgeType::Finalizes, consistency, None);
     }
 }
 
@@ -6277,11 +6329,11 @@ mod tests {
         let record = [4u8; 32];
         let profile = [5u8; 32];
 
-        graph.add_edge(action, EdgeType::Authorizes, receipt);
-        graph.add_edge(decision, EdgeType::Authorizes, receipt);
-        graph.add_edge(record, EdgeType::References, action);
-        graph.add_edge(record, EdgeType::References, receipt);
-        graph.add_edge(profile, EdgeType::References, receipt);
+        graph.add_edge(action, EdgeType::Authorizes, receipt, None);
+        graph.add_edge(decision, EdgeType::Authorizes, receipt, None);
+        graph.add_edge(record, EdgeType::References, action, None);
+        graph.add_edge(record, EdgeType::References, receipt, None);
+        graph.add_edge(profile, EdgeType::References, receipt, None);
 
         sep_log
             .append_event(
@@ -6339,9 +6391,9 @@ mod tests {
         let decision = [6u8; 32];
         let profile = [5u8; 32];
 
-        graph.add_edge(action, EdgeType::Authorizes, receipt);
-        graph.add_edge(decision, EdgeType::Authorizes, receipt);
-        graph.add_edge(profile, EdgeType::References, receipt);
+        graph.add_edge(action, EdgeType::Authorizes, receipt, None);
+        graph.add_edge(decision, EdgeType::Authorizes, receipt, None);
+        graph.add_edge(profile, EdgeType::References, receipt, None);
 
         sep_log
             .append_event(
@@ -6462,8 +6514,8 @@ mod tests {
         let action = [1u8; 32];
         let receipt = [2u8; 32];
 
-        graph.add_edge(action, EdgeType::Authorizes, receipt);
-        graph.add_edge([3u8; 32], EdgeType::References, receipt);
+        graph.add_edge(action, EdgeType::Authorizes, receipt, None);
+        graph.add_edge([3u8; 32], EdgeType::References, receipt, None);
 
         sep_log
             .append_event(
@@ -6497,11 +6549,11 @@ mod tests {
         let decision = [12u8; 32];
         let profile = [13u8; 32];
 
-        graph.add_edge(action, EdgeType::Authorizes, receipt);
-        graph.add_edge(decision, EdgeType::Authorizes, receipt);
-        graph.add_edge(profile, EdgeType::References, receipt);
-        graph.add_edge([14u8; 32], EdgeType::References, action);
-        graph.add_edge([14u8; 32], EdgeType::References, receipt);
+        graph.add_edge(action, EdgeType::Authorizes, receipt, None);
+        graph.add_edge(decision, EdgeType::Authorizes, receipt, None);
+        graph.add_edge(profile, EdgeType::References, receipt, None);
+        graph.add_edge([14u8; 32], EdgeType::References, action, None);
+        graph.add_edge([14u8; 32], EdgeType::References, receipt, None);
 
         sep_log
             .append_event(
