@@ -284,7 +284,7 @@ fn log_replay_event(
         reasons.extend(mismatches.iter().cloned());
     }
 
-    log.append_event(
+    let _ = log.append_event(
         session_id.to_string(),
         SepEventType::EvReplay,
         object_digest,

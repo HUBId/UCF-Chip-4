@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hasher;
-use limits::DEFAULT_LIMITS;
+use limits::{StoreLimits, DEFAULT_LIMITS};
 use log::warn;
 use std::collections::HashMap;
 use thiserror::Error;
+use ucf_protocol::ucf::v1::ReasonCodes;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -76,9 +77,17 @@ pub struct SepEventInternal {
 #[derive(Debug, Default, Clone)]
 pub struct SepLog {
     pub events: Vec<SepEventInternal>,
+    pub limits: StoreLimits,
 }
 
 impl SepLog {
+    pub fn new(limits: StoreLimits) -> Self {
+        Self {
+            events: Vec::new(),
+            limits,
+        }
+    }
+
     /// Append a new event to the log, computing the chained digest.
     pub fn append_event(
         &mut self,
@@ -86,31 +95,19 @@ impl SepLog {
         event_type: SepEventType,
         object_digest: [u8; 32],
         reason_codes: Vec<String>,
-    ) -> SepEventInternal {
-        let prev_event_digest = self
-            .events
-            .last()
-            .map(|e| e.event_digest)
-            .unwrap_or([0u8; 32]);
-        let event_digest = compute_event_digest(
-            &session_id,
-            &event_type,
-            &object_digest,
-            &reason_codes,
-            prev_event_digest,
-        );
+    ) -> Result<SepEventInternal, SepError> {
+        if self.events.len() >= self.limits.max_sep_events {
+            let mut failure_reason_codes = reason_codes;
+            failure_reason_codes.push(ReasonCodes::RE_INTEGRITY_FAIL.to_string());
+            let event =
+                self.build_event(session_id, event_type, object_digest, failure_reason_codes);
+            self.events.push(event.clone());
+            return Err(SepError::Overflow);
+        }
 
-        let event = SepEventInternal {
-            session_id,
-            event_type,
-            object_digest,
-            reason_codes,
-            prev_event_digest,
-            event_digest,
-        };
-
+        let event = self.build_event(session_id, event_type, object_digest, reason_codes);
         self.events.push(event.clone());
-        event
+        Ok(event)
     }
 
     /// Append a control or signal frame event to the log.
@@ -120,7 +117,7 @@ impl SepLog {
         kind: FrameEventKind,
         frame_digest: [u8; 32],
         reason_codes: Vec<String>,
-    ) -> SepEventInternal {
+    ) -> Result<SepEventInternal, SepError> {
         let event_type = match kind {
             FrameEventKind::ControlFrame => SepEventType::EvControlFrame,
             FrameEventKind::SignalFrame => SepEventType::EvSignalFrame,
@@ -156,6 +153,36 @@ impl SepLog {
             }
         }
         Ok(())
+    }
+
+    fn build_event(
+        &self,
+        session_id: String,
+        event_type: SepEventType,
+        object_digest: [u8; 32],
+        reason_codes: Vec<String>,
+    ) -> SepEventInternal {
+        let prev_event_digest = self
+            .events
+            .last()
+            .map(|e| e.event_digest)
+            .unwrap_or([0u8; 32]);
+        let event_digest = compute_event_digest(
+            &session_id,
+            &event_type,
+            &object_digest,
+            &reason_codes,
+            prev_event_digest,
+        );
+
+        SepEventInternal {
+            session_id,
+            event_type,
+            object_digest,
+            reason_codes,
+            prev_event_digest,
+            event_digest,
+        }
     }
 }
 
@@ -323,6 +350,8 @@ fn compute_event_digest(
 pub enum SepError {
     #[error("event chain broken at index {0}")]
     ChainBroken(usize),
+    #[error("sep log overflow")]
+    Overflow,
 }
 
 #[cfg(test)]
@@ -332,14 +361,20 @@ mod tests {
     #[test]
     fn validate_sep_chain() {
         let mut log = SepLog::default();
-        let e1 = log.append_event("s".to_string(), SepEventType::EvDecision, [1u8; 32], vec![]);
-        let _ = log.append_event(
-            "s".to_string(),
-            SepEventType::EvRecoveryGov,
-            [2u8; 32],
-            vec![],
-        );
-        let _ = log.append_event("s".to_string(), SepEventType::EvDecision, [3u8; 32], vec![]);
+        let e1 = log
+            .append_event("s".to_string(), SepEventType::EvDecision, [1u8; 32], vec![])
+            .unwrap();
+        let _ = log
+            .append_event(
+                "s".to_string(),
+                SepEventType::EvRecoveryGov,
+                [2u8; 32],
+                vec![],
+            )
+            .unwrap();
+        let _ = log
+            .append_event("s".to_string(), SepEventType::EvDecision, [3u8; 32], vec![])
+            .unwrap();
 
         assert!(log.validate_chain().is_ok());
 
@@ -357,13 +392,15 @@ mod tests {
             SepEventType::EvDecision,
             [1u8; 32],
             vec![],
-        );
+        )
+        .unwrap();
         log.append_event(
             "session-1".to_string(),
             SepEventType::EvDecision,
             [9u8; 32],
             vec![],
-        );
+        )
+        .unwrap();
 
         let seal = seal("session-1", &log);
         assert_eq!(

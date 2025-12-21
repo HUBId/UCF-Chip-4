@@ -1120,13 +1120,15 @@ mod tests {
             FrameEventKind::ControlFrame,
             control_digest,
             vec![],
-        );
+        )
+        .unwrap();
         log.append_frame_event(
             "session-1".to_string(),
             FrameEventKind::SignalFrame,
             signal_digest,
             vec![],
-        );
+        )
+        .unwrap();
 
         assert!(has_control_frame_digest(&log, "session-1", control_digest));
         assert!(!has_control_frame_digest(&log, "session-1", signal_digest));
@@ -1149,13 +1151,15 @@ mod tests {
             SepEventType::EvPevUpdate,
             digest_one,
             vec![ReasonCodes::GV_RULESET_CHANGED.to_string()],
-        );
+        )
+        .unwrap();
         log.append_event(
             "session-b".to_string(),
             SepEventType::EvToolOnboarding,
             digest_two,
             vec![ReasonCodes::GV_RULESET_CHANGED.to_string()],
-        );
+        )
+        .unwrap();
 
         let all_changes = list_ruleset_changes(&log, None);
         assert_eq!(all_changes, vec![digest_one, digest_two]);

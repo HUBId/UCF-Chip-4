@@ -21,7 +21,7 @@ use replay_plan::{
     build_replay_plan, ref_from_digest, replay_trigger_reasons, should_generate_replay,
     BuildReplayPlanArgs, ConsistencyClass, ConsistencyCounts, ReplayPlanStore, ReplaySignals,
 };
-use sep::{CausalGraph, EdgeType, FrameEventKind, NodeKey, SepEventType, SepLog};
+use sep::{CausalGraph, EdgeType, FrameEventKind, NodeKey, SepError, SepEventType, SepLog};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -81,6 +81,8 @@ pub enum CbvCommitError {
     NonMonotonicEpoch,
     #[error("cbv derivation failed: {0}")]
     Derivation(String),
+    #[error("sep error: {0}")]
+    Sep(#[from] SepError),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -99,12 +101,16 @@ pub enum MacroValidationError {
     MissingConsistencyFeedback,
     #[error("macro milestone consistency too low")]
     LowConsistencyClass,
+    #[error("sep error: {0}")]
+    Sep(#[from] SepError),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AutoCommitError {
     #[error("meso commit rejected: {0:?}")]
     Rejected(Vec<String>),
+    #[error("sep error: {0}")]
+    Sep(#[from] SepError),
 }
 
 /// Commit binding data that feeds into receipts.
@@ -394,6 +400,7 @@ fn reason_code_for_macro_error(err: MacroValidationError) -> String {
         | MacroValidationError::MissingProofReceipt => {
             protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
         }
+        MacroValidationError::Sep(_) => protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string(),
     }
 }
 
@@ -559,23 +566,23 @@ impl PvgsStore {
         &mut self,
         session_id: &str,
         keystore: &KeyStore,
-    ) -> Option<ReplayPlanOutcome> {
+    ) -> Result<Option<ReplayPlanOutcome>, SepError> {
         let signals = self.collect_replay_signals(session_id);
         if !should_generate_replay(session_id, signals.clone()) {
-            return None;
+            return Ok(None);
         }
 
         let trigger_reason_codes = replay_trigger_reasons(&signals);
 
         if trigger_reason_codes.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         if let Some(latest) = self.replay_plans.latest() {
             if digest_from_bytes(&latest.head_record_digest)
                 .is_some_and(|digest| digest == self.current_head_record_digest)
             {
-                return None;
+                return Ok(None);
             }
         }
 
@@ -586,7 +593,7 @@ impl PvgsStore {
 
         let (target_kind, target_refs) = select_replay_targets(self, prefer_macro_targets);
         if target_refs.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let fidelity = if signals.integrity_degraded_present {
@@ -608,10 +615,12 @@ impl PvgsStore {
         });
 
         if self.replay_plans.push(plan.clone()).is_err() {
-            return None;
+            return Ok(None);
         }
 
-        let plan_digest = digest_from_bytes(&plan.replay_digest)?;
+        let Some(plan_digest) = digest_from_bytes(&plan.replay_digest) else {
+            return Ok(None);
+        };
         self.committed_payload_digests.insert(plan_digest);
 
         let (receipt, proof_receipt) = issue_replay_plan_receipts(&plan, self, keystore);
@@ -625,13 +634,13 @@ impl PvgsStore {
             SepEventType::EvReplay,
             plan_digest,
             vec![protocol::ReasonCodes::GV_REPLAY_PLANNED.to_string()],
-        );
+        )?;
 
-        Some(ReplayPlanOutcome {
+        Ok(Some(ReplayPlanOutcome {
             plan,
             receipt,
             proof_receipt,
-        })
+        }))
     }
 
     fn log_ruleset_change(
@@ -641,12 +650,14 @@ impl PvgsStore {
         mut reason_codes: Vec<String>,
     ) {
         reason_codes.push(protocol::ReasonCodes::GV_RULESET_CHANGED.to_string());
-        self.sep_log.append_event(
-            session_id.to_string(),
-            event_type,
-            self.ruleset_state.ruleset_digest,
-            reason_codes,
-        );
+        self.sep_log
+            .append_event(
+                session_id.to_string(),
+                event_type,
+                self.ruleset_state.ruleset_digest,
+                reason_codes,
+            )
+            .expect("sep log append failed");
     }
 
     fn add_receipt_edges(&mut self, receipt: &PVGSReceipt) {
@@ -766,13 +777,15 @@ impl PvgsStore {
         proof_receipt: ProofReceipt,
     ) {
         self.current_head_record_digest = record_digest;
-        self.experience_store.append(
-            record,
-            record_digest,
-            proof_receipt,
-            &mut self.sep_log,
-            session_id,
-        );
+        self.experience_store
+            .append(
+                record,
+                record_digest,
+                proof_receipt,
+                &mut self.sep_log,
+                session_id,
+            )
+            .expect("sep log append failed");
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -898,7 +911,7 @@ impl PvgsStore {
             SepEventType::EvRecoveryGov,
             next_cbv_digest,
             reason_codes,
-        );
+        )?;
 
         Ok(CbvCommitOutcome {
             cbv,
@@ -1106,11 +1119,11 @@ impl ExperienceStore {
         proof_receipt: ProofReceipt,
         sep_log: &mut SepLog,
         session_id: &str,
-    ) {
+    ) -> Result<(), SepError> {
         let limit = self.limits.max_experience_records;
 
         if limit == 0 {
-            return;
+            return Ok(());
         }
 
         while self.records.len() >= limit {
@@ -1126,7 +1139,7 @@ impl ExperienceStore {
                         SepEventType::EvOutcome,
                         evicted_digest,
                         vec!["RC.GV.RETENTION.EVICTED".to_string()],
-                    );
+                    )?;
                 }
             }
 
@@ -1147,6 +1160,8 @@ impl ExperienceStore {
         self.head_record_digest = record_digest;
         self.head_id = self.head_id.saturating_add(1);
         self.proof_receipts.insert(record_digest, proof_receipt);
+
+        Ok(())
     }
 }
 
@@ -1809,14 +1824,14 @@ pub fn verify_and_commit(
 
     if matches!(req.commit_type, CommitType::FrameEvidenceAppend) {
         let kind = frame_event_kind.unwrap_or(FrameEventKind::SignalFrame);
-        store.sep_log.append_frame_event(
+        let _ = store.sep_log.append_frame_event(
             req.commit_id.clone(),
             kind,
             event_object_digest,
             receipt.reject_reason_codes.clone(),
         );
     } else {
-        store.sep_log.append_event(
+        let _ = store.sep_log.append_event(
             req.commit_id.clone(),
             event_type,
             event_object_digest,
@@ -2005,7 +2020,7 @@ fn verify_macro_milestone_proposal(
     store.committed_payload_digests.insert(macro_digest);
     store.add_receipt_edges(&receipt);
 
-    store.sep_log.append_event(
+    let _ = store.sep_log.append_event(
         req.commit_id.clone(),
         SepEventType::EvRecoveryGov,
         macro_digest,
@@ -2258,7 +2273,7 @@ fn verify_macro_milestone_finalization(
         Some(consistency_digest),
     );
 
-    store.sep_log.append_event(
+    let _ = store.sep_log.append_event(
         req.commit_id.clone(),
         SepEventType::EvRecoveryGov,
         macro_digest,
@@ -2443,7 +2458,7 @@ fn verify_meso_milestone_append(
     store.add_receipt_edges(&receipt);
     store.meso_deriver.register_committed(&meso_milestone);
 
-    store.sep_log.append_event(
+    let _ = store.sep_log.append_event(
         req.commit_id.clone(),
         SepEventType::EvRecoveryGov,
         meso_digest,
@@ -2461,7 +2476,7 @@ fn attempt_cbv_update_from_macro(
     macro_digest: [u8; 32],
 ) {
     if cbv_update_already_applied(store, &macro_milestone) {
-        store.sep_log.append_event(
+        let _ = store.sep_log.append_event(
             macro_milestone.macro_id.clone(),
             SepEventType::EvRecoveryGov,
             macro_digest,
@@ -2494,7 +2509,7 @@ fn attempt_cbv_update_from_macro(
             );
         }
         Err(_) => {
-            store.sep_log.append_event(
+            let _ = store.sep_log.append_event(
                 macro_milestone.macro_id,
                 SepEventType::EvRecoveryGov,
                 macro_digest,
@@ -3206,7 +3221,7 @@ fn verify_consistency_feedback_append(
         .push(req.commit_id.clone(), cf_digest);
     store.committed_payload_digests.insert(payload_digest);
 
-    store.sep_log.append_event(
+    let _ = store.sep_log.append_event(
         req.commit_id.clone(),
         SepEventType::EvRecoveryGov,
         cf_digest,
@@ -3468,7 +3483,7 @@ fn log_experience_events(
 ) {
     let record_type = RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified);
 
-    store.sep_log.append_event(
+    let _ = store.sep_log.append_event(
         commit_id.to_string(),
         SepEventType::EvAgentStep,
         record_digest,
@@ -3502,7 +3517,7 @@ fn log_experience_events(
             if output_reason_codes.is_none() {
                 output_reason_codes = Some(reason_codes.clone());
             }
-            store.sep_log.append_event(
+            let _ = store.sep_log.append_event(
                 commit_id.to_string(),
                 SepEventType::EvDlpDecision,
                 *digest,
@@ -3513,7 +3528,7 @@ fn log_experience_events(
         let output_reason = output_reason_codes
             .unwrap_or_else(|| vec![protocol::ReasonCodes::RE_INTEGRITY_OK.to_string()]);
 
-        store.sep_log.append_event(
+        let _ = store.sep_log.append_event(
             commit_id.to_string(),
             SepEventType::EvOutput,
             record_digest,
@@ -3523,7 +3538,7 @@ fn log_experience_events(
 
     if let Some(gov) = &record.governance_frame {
         if !gov.policy_decision_refs.is_empty() {
-            store.sep_log.append_event(
+            let _ = store.sep_log.append_event(
                 commit_id.to_string(),
                 SepEventType::EvDecision,
                 record_digest,
@@ -3532,7 +3547,7 @@ fn log_experience_events(
         }
 
         if !gov.dlp_refs.is_empty() {
-            store.sep_log.append_event(
+            let _ = store.sep_log.append_event(
                 commit_id.to_string(),
                 SepEventType::EvOutcome,
                 record_digest,
@@ -3542,7 +3557,7 @@ fn log_experience_events(
     }
 
     if record.metabolic_frame_ref.is_some() {
-        store.sep_log.append_event(
+        let _ = store.sep_log.append_event(
             commit_id.to_string(),
             SepEventType::EvProfileChange,
             record_digest,
@@ -3552,7 +3567,7 @@ fn log_experience_events(
 
     if let Some(meta) = &record.metabolic_frame {
         if meta.profile_digest.is_some() {
-            store.sep_log.append_event(
+            let _ = store.sep_log.append_event(
                 commit_id.to_string(),
                 SepEventType::EvProfileChange,
                 record_digest,
@@ -3561,7 +3576,7 @@ fn log_experience_events(
         }
 
         if !meta.outcome_refs.is_empty() {
-            store.sep_log.append_event(
+            let _ = store.sep_log.append_event(
                 commit_id.to_string(),
                 SepEventType::EvOutcome,
                 record_digest,
@@ -3570,7 +3585,7 @@ fn log_experience_events(
         }
     }
 
-    store.sep_log.append_event(
+    let _ = store.sep_log.append_event(
         commit_id.to_string(),
         SepEventType::EvRecoveryGov,
         record_digest,
@@ -3881,7 +3896,7 @@ impl<'a> CompletenessChecker<'a> {
                         reason_codes
                             .insert(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
                         reason_codes.insert(RC_RE_DLP_DECISION_MISSING.to_string());
-                        self.sep_log.append_event(
+                        let _ = self.sep_log.append_event(
                             session_id.to_string(),
                             SepEventType::EvDlpDecision,
                             digest,
@@ -3899,7 +3914,7 @@ impl<'a> CompletenessChecker<'a> {
                 status = CompletenessStatus::Fail;
                 reason_codes.insert(protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string());
                 reason_codes.insert(RC_RE_REPLAY_INVALID_EMBEDDED_ACTION.to_string());
-                self.sep_log.append_event(
+                let _ = self.sep_log.append_event(
                     session_id.to_string(),
                     SepEventType::EvReplay,
                     record_digest,
@@ -3921,7 +3936,7 @@ impl<'a> CompletenessChecker<'a> {
                     status = CompletenessStatus::Degraded;
                 }
                 if missing_nodes.insert(plan_digest) {
-                    self.sep_log.append_event(
+                    let _ = self.sep_log.append_event(
                         session_id.to_string(),
                         SepEventType::EvReplay,
                         plan_digest,
@@ -4174,11 +4189,14 @@ fn finalize_receipt(args: FinalizeReceiptArgs) -> (PVGSReceipt, Option<ProofRece
 
     if matches!(req.commit_type, CommitType::FrameEvidenceAppend) {
         let kind = frame_kind.unwrap_or(FrameEventKind::SignalFrame);
-        store
-            .sep_log
-            .append_frame_event(req.commit_id.clone(), kind, object_digest, reason_codes);
+        let _ = store.sep_log.append_frame_event(
+            req.commit_id.clone(),
+            kind,
+            object_digest,
+            reason_codes,
+        );
     } else {
-        store.sep_log.append_event(
+        let _ = store.sep_log.append_event(
             req.commit_id.clone(),
             event_type,
             object_digest,
@@ -6265,18 +6283,22 @@ mod tests {
         graph.add_edge(record, EdgeType::References, receipt);
         graph.add_edge(profile, EdgeType::References, receipt);
 
-        sep_log.append_event(
-            "sess-ok".to_string(),
-            SepEventType::EvDecision,
-            receipt,
-            vec![],
-        );
-        sep_log.append_frame_event(
-            "sess-ok".to_string(),
-            FrameEventKind::ControlFrame,
-            profile,
-            vec![],
-        );
+        sep_log
+            .append_event(
+                "sess-ok".to_string(),
+                SepEventType::EvDecision,
+                receipt,
+                vec![],
+            )
+            .unwrap();
+        sep_log
+            .append_frame_event(
+                "sess-ok".to_string(),
+                FrameEventKind::ControlFrame,
+                profile,
+                vec![],
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
@@ -6321,18 +6343,22 @@ mod tests {
         graph.add_edge(decision, EdgeType::Authorizes, receipt);
         graph.add_edge(profile, EdgeType::References, receipt);
 
-        sep_log.append_event(
-            "sess-degraded".to_string(),
-            SepEventType::EvDecision,
-            receipt,
-            vec![],
-        );
-        sep_log.append_frame_event(
-            "sess-degraded".to_string(),
-            FrameEventKind::ControlFrame,
-            profile,
-            vec![],
-        );
+        sep_log
+            .append_event(
+                "sess-degraded".to_string(),
+                SepEventType::EvDecision,
+                receipt,
+                vec![],
+            )
+            .unwrap();
+        sep_log
+            .append_frame_event(
+                "sess-degraded".to_string(),
+                FrameEventKind::ControlFrame,
+                profile,
+                vec![],
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
@@ -6363,12 +6389,14 @@ mod tests {
 
         let record = output_record(dlp_digest);
         let record_digest = compute_experience_record_digest(&record);
-        sep_log.append_event(
-            "sess-o-c1-ok".to_string(),
-            SepEventType::EvOutput,
-            record_digest,
-            Vec::new(),
-        );
+        sep_log
+            .append_event(
+                "sess-o-c1-ok".to_string(),
+                SepEventType::EvOutput,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
 
         let records = vec![record];
         let replay_plans = ReplayPlanStore::default();
@@ -6391,12 +6419,14 @@ mod tests {
 
         let record = output_record(dlp_digest);
         let record_digest = compute_experience_record_digest(&record);
-        sep_log.append_event(
-            "sess-o-c1-missing".to_string(),
-            SepEventType::EvOutput,
-            record_digest,
-            Vec::new(),
-        );
+        sep_log
+            .append_event(
+                "sess-o-c1-missing".to_string(),
+                SepEventType::EvOutput,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let records = vec![record];
@@ -6435,12 +6465,14 @@ mod tests {
         graph.add_edge(action, EdgeType::Authorizes, receipt);
         graph.add_edge([3u8; 32], EdgeType::References, receipt);
 
-        sep_log.append_event(
-            "sess-deterministic".to_string(),
-            SepEventType::EvDecision,
-            receipt,
-            vec![],
-        );
+        sep_log
+            .append_event(
+                "sess-deterministic".to_string(),
+                SepEventType::EvDecision,
+                receipt,
+                vec![],
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
@@ -6471,12 +6503,14 @@ mod tests {
         graph.add_edge([14u8; 32], EdgeType::References, action);
         graph.add_edge([14u8; 32], EdgeType::References, receipt);
 
-        sep_log.append_event(
-            "sess-cf".to_string(),
-            SepEventType::EvDecision,
-            receipt,
-            vec![],
-        );
+        sep_log
+            .append_event(
+                "sess-cf".to_string(),
+                SepEventType::EvDecision,
+                receipt,
+                vec![],
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
@@ -6517,12 +6551,14 @@ mod tests {
             None,
         );
         let record_digest = compute_experience_record_digest(&record);
-        sep_log.append_event(
-            "sess-replay-present".to_string(),
-            SepEventType::EvAgentStep,
-            record_digest,
-            Vec::new(),
-        );
+        sep_log
+            .append_event(
+                "sess-replay-present".to_string(),
+                SepEventType::EvAgentStep,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let records = vec![record];
@@ -6549,12 +6585,14 @@ mod tests {
             None,
         );
         let record_digest = compute_experience_record_digest(&record);
-        sep_log.append_event(
-            "sess-replay-missing-plan".to_string(),
-            SepEventType::EvAgentStep,
-            record_digest,
-            Vec::new(),
-        );
+        sep_log
+            .append_event(
+                "sess-replay-missing-plan".to_string(),
+                SepEventType::EvAgentStep,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
@@ -6589,12 +6627,14 @@ mod tests {
         let mut sep_log = SepLog::default();
         let record = replay_record(Vec::new(), None);
         let record_digest = compute_experience_record_digest(&record);
-        sep_log.append_event(
-            "sess-replay-missing-ref".to_string(),
-            SepEventType::EvAgentStep,
-            record_digest,
-            Vec::new(),
-        );
+        sep_log
+            .append_event(
+                "sess-replay-missing-ref".to_string(),
+                SepEventType::EvAgentStep,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
@@ -6645,12 +6685,14 @@ mod tests {
             None,
         );
         let record_digest = compute_experience_record_digest(&record);
-        sep_log.append_event(
-            "sess-replay-invalid-action".to_string(),
-            SepEventType::EvAgentStep,
-            record_digest,
-            Vec::new(),
-        );
+        sep_log
+            .append_event(
+                "sess-replay-invalid-action".to_string(),
+                SepEventType::EvAgentStep,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
 
         let dlp_store = DlpDecisionStore::default();
         let records = vec![record];
@@ -6936,7 +6978,8 @@ mod tests {
 
         let outcome = store
             .maybe_plan_replay("session-a", &keystore)
-            .expect("replay plan created");
+            .expect("replay plan created")
+            .expect("replay plan outcome");
 
         assert_eq!(store.replay_plans.plans.len(), 1);
         assert_eq!(outcome.plan.replay_id, "replay:session-a:20:1");
@@ -6949,7 +6992,7 @@ mod tests {
             .contains(&ReasonCodes::GV_REPLAY_PLANNED.to_string()));
 
         let duplicate = store.maybe_plan_replay("session-a", &keystore);
-        assert!(duplicate.is_none());
+        assert!(duplicate.expect("duplicate planning result").is_none());
         assert_eq!(store.replay_plans.plans.len(), 1);
     }
 
@@ -6977,7 +7020,8 @@ mod tests {
 
         let outcome = store
             .maybe_plan_replay("session-b", &keystore)
-            .expect("replay plan created");
+            .expect("replay plan created")
+            .expect("replay plan outcome");
 
         assert_eq!(outcome.plan.target_kind, ReplayTargetKind::Micro as i32);
         assert_eq!(outcome.plan.target_refs.len(), 2);
@@ -7004,7 +7048,8 @@ mod tests {
 
         let outcome = store
             .maybe_plan_replay("session-low", &keystore)
-            .expect("replay plan created");
+            .expect("replay plan created")
+            .expect("replay plan outcome");
 
         assert_eq!(
             outcome.plan.trigger_reason_codes,
@@ -7029,7 +7074,8 @@ mod tests {
 
         let outcome = store
             .maybe_plan_replay("session-med", &keystore)
-            .expect("replay plan created");
+            .expect("replay plan created")
+            .expect("replay plan outcome");
 
         assert_eq!(
             outcome.plan.trigger_reason_codes,
@@ -7047,7 +7093,10 @@ mod tests {
 
         track_consistency_feedback(&mut store, "session-high", [0xC1u8; 32], "CONSISTENCY_HIGH");
 
-        assert!(store.maybe_plan_replay("session-high", &keystore).is_none());
+        assert!(store
+            .maybe_plan_replay("session-high", &keystore)
+            .expect("replay planning result")
+            .is_none());
     }
 
     #[test]
@@ -7064,7 +7113,8 @@ mod tests {
 
         let outcome = store
             .maybe_plan_replay("session-pref", &keystore)
-            .expect("replay plan created");
+            .expect("replay plan created")
+            .expect("replay plan outcome");
 
         assert_eq!(outcome.plan.target_kind, ReplayTargetKind::Macro as i32);
         assert_eq!(outcome.plan.target_refs.len(), 1);

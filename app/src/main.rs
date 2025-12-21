@@ -187,12 +187,15 @@ mod tests {
         store.replay_plans.push(plan_a.clone()).unwrap();
         store.replay_plans.push(plan_b.clone()).unwrap();
 
-        let decision_event = store.sep_log.append_event(
-            "sess-1".into(),
-            SepEventType::EvDecision,
-            [7u8; 32],
-            Vec::new(),
-        );
+        let decision_event = store
+            .sep_log
+            .append_event(
+                "sess-1".into(),
+                SepEventType::EvDecision,
+                [7u8; 32],
+                Vec::new(),
+            )
+            .unwrap();
 
         let snapshot = snapshot(&store, Some("sess-1"));
 

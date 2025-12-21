@@ -15,6 +15,8 @@ pub struct StoreLimits {
     pub max_pending_replay_plans: usize,
     /// Maximum number of experience records retained in memory.
     pub max_experience_records: usize,
+    /// Maximum number of SEP events retained in memory.
+    pub max_sep_events: usize,
 }
 
 /// Default limits used throughout the PVGS components.
@@ -25,6 +27,7 @@ pub const DEFAULT_LIMITS: StoreLimits = StoreLimits {
     max_replay_target_refs: 16,
     max_pending_replay_plans: 128,
     max_experience_records: 4096,
+    max_sep_events: 4096,
 };
 
 impl Default for StoreLimits {
