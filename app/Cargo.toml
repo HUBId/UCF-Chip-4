@@ -17,3 +17,4 @@ pev = { path = "../pev" }
 replay_plan = { path = "../replay_plan" }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+recovery = { path = "../crates/recovery" }

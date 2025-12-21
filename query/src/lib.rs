@@ -7,14 +7,18 @@ use dlp_store::DlpDecisionStore;
 use milestones::{MesoMilestone, MicroMilestone};
 use pev::{pev_digest, PolicyEcologyVector};
 use pvgs::{compute_experience_record_digest, CompletenessStatus, PvgsCommitRequest, PvgsStore};
-use recovery::RecoveryCase;
+use recovery::{
+    RecoveryCase as InternalRecoveryCase, RecoveryCheck as InternalRecoveryCheck,
+    RecoveryState as InternalRecoveryState,
+};
 use sep::{EdgeType, NodeKey, SepEventInternal, SepEventType, SepLog};
 use std::collections::{BTreeSet, VecDeque};
 use std::convert::TryFrom;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{
     ConsistencyFeedback, DlpDecisionForm, ExperienceRecord, PVGSKeyEpoch, PVGSReceipt,
-    ProofReceipt, ReasonCodes, ReplayPlan,
+    ProofReceipt, ReasonCodes, RecoveryCase as ProtoRecoveryCase,
+    RecoveryCheck as ProtoRecoveryCheck, RecoveryState as ProtoRecoveryState, ReplayPlan,
 };
 use wire::{AuthContext, Envelope};
 
@@ -111,6 +115,9 @@ pub struct PvgsSnapshot {
     pub pending_replay_ids: Vec<String>,
     pub completeness_status: Option<String>,
     pub last_seal_digest: Option<[u8; 32]>,
+    pub recovery_case: Option<ProtoRecoveryCase>,
+    pub unlock_permit_digest: Option<[u8; 32]>,
+    pub unlock_readiness_hint: Option<String>,
 }
 
 const MAX_MACRO_VECTOR_ITEMS: usize = 64;
@@ -182,8 +189,41 @@ pub fn get_unlock_permit_digest(store: &PvgsStore, session_id: &str) -> Option<[
         .map(|permit| permit.permit_digest)
 }
 
-pub fn get_recovery_case(store: &PvgsStore, session_id: &str) -> Option<RecoveryCase> {
-    store.recovery_store.get_active_for_session(session_id)
+pub fn get_recovery_case_for_session(
+    store: &PvgsStore,
+    session_id: &str,
+) -> Option<ProtoRecoveryCase> {
+    let mut cases: Vec<_> = store
+        .recovery_store
+        .list_for_session(session_id)
+        .into_iter()
+        .filter(|case| case.state != InternalRecoveryState::R7Closed)
+        .collect();
+
+    if cases.is_empty() {
+        return None;
+    }
+
+    cases.sort_by(|a, b| {
+        let created_a = a.created_at_ms.unwrap_or_default();
+        let created_b = b.created_at_ms.unwrap_or_default();
+
+        created_a
+            .cmp(&created_b)
+            .then_with(|| a.recovery_id.cmp(&b.recovery_id))
+    });
+
+    cases.last().cloned().map(recovery_case_to_proto)
+}
+
+pub fn unlock_readiness_hint(store: &PvgsStore, session_id: &str) -> String {
+    if has_unlock_permit(store, session_id) {
+        "UNLOCKED_READONLY".to_string()
+    } else if is_session_sealed(store, session_id) {
+        "LOCKED".to_string()
+    } else {
+        "NONE".to_string()
+    }
 }
 
 pub fn list_pev_versions(store: &PvgsStore) -> Vec<[u8; 32]> {
@@ -274,6 +314,52 @@ pub fn snapshot(store: &PvgsStore, session_id: Option<&str>) -> PvgsSnapshot {
         pending_replay_ids,
         completeness_status,
         last_seal_digest,
+        recovery_case: session_id.and_then(|session| get_recovery_case_for_session(store, session)),
+        unlock_permit_digest: session_id
+            .and_then(|session| get_unlock_permit_digest(store, session)),
+        unlock_readiness_hint: session_id
+            .map(|session| unlock_readiness_hint(store, session))
+            .filter(|hint| hint != "NONE"),
+    }
+}
+
+fn recovery_case_to_proto(case: InternalRecoveryCase) -> ProtoRecoveryCase {
+    ProtoRecoveryCase {
+        recovery_id: case.recovery_id,
+        session_id: case.session_id,
+        state: recovery_state_to_proto(case.state),
+        required_checks: case
+            .required_checks
+            .into_iter()
+            .map(recovery_check_to_proto)
+            .collect(),
+        completed_checks: case
+            .completed_checks
+            .into_iter()
+            .map(recovery_check_to_proto)
+            .collect(),
+        trigger_refs: case.trigger_refs,
+        created_at_ms: case.created_at_ms,
+    }
+}
+
+fn recovery_state_to_proto(state: InternalRecoveryState) -> ProtoRecoveryState {
+    match state {
+        InternalRecoveryState::R0Captured => ProtoRecoveryState::R0Captured,
+        InternalRecoveryState::R1Triaged => ProtoRecoveryState::R1Triaged,
+        InternalRecoveryState::R2Validated => ProtoRecoveryState::R2Validated,
+        InternalRecoveryState::R3Mitigated => ProtoRecoveryState::R3Mitigated,
+        InternalRecoveryState::R4Remediated => ProtoRecoveryState::R4Remediated,
+        InternalRecoveryState::R5Approved => ProtoRecoveryState::R5Approved,
+        InternalRecoveryState::R6Unlocked => ProtoRecoveryState::R6Unlocked,
+        InternalRecoveryState::R7Closed => ProtoRecoveryState::R7Closed,
+    }
+}
+
+fn recovery_check_to_proto(check: InternalRecoveryCheck) -> ProtoRecoveryCheck {
+    match check {
+        InternalRecoveryCheck::IntegrityOk => ProtoRecoveryCheck::IntegrityOk,
+        InternalRecoveryCheck::ValidationPassed => ProtoRecoveryCheck::ValidationPassed,
     }
 }
 
@@ -755,6 +841,65 @@ pub fn trace_exports(store: &PvgsStore, session_id: &str) -> Vec<ExportAudit> {
             .then_with(|| a.dlp_decision_digest.cmp(&b.dlp_decision_digest))
     });
     audits
+}
+
+#[cfg(test)]
+mod recovery_views_tests {
+    use super::*;
+    use pvgs::UnlockPermit;
+    use recovery::{RecoveryCheck, RecoveryState};
+    use std::collections::HashSet;
+
+    fn base_store() -> PvgsStore {
+        PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+        )
+    }
+
+    #[test]
+    fn recovery_query_returns_latest_case() {
+        let mut store = base_store();
+
+        let case_old = InternalRecoveryCase {
+            recovery_id: "recovery:a".into(),
+            session_id: "session-1".into(),
+            state: RecoveryState::R0Captured,
+            required_checks: vec![RecoveryCheck::IntegrityOk, RecoveryCheck::ValidationPassed],
+            completed_checks: Vec::new(),
+            trigger_refs: vec!["trigger-a".into()],
+            created_at_ms: Some(10),
+        };
+
+        let mut case_newer = case_old.clone();
+        case_newer.recovery_id = "recovery:b".into();
+        case_newer.created_at_ms = Some(20);
+
+        store.recovery_store.insert_new(case_old).unwrap();
+        store.recovery_store.insert_new(case_newer.clone()).unwrap();
+
+        let result = get_recovery_case_for_session(&store, "session-1").unwrap();
+        assert_eq!(result.recovery_id, case_newer.recovery_id);
+        assert_eq!(result.state, ProtoRecoveryState::R0Captured);
+    }
+
+    #[test]
+    fn unlock_permit_view_returns_digest() {
+        let mut store = base_store();
+
+        let permit = UnlockPermit::new("sess".into(), 1, [9u8; 32]);
+        store.unlock_permits.insert("sess".into(), permit.clone());
+
+        assert!(has_unlock_permit(&store, "sess"));
+        assert_eq!(
+            get_unlock_permit_digest(&store, "sess"),
+            Some(permit.permit_digest)
+        );
+    }
 }
 
 fn find_record(store: &PvgsStore, record_digest: [u8; 32]) -> Option<&ExperienceRecord> {

@@ -93,6 +93,40 @@ fn format_snapshot(snapshot: &PvgsSnapshot) -> String {
         hex_or_none(snapshot.last_seal_digest)
     ));
 
+    let (recovery_state, recovery_checks, recovery_id) = snapshot
+        .recovery_case
+        .as_ref()
+        .map(|case| {
+            let state = format!("{:?}", case.state);
+            let checks = format!(
+                "{}/{}",
+                case.completed_checks.len(),
+                case.required_checks.len()
+            );
+            (state, checks, case.recovery_id.clone())
+        })
+        .unwrap_or_else(|| ("NONE".to_string(), "0/0".to_string(), "NONE".to_string()));
+
+    lines.push(format!(
+        "recovery: state={} checks={} id={}",
+        recovery_state, recovery_checks, recovery_id
+    ));
+
+    let unlock_present = snapshot.unlock_permit_digest.is_some();
+    lines.push(format!(
+        "unlock_permit: present={} digest={}",
+        unlock_present,
+        hex_or_none(snapshot.unlock_permit_digest)
+    ));
+
+    lines.push(format!(
+        "unlock_hint: {}",
+        snapshot
+            .unlock_readiness_hint
+            .clone()
+            .unwrap_or_else(|| "NONE".to_string())
+    ));
+
     lines.join("\n")
 }
 
@@ -107,6 +141,7 @@ mod tests {
     use cbv::CharacterBaselineVector;
     use pev::{pev_digest, PolicyEcologyDimension, PolicyEcologyVector};
     use query::{get_current_ruleset_digest, get_previous_ruleset_digest};
+    use recovery::{RecoveryCase, RecoveryCheck, RecoveryState};
     use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
     use sep::SepEventType;
     use ucf_protocol::ucf::v1::{ReplayFidelity, ReplayTargetKind};
@@ -187,6 +222,22 @@ mod tests {
         store.replay_plans.push(plan_a.clone()).unwrap();
         store.replay_plans.push(plan_b.clone()).unwrap();
 
+        store
+            .recovery_store
+            .insert_new(RecoveryCase {
+                recovery_id: "recovery:test".into(),
+                session_id: "sess-1".into(),
+                state: RecoveryState::R0Captured,
+                required_checks: vec![RecoveryCheck::IntegrityOk],
+                completed_checks: Vec::new(),
+                trigger_refs: vec!["trigger".into()],
+                created_at_ms: Some(42),
+            })
+            .unwrap();
+
+        let permit = pvgs::UnlockPermit::new("sess-1".into(), 99, [8u8; 32]);
+        store.unlock_permits.insert("sess-1".into(), permit.clone());
+
         let decision_event = store
             .sep_log
             .append_event(
@@ -216,7 +267,7 @@ mod tests {
         assert_eq!(snapshot.last_seal_digest, Some(decision_event.event_digest));
 
         let expected = format!(
-            "head: id=7 digest={}\nruleset: current={} prev={}\ncbv: epoch=5 digest={}\npev_digest: {}\npending_replay_plans: 2\n- replay:sess-1:7:1\n- replay:sess-1:7:2\ncompleteness: {}\nlast_seal: {}",
+            "head: id=7 digest={}\nruleset: current={} prev={}\ncbv: epoch=5 digest={}\npev_digest: {}\npending_replay_plans: 2\n- replay:sess-1:7:1\n- replay:sess-1:7:2\ncompleteness: {}\nlast_seal: {}\nrecovery: state=R0Captured checks=0/1 id=recovery:test\nunlock_permit: present=true digest={}\nunlock_hint: UNLOCKED_READONLY",
             encode(head_digest),
             encode(snapshot.ruleset_digest.unwrap()),
             encode(snapshot.prev_ruleset_digest.unwrap()),
@@ -227,6 +278,7 @@ mod tests {
                 .clone()
                 .unwrap_or_else(|| "NONE".to_string()),
             encode(decision_event.event_digest),
+            encode(permit.permit_digest),
         );
 
         let output = format_snapshot(&snapshot);
