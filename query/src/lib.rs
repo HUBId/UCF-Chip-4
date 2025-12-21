@@ -391,12 +391,12 @@ fn cbv_link_for_macro(
 }
 
 fn macro_ref_matches(reference: &ucf_protocol::ucf::v1::Ref, macro_digest: [u8; 32]) -> bool {
-    reference
+    (reference
         .id
         .split_once(':')
         .and_then(|(_, value)| hex::decode(value).ok())
         .and_then(|bytes| digest_from_bytes(&bytes))
-        .map_or(false, |digest| digest == macro_digest)
+        == Some(macro_digest))
         || digest_from_labeled_ref(reference, "macro") == Some(macro_digest)
 }
 
