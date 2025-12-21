@@ -52,7 +52,7 @@ impl PevStore {
         let limit = self.limits.max_pevs;
 
         if limit == 0 {
-            evicted.extend(self.pevs.drain(..));
+            evicted.append(&mut self.pevs);
             evicted.push(pev);
             return Ok(evicted);
         }
