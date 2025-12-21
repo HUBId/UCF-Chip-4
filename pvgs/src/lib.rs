@@ -279,6 +279,10 @@ impl MacroMilestoneStore {
         self.finalized.get(macro_id)
     }
 
+    pub fn proposed_ids(&self) -> Vec<String> {
+        self.proposed.keys().cloned().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.finalized_order.is_empty() && self.proposed.is_empty()
     }
@@ -861,7 +865,7 @@ impl PvgsStore {
         Ok(Some(receipt))
     }
 
-    pub fn auto_commit_next_macro(
+    pub fn auto_propose_next_macro(
         &mut self,
         keystore: &KeyStore,
         vrf_engine: &VrfEngine,
@@ -898,7 +902,7 @@ impl PvgsStore {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
-            macro_milestone: Some(proposal),
+            macro_milestone: Some(proposal.clone()),
             meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
@@ -915,26 +919,43 @@ impl PvgsStore {
             ));
         }
 
-        let Some(consistency_digest) = self.consistency_store.map.keys().next().copied() else {
-            return Ok(Some(proposal_receipt));
+        self.macro_deriver.register_committed(&proposal);
+
+        Ok(Some(proposal_receipt))
+    }
+
+    pub fn finalize_macro(
+        &mut self,
+        macro_id: &str,
+        consistency_digest: [u8; 32],
+        keystore: &KeyStore,
+        vrf_engine: &VrfEngine,
+    ) -> Result<Option<PVGSReceipt>, AutoCommitError> {
+        let Some(mut macro_milestone) = self.macro_milestones.get_proposed(macro_id).cloned()
+        else {
+            return Ok(None);
         };
 
         let Some(feedback) = self.consistency_store.get(consistency_digest) else {
-            return Ok(Some(proposal_receipt));
+            return Err(AutoCommitError::Rejected(vec![
+                protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string(),
+            ]));
         };
 
-        let mut finalized = macro_milestone;
-        finalized.state = MacroMilestoneState::Finalized as i32;
-        finalized.identity_anchor_flag = true;
-        finalized.consistency_class = feedback.consistency_class.clone();
-        finalized.consistency_digest = Some(consistency_digest.to_vec());
-        finalized.proof_receipt_ref.get_or_insert_with(Ref::default);
-        finalized
+        macro_milestone.state = MacroMilestoneState::Finalized as i32;
+        macro_milestone.identity_anchor_flag = true;
+        macro_milestone.consistency_class = feedback.consistency_class.clone();
+        macro_milestone.consistency_digest = Some(consistency_digest.to_vec());
+        macro_milestone
+            .proof_receipt_ref
+            .get_or_insert_with(Ref::default);
+        macro_milestone
             .consistency_feedback_ref
             .get_or_insert_with(Ref::default);
 
+        let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap_or([0u8; 32]);
         let finalize_req = PvgsCommitRequest {
-            commit_id: finalized.macro_id.clone(),
+            commit_id: macro_milestone.macro_id.clone(),
             commit_type: CommitType::MacroMilestoneFinalize,
             bindings: CommitBindings {
                 action_digest: None,
@@ -953,7 +974,7 @@ impl PvgsStore {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
-            macro_milestone: Some(finalized),
+            macro_milestone: Some(macro_milestone),
             meso_milestone: None,
             dlp_decision_payload: None,
             tool_registry_container: None,
@@ -962,9 +983,16 @@ impl PvgsStore {
             macro_consistency_digest: Some(consistency_digest),
         };
 
-        let (receipt, _proof) =
-            verify_macro_milestone_append(finalize_req, self, keystore, vrf_engine);
+        let (receipt, _) = verify_macro_milestone_append(finalize_req, self, keystore, vrf_engine);
         if receipt.status == ReceiptStatus::Rejected {
+            if receipt
+                .reject_reason_codes
+                .contains(&protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string())
+                && self.macro_milestones.get_finalized(macro_id).is_some()
+            {
+                return Ok(None);
+            }
+
             return Err(AutoCommitError::Rejected(receipt.reject_reason_codes));
         }
 
@@ -1611,8 +1639,6 @@ fn verify_macro_milestone_append(
 ) -> (PVGSReceipt, Option<ProofReceipt>) {
     let mut reject_reason_codes = Vec::new();
     let receipt_input = to_receipt_input(&req);
-    let is_proposal = matches!(req.commit_type, CommitType::MacroMilestonePropose);
-
     if req.epoch_id != keystore.current_epoch() {
         reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
         return finalize_receipt(FinalizeReceiptArgs {
@@ -1693,6 +1719,11 @@ fn verify_macro_milestone_append(
             event_reason_codes: None,
         });
     };
+
+    let is_proposal = matches!(req.commit_type, CommitType::MacroMilestonePropose)
+        || (req.commit_type == CommitType::MilestoneAppend
+            && MacroMilestoneState::try_from(macro_milestone.state)
+                .is_ok_and(|state| state == MacroMilestoneState::Proposed));
 
     let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap_or([0u8; 32]);
     let consistency_digest = req.macro_consistency_digest;
@@ -4569,8 +4600,24 @@ mod tests {
         assert_eq!(store.meso_milestones.list().len(), 2);
 
         let macro_receipt = store
-            .auto_commit_next_macro(&keystore, &vrf_engine)
+            .auto_propose_next_macro(&keystore, &vrf_engine)
             .expect("auto macro")
+            .expect("macro receipt");
+
+        assert_eq!(macro_receipt.status, ReceiptStatus::Accepted);
+        assert_eq!(store.macro_milestones.len(), 0);
+
+        let proposed_macro_id = store
+            .macro_milestones
+            .proposed_ids()
+            .pop()
+            .expect("proposal stored");
+
+        assert!(store.cbv_store.latest().is_none());
+
+        let macro_receipt = store
+            .finalize_macro(&proposed_macro_id, [0x31u8; 32], &keystore, &vrf_engine)
+            .expect("macro finalize")
             .expect("macro receipt");
 
         assert_eq!(macro_receipt.status, ReceiptStatus::Accepted);
@@ -4613,7 +4660,7 @@ mod tests {
         assert!(cbv_logged);
 
         let second = store
-            .auto_commit_next_macro(&keystore, &vrf_engine)
+            .auto_propose_next_macro(&keystore, &vrf_engine)
             .expect("second macro attempt");
         assert!(second.is_none());
     }
