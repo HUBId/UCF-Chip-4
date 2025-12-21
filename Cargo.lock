@@ -70,6 +70,7 @@ dependencies = [
  "pvgs",
  "query",
  "receipts",
+ "recovery",
  "replay_plan",
  "sep",
  "ucf-protocol",

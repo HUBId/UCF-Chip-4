@@ -79,6 +79,38 @@ pub mod ucf {
             IntegrityOk,
         }
 
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum RecoveryCheck {
+            IntegrityOk,
+            ValidationPassed,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum RecoveryState {
+            R0Captured,
+            R1Triaged,
+            R2Validated,
+            R3Mitigated,
+            R4Remediated,
+            R5Approved,
+            R6Unlocked,
+            R7Closed,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct RecoveryCase {
+            pub recovery_id: String,
+            pub session_id: String,
+            pub state: RecoveryState,
+            pub required_checks: Vec<RecoveryCheck>,
+            pub completed_checks: Vec<RecoveryCheck>,
+            pub trigger_refs: Vec<String>,
+            pub created_at_ms: Option<u64>,
+        }
+
         /// Binding information recorded inside receipts.
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
         #[derive(Clone, Debug, PartialEq, Eq)]

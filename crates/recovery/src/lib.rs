@@ -57,6 +57,7 @@ pub struct RecoveryCase {
     pub required_checks: Vec<RecoveryCheck>,
     pub completed_checks: Vec<RecoveryCheck>,
     pub trigger_refs: Vec<String>,
+    pub created_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -143,8 +144,20 @@ impl RecoveryStore {
         self.cases
             .values()
             .filter(|case| case.session_id == session_id && case.state != RecoveryState::R7Closed)
-            .max_by_key(|case| case.state)
             .cloned()
+            .max_by(RecoveryStore::case_ordering)
+    }
+
+    pub fn list_for_session(&self, session_id: &str) -> Vec<RecoveryCase> {
+        let mut cases: Vec<_> = self
+            .cases
+            .values()
+            .filter(|case| case.session_id == session_id)
+            .cloned()
+            .collect();
+
+        cases.sort_by(RecoveryStore::case_ordering);
+        cases
     }
 
     fn valid_required_checks(&self, checks: &[RecoveryCheck]) -> bool {
@@ -167,6 +180,16 @@ impl RecoveryStore {
 
         subset.iter().all(|chk| required_set.contains(chk))
     }
+
+    fn case_ordering(a: &RecoveryCase, b: &RecoveryCase) -> std::cmp::Ordering {
+        let created_a = a.created_at_ms.unwrap_or_default();
+        let created_b = b.created_at_ms.unwrap_or_default();
+
+        created_a
+            .cmp(&created_b)
+            .then_with(|| a.recovery_id.cmp(&b.recovery_id))
+            .then_with(|| a.state.cmp(&b.state))
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +204,7 @@ mod tests {
             required_checks: vec![RecoveryCheck::IntegrityOk, RecoveryCheck::ValidationPassed],
             completed_checks: Vec::new(),
             trigger_refs: vec!["trigger".to_string()],
+            created_at_ms: None,
         }
     }
 

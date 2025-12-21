@@ -979,6 +979,7 @@ impl PvgsStore {
             required_checks: vec![RecoveryCheck::IntegrityOk, RecoveryCheck::ValidationPassed],
             completed_checks: Vec::new(),
             trigger_refs: vec![seal.seal_id.clone()],
+            created_at_ms: None,
         };
 
         let _ = self.recovery_store.insert_new(case);
@@ -5143,6 +5144,7 @@ mod tests {
             required_checks: vec![RecoveryCheck::IntegrityOk, RecoveryCheck::ValidationPassed],
             completed_checks,
             trigger_refs: vec!["trigger".to_string()],
+            created_at_ms: None,
         }
     }
 
