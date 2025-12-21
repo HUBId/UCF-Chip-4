@@ -9,7 +9,7 @@ use consistency::{validate_feedback, ConsistencyStore};
 use dlp_store::DlpDecisionStore;
 use ed25519_dalek::Signer;
 use keys::{verify_key_epoch_signature, KeyEpochHistory, KeyStore};
-use limits::DEFAULT_LIMITS;
+use limits::{StoreLimits, DEFAULT_LIMITS};
 use milestones::{
     compute_meso_digest, MacroDeriver, MesoDeriver, MesoMilestone, MesoMilestoneStore,
     MicroMilestoneStore,
@@ -213,6 +213,7 @@ pub struct ExperienceStore {
     pub head_record_digest: [u8; 32],
     pub head_id: u64,
     pub proof_receipts: HashMap<[u8; 32], ProofReceipt>,
+    pub limits: StoreLimits,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -409,6 +410,7 @@ fn macro_proposal_from(macro_milestone: &MacroMilestone) -> MacroMilestone {
 pub struct PvgsStore {
     pub current_head_record_digest: [u8; 32],
     pub experience_store: ExperienceStore,
+    pub limits: StoreLimits,
     pub receipts: HashMap<[u8; 32], PVGSReceipt>,
     pub known_charter_versions: HashSet<String>,
     pub known_policy_versions: HashSet<String>,
@@ -442,13 +444,16 @@ impl PvgsStore {
         known_policy_versions: HashSet<String>,
         known_profiles: HashSet<[u8; 32]>,
     ) -> Self {
+        let limits = StoreLimits::default();
         let experience_store = ExperienceStore {
             head_record_digest: current_head_record_digest,
+            limits,
             ..Default::default()
         };
         Self {
             current_head_record_digest,
             experience_store,
+            limits,
             receipts: HashMap::new(),
             known_charter_versions,
             known_policy_versions,
@@ -755,13 +760,19 @@ impl PvgsStore {
 
     pub fn append_record(
         &mut self,
+        session_id: &str,
         record: ExperienceRecord,
         record_digest: [u8; 32],
         proof_receipt: ProofReceipt,
     ) {
         self.current_head_record_digest = record_digest;
-        self.experience_store
-            .append(record, record_digest, proof_receipt);
+        self.experience_store.append(
+            record,
+            record_digest,
+            proof_receipt,
+            &mut self.sep_log,
+            session_id,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1093,7 +1104,45 @@ impl ExperienceStore {
         record: ExperienceRecord,
         record_digest: [u8; 32],
         proof_receipt: ProofReceipt,
+        sep_log: &mut SepLog,
+        session_id: &str,
     ) {
+        let limit = self.limits.max_experience_records;
+
+        if limit == 0 {
+            return;
+        }
+
+        while self.records.len() >= limit {
+            if let Some(evicted) = self.records.first() {
+                if let Some(evicted_digest) = evicted
+                    .finalization_header
+                    .as_ref()
+                    .and_then(|header| digest_from_bytes(&header.record_digest))
+                {
+                    self.proof_receipts.remove(&evicted_digest);
+                    sep_log.append_event(
+                        session_id.to_string(),
+                        SepEventType::EvOutcome,
+                        evicted_digest,
+                        vec!["RC.GV.RETENTION.EVICTED".to_string()],
+                    );
+                }
+            }
+
+            self.records.remove(0);
+
+            if let Some(latest) = self.records.last() {
+                self.head_record_digest = latest
+                    .finalization_header
+                    .as_ref()
+                    .and_then(|header| digest_from_bytes(&header.record_digest))
+                    .unwrap_or([0u8; 32]);
+            } else {
+                self.head_record_digest = [0u8; 32];
+            }
+        }
+
         self.records.push(record);
         self.head_record_digest = record_digest;
         self.head_id = self.head_id.saturating_add(1);
@@ -2982,7 +3031,7 @@ fn verify_experience_record_append(
 
     store.add_record_edges(record_digest, req.bindings.prev_record_digest, &record);
     log_experience_events(&req.commit_id, record_digest, &record, store);
-    store.append_record(record, record_digest, proof_receipt.clone());
+    store.append_record(&req.commit_id, record, record_digest, proof_receipt.clone());
 
     (receipt, Some(proof_receipt))
 }
