@@ -139,6 +139,9 @@ fn derive_macro_for_chunk(
         meso_refs,
         consistency_class: "CONSISTENCY_HIGH".to_string(),
         identity_anchor_flag: true,
+        proof_receipt_ref: None,
+        consistency_digest: None,
+        consistency_feedback_ref: None,
     };
 
     let digest = compute_macro_digest(&macro_milestone);

@@ -343,6 +343,9 @@ mod tests {
             meso_refs: Vec::new(),
             consistency_class: "CONSISTENCY_HIGH".to_string(),
             identity_anchor_flag: true,
+            proof_receipt_ref: None,
+            consistency_digest: None,
+            consistency_feedback_ref: None,
         }
     }
 
