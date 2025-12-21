@@ -1203,10 +1203,11 @@ mod tests {
             flags: Vec::new(),
             proof_receipt_ref: None,
         };
-        let consistency_digest = store
+        let (consistency_digest, evicted) = store
             .consistency_store
             .insert(feedback)
             .expect("feedback stored");
+        assert!(evicted.is_empty());
 
         let receipt = store
             .finalize_macro("macro-high", consistency_digest, &keystore, &vrf_engine)
