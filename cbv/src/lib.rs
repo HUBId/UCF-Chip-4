@@ -81,7 +81,7 @@ impl CbvStore {
         let limit = self.limits.max_cbvs;
 
         if limit == 0 {
-            evicted.extend(self.entries.drain(..));
+            evicted.append(&mut self.entries);
             evicted.push(cbv);
             return evicted;
         }

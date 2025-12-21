@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
 /// Default, shareable size limits for PVGS in-memory stores.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreLimits {
     /// Number of consistency signals retained per session when deriving replay triggers.
