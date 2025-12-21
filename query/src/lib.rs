@@ -806,7 +806,7 @@ mod tests {
         compute_ruleset_digest, verify_and_commit, CommitBindings, CommitType, RequiredCheck,
         RequiredReceiptKind,
     };
-    use replay_plan::build_replay_plan;
+    use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
     use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
     use ucf_protocol::ucf::v1::{
@@ -1865,26 +1865,26 @@ mod tests {
             id: "target".to_string(),
         };
 
-        let plan_two = build_replay_plan(
-            "sess",
-            1,
-            [1u8; 32],
-            ReplayTargetKind::Macro,
-            vec![target_ref.clone()],
-            ReplayFidelity::Low,
-            2,
-            Vec::new(),
-        );
-        let plan_one = build_replay_plan(
-            "sess",
-            1,
-            [1u8; 32],
-            ReplayTargetKind::Macro,
-            vec![target_ref],
-            ReplayFidelity::Low,
-            1,
-            Vec::new(),
-        );
+        let plan_two = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "sess".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![target_ref.clone()],
+            fidelity: ReplayFidelity::Low,
+            counter: 2,
+            trigger_reason_codes: Vec::new(),
+        });
+        let plan_one = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "sess".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![target_ref],
+            fidelity: ReplayFidelity::Low,
+            counter: 1,
+            trigger_reason_codes: Vec::new(),
+        });
 
         store.replay_plans.push(plan_two).unwrap();
         store.replay_plans.push(plan_one).unwrap();

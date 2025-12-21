@@ -18,7 +18,7 @@ use prost::Message;
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
 use replay_plan::{
     build_replay_plan, ref_from_digest, replay_trigger_reasons, should_generate_replay,
-    ConsistencyClass, ConsistencyCounts, ReplayPlanStore, ReplaySignals,
+    BuildReplayPlanArgs, ConsistencyClass, ConsistencyCounts, ReplayPlanStore, ReplaySignals,
 };
 use sep::{CausalGraph, EdgeType, FrameEventKind, NodeKey, SepEventType, SepLog};
 use std::collections::{HashMap, HashSet};
@@ -530,7 +530,7 @@ impl PvgsStore {
             .recent_for_session(session_id, CONSISTENCY_SIGNAL_WINDOW)
         {
             if let Some(feedback) = self.consistency_store.get(digest) {
-                if let Some(class) = ConsistencyClass::from_str(&feedback.consistency_class) {
+                if let Ok(class) = feedback.consistency_class.parse::<ConsistencyClass>() {
                     latest_consistency_class = Some(class.clone());
                     match class {
                         ConsistencyClass::Low => consistency_counts.low_count += 1,
@@ -590,16 +590,16 @@ impl PvgsStore {
         };
 
         let counter = self.replay_plans.plans.len() + 1;
-        let plan = build_replay_plan(
-            session_id,
-            self.experience_store.head_id,
-            self.current_head_record_digest,
+        let plan = build_replay_plan(BuildReplayPlanArgs {
+            session_id: session_id.to_string(),
+            head_experience_id: self.experience_store.head_id,
+            head_record_digest: self.current_head_record_digest,
             target_kind,
             target_refs,
             fidelity,
             counter,
-            trigger_reason_codes.clone(),
-        );
+            trigger_reason_codes: trigger_reason_codes.clone(),
+        });
 
         if self.replay_plans.push(plan.clone()).is_err() {
             return None;
