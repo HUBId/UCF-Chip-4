@@ -10,3 +10,4 @@ serde = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
 log = "0.4"
 limits = { workspace = true }
+ucf-protocol = { workspace = true }

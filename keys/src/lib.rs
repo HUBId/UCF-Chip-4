@@ -3,7 +3,7 @@
 use blake3::Hasher;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::OsRng;
-use sep::{SepEventType, SepLog};
+use sep::{SepError, SepEventType, SepLog};
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{Digest32, PVGSKeyEpoch, ReasonCodes};
 
@@ -37,6 +37,8 @@ pub enum KeyEpochHistoryError {
     MissingPreviousDigest,
     #[error("previous digest does not match latest announcement")]
     PreviousDigestMismatch,
+    #[error("sep error: {0}")]
+    Sep(#[from] SepError),
 }
 
 /// In-memory keystore tracking the current signing key and historical epochs.
@@ -185,7 +187,7 @@ impl KeyStore {
             SepEventType::EvRecoveryGov,
             proto.announcement_digest.0,
             vec![ReasonCodes::GV_KEY_EPOCH_ROTATED.to_string()],
-        );
+        )?;
 
         Ok(proto)
     }
