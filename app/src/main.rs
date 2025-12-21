@@ -97,9 +97,7 @@ fn format_snapshot(snapshot: &PvgsSnapshot) -> String {
 }
 
 fn hex_or_none(value: Option<[u8; 32]>) -> String {
-    value
-        .map(encode)
-        .unwrap_or_else(|| "NONE".to_string())
+    value.map(encode).unwrap_or_else(|| "NONE".to_string())
 }
 
 #[cfg(test)]
