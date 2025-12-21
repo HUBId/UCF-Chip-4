@@ -6,10 +6,7 @@ use cbv::{
 use dlp_store::DlpDecisionStore;
 use milestones::{MesoMilestone, MicroMilestone};
 use pev::{pev_digest, PolicyEcologyVector};
-use pvgs::{
-    compute_experience_record_digest, CompletenessChecker, CompletenessStatus, PvgsCommitRequest,
-    PvgsStore,
-};
+use pvgs::{compute_experience_record_digest, CompletenessStatus, PvgsCommitRequest, PvgsStore};
 use sep::{EdgeType, NodeKey, SepEventInternal, SepEventType, SepLog};
 use std::collections::{BTreeSet, VecDeque};
 use std::convert::TryFrom;
@@ -223,15 +220,8 @@ pub fn snapshot(store: &PvgsStore, session_id: Option<&str>) -> PvgsSnapshot {
             return None;
         }
 
-        let mut sep_log = store.sep_log.clone();
-        let mut checker = CompletenessChecker::new(
-            &store.causal_graph,
-            &mut sep_log,
-            &store.dlp_store,
-            &store.replay_plans,
-            &store.experience_store.records,
-        );
-        let status = checker.check_actions(session, action_digests).status;
+        let mut store = store.clone();
+        let status = store.check_completeness(session, action_digests).status;
 
         match status {
             CompletenessStatus::Ok => Some("OK".to_string()),
