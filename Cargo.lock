@@ -129,6 +129,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "hex",
+ "limits",
  "prost",
  "serde",
  "serde_yaml",
@@ -203,6 +204,7 @@ name = "consistency"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "limits",
  "prost",
  "thiserror",
  "ucf-protocol",
@@ -457,6 +459,9 @@ checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
 [[package]]
 name = "limits"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "log"
@@ -493,6 +498,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "pev"
 version = "0.1.0"
 dependencies = [
+ "limits",
  "serde",
  "thiserror",
  "ucf-protocol",

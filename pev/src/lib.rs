@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use limits::StoreLimits;
 use thiserror::Error;
 pub use ucf_protocol::ucf::v1::{PolicyEcologyDimension, PolicyEcologyVector};
 
@@ -25,16 +26,43 @@ pub enum PevError {
 
 /// Append-only Policy Ecology Vector store with validation.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PevStore {
     pevs: Vec<PolicyEcologyVector>,
+    limits: StoreLimits,
+}
+
+impl Default for PevStore {
+    fn default() -> Self {
+        Self::with_limits(StoreLimits::default())
+    }
 }
 
 impl PevStore {
-    pub fn push(&mut self, pev: PolicyEcologyVector) -> Result<(), PevError> {
+    pub fn with_limits(limits: StoreLimits) -> Self {
+        Self {
+            pevs: Vec::new(),
+            limits,
+        }
+    }
+
+    pub fn push(&mut self, pev: PolicyEcologyVector) -> Result<Vec<PolicyEcologyVector>, PevError> {
         self.validate(&pev)?;
+        let mut evicted = Vec::new();
+        let limit = self.limits.max_pevs;
+
+        if limit == 0 {
+            evicted.append(&mut self.pevs);
+            evicted.push(pev);
+            return Ok(evicted);
+        }
+
+        while self.pevs.len() >= limit {
+            evicted.push(self.pevs.remove(0));
+        }
+
         self.pevs.push(pev);
-        Ok(())
+        Ok(evicted)
     }
 
     pub fn latest(&self) -> Option<&PolicyEcologyVector> {
@@ -143,8 +171,8 @@ mod tests {
         let first = pev([1u8; 32], Some(1));
         let second = pev([2u8; 32], Some(2));
 
-        store.push(first.clone()).expect("first push");
-        store.push(second.clone()).expect("second push");
+        assert!(store.push(first.clone()).expect("first push").is_empty());
+        assert!(store.push(second.clone()).expect("second push").is_empty());
 
         assert_eq!(store.latest(), Some(&second));
         assert_eq!(
@@ -173,7 +201,10 @@ mod tests {
     #[test]
     fn rejects_non_monotonic_epoch() {
         let mut store = PevStore::default();
-        store.push(pev([1u8; 32], Some(5))).expect("first push");
+        assert!(store
+            .push(pev([1u8; 32], Some(5)))
+            .expect("first push")
+            .is_empty());
 
         let err = store
             .push(pev([2u8; 32], Some(4)))
@@ -196,5 +227,22 @@ mod tests {
 
         let err = store.push(pev).expect_err("push should fail");
         assert_eq!(err, PevError::InvalidDigestLength);
+    }
+
+    #[test]
+    fn evicts_oldest_pev_when_limit_exceeded() {
+        let mut store = PevStore::with_limits(StoreLimits {
+            max_pevs: 1,
+            ..StoreLimits::default()
+        });
+
+        let first = pev([1u8; 32], Some(1));
+        let second = pev([2u8; 32], Some(2));
+
+        assert!(store.push(first.clone()).expect("first push").is_empty());
+        let evicted = store.push(second.clone()).expect("second push");
+
+        assert_eq!(evicted, vec![first]);
+        assert_eq!(store.latest(), Some(&second));
     }
 }

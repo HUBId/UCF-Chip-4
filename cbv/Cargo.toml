@@ -11,3 +11,4 @@ blake3.workspace = true
 prost.workspace = true
 ucf-protocol = { path = "../ucf-protocol" }
 hex.workspace = true
+limits = { path = "../crates/limits" }

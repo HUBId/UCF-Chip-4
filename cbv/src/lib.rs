@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hasher;
+use limits::StoreLimits;
 use prost::Message;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -55,14 +56,42 @@ enum TraitField {
 }
 
 /// Append-only CBV store.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CbvStore {
     entries: Vec<CharacterBaselineVector>,
+    limits: StoreLimits,
+}
+
+impl Default for CbvStore {
+    fn default() -> Self {
+        Self::with_limits(StoreLimits::default())
+    }
 }
 
 impl CbvStore {
-    pub fn push(&mut self, cbv: CharacterBaselineVector) {
+    pub fn with_limits(limits: StoreLimits) -> Self {
+        Self {
+            entries: Vec::new(),
+            limits,
+        }
+    }
+
+    pub fn push(&mut self, cbv: CharacterBaselineVector) -> Vec<CharacterBaselineVector> {
+        let mut evicted = Vec::new();
+        let limit = self.limits.max_cbvs;
+
+        if limit == 0 {
+            evicted.append(&mut self.entries);
+            evicted.push(cbv);
+            return evicted;
+        }
+
+        while self.entries.len() >= limit {
+            evicted.push(self.entries.remove(0));
+        }
+
         self.entries.push(cbv);
+        evicted
     }
 
     pub fn latest(&self) -> Option<&CharacterBaselineVector> {
@@ -363,6 +392,24 @@ mod tests {
         }
     }
 
+    fn cbv_with_epoch(epoch: u64) -> CharacterBaselineVector {
+        CharacterBaselineVector {
+            cbv_epoch: epoch,
+            baseline_caution_offset: 0,
+            baseline_novelty_dampening_offset: 0,
+            baseline_approval_strictness_offset: 0,
+            baseline_export_strictness_offset: 0,
+            baseline_chain_conservatism_offset: 0,
+            baseline_cooldown_multiplier_class: 0,
+            cbv_digest: Some([epoch as u8; 32].to_vec()),
+            source_milestone_refs: Vec::new(),
+            source_event_refs: Vec::new(),
+            proof_receipt_ref: None,
+            pvgs_attestation_key_id: String::new(),
+            pvgs_attestation_sig: Vec::new(),
+        }
+    }
+
     #[test]
     fn derivation_is_deterministic() {
         let updates = vec![update(
@@ -449,5 +496,25 @@ mod tests {
 
         assert_eq!(derived.cbv.baseline_cooldown_multiplier_class, 3);
         assert!(derived.applied_updates);
+    }
+
+    #[test]
+    fn cbv_store_evicts_fifo() {
+        let mut store = CbvStore::with_limits(StoreLimits {
+            max_cbvs: 2,
+            ..StoreLimits::default()
+        });
+
+        let first = cbv_with_epoch(1);
+        let second = cbv_with_epoch(2);
+        let third = cbv_with_epoch(3);
+
+        assert!(store.push(first.clone()).is_empty());
+        assert!(store.push(second.clone()).is_empty());
+
+        let evicted = store.push(third.clone());
+        assert_eq!(evicted, vec![first]);
+        assert_eq!(store.latest(), Some(&third));
+        assert_eq!(store.list_latest(5), vec![second, third]);
     }
 }

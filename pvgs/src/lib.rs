@@ -2,8 +2,8 @@
 
 use blake3::Hasher;
 use cbv::{
-    cbv_attestation_preimage, compute_cbv_verified_fields_digest, derive_next_cbv,
-    CbvDeriverConfig, CbvStore,
+    cbv_attestation_preimage, compute_cbv_digest, compute_cbv_verified_fields_digest,
+    derive_next_cbv, CbvDeriverConfig, CbvStore,
 };
 use consistency::{validate_feedback, ConsistencyStore};
 use dlp_store::DlpDecisionStore;
@@ -467,10 +467,10 @@ impl PvgsStore {
             known_policy_versions,
             known_profiles,
             key_epoch_history: KeyEpochHistory::default(),
-            cbv_store: CbvStore::default(),
-            pev_store: PevStore::default(),
+            cbv_store: CbvStore::with_limits(limits),
+            pev_store: PevStore::with_limits(limits),
             dlp_store: DlpDecisionStore::default(),
-            consistency_store: ConsistencyStore::default(),
+            consistency_store: ConsistencyStore::with_limits(limits),
             consistency_history: ConsistencyHistory::default(),
             tool_registry_state: ToolRegistryState::default(),
             micro_milestones: MicroMilestoneStore::default(),
@@ -659,6 +659,21 @@ impl PvgsStore {
                 reason_codes,
             )
             .expect("sep log append failed");
+    }
+
+    fn log_retention_evictions(
+        &mut self,
+        session_id: &str,
+        evicted: impl IntoIterator<Item = [u8; 32]>,
+    ) {
+        for digest in evicted {
+            let _ = self.sep_log.append_event(
+                session_id.to_string(),
+                SepEventType::EvOutcome,
+                digest,
+                vec!["RC.GV.RETENTION.EVICTED".to_string()],
+            );
+        }
     }
 
     fn add_graph_edge(
@@ -950,7 +965,11 @@ impl PvgsStore {
         let signature = keystore.signing_key().sign(&cbv_attestation_preimage(&cbv));
         cbv.pvgs_attestation_sig = signature.to_bytes().to_vec();
 
-        self.cbv_store.push(cbv.clone());
+        let evicted = self.cbv_store.push(cbv.clone());
+        if !evicted.is_empty() {
+            let evicted_digests = evicted.iter().map(compute_cbv_digest).collect::<Vec<_>>();
+            self.log_retention_evictions(&macro_milestone.macro_id, evicted_digests);
+        }
 
         let mut reason_codes = vec![protocol::ReasonCodes::GV_CBV_UPDATED.to_string()];
         if !derived.applied_updates {
@@ -2704,10 +2723,17 @@ fn verify_pev_update(
     );
     proof_receipt.receipt_digest = receipt.receipt_digest.clone();
 
-    store
+    let evicted_pevs = store
         .pev_store
         .push(pev)
         .expect("validated PEV must be insertable");
+    if !evicted_pevs.is_empty() {
+        let evicted_digests = evicted_pevs
+            .iter()
+            .filter_map(extract_pev_digest)
+            .collect::<Vec<_>>();
+        store.log_retention_evictions(&req.commit_id, evicted_digests);
+    }
     store.committed_payload_digests.insert(pev_digest);
 
     if ruleset_changed {
