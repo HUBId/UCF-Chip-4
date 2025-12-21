@@ -919,7 +919,15 @@ impl PvgsStore {
             return Ok(Some(proposal_receipt));
         };
 
+        let Some(feedback) = self.consistency_store.get(consistency_digest) else {
+            return Ok(Some(proposal_receipt));
+        };
+
         let mut finalized = macro_milestone;
+        finalized.state = MacroMilestoneState::Finalized as i32;
+        finalized.identity_anchor_flag = true;
+        finalized.consistency_class = feedback.consistency_class.clone();
+        finalized.consistency_digest = Some(consistency_digest.to_vec());
         finalized.proof_receipt_ref.get_or_insert_with(Ref::default);
         finalized
             .consistency_feedback_ref
