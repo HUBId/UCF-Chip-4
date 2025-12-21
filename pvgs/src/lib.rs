@@ -4367,6 +4367,41 @@ mod tests {
     }
 
     #[test]
+    fn macro_proposal_emits_sep_without_cbv_update() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let macro_milestone = macro_with_state("macro-proposed", MacroMilestoneState::Finalized);
+        let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap();
+
+        let req = make_macro_request(
+            &macro_proposal_from(&macro_milestone),
+            &store,
+            1,
+            None,
+            CommitType::MacroMilestonePropose,
+        );
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof.is_some());
+        assert!(store.cbv_store.latest().is_none());
+
+        let event = store.sep_log.events.last().expect("missing sep event");
+        assert_eq!(event.event_type, SepEventType::EvRecoveryGov);
+        assert_eq!(event.object_digest, macro_digest);
+        assert!(event
+            .reason_codes
+            .contains(&ReasonCodes::GV_MACRO_PROPOSED.to_string()));
+        assert!(!event
+            .reason_codes
+            .contains(&ReasonCodes::GV_CBV_UPDATED.to_string()));
+    }
+
+    #[test]
     fn macro_append_rejects_low_consistency() {
         let prev = [8u8; 32];
         let mut store = base_store(prev);
@@ -4404,6 +4439,56 @@ mod tests {
             .contains(&ReasonCodes::GV_CONSISTENCY_LOW.to_string()));
         assert!(store.macro_milestones.get_proposed("macro-low").is_some());
         assert!(store.cbv_store.latest().is_none());
+    }
+
+    #[test]
+    fn macro_finalize_rejects_without_feedback() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let consistency_digest = [0x31u8; 32];
+
+        let macro_milestone = macro_with_state("macro-no-feedback", MacroMilestoneState::Finalized);
+        let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap();
+
+        let proposal_req = make_macro_request(
+            &macro_proposal_from(&macro_milestone),
+            &store,
+            1,
+            None,
+            CommitType::MacroMilestonePropose,
+        );
+        let (proposal_receipt, _) =
+            verify_and_commit(proposal_req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(proposal_receipt.status, ReceiptStatus::Accepted);
+
+        let finalize_req = make_macro_request(
+            &macro_milestone,
+            &store,
+            1,
+            Some(consistency_digest),
+            CommitType::MacroMilestoneFinalize,
+        );
+
+        let (receipt, proof) = verify_and_commit(finalize_req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert!(proof.is_none());
+        assert!(store.cbv_store.latest().is_none());
+        assert!(store
+            .macro_milestones
+            .get_proposed("macro-no-feedback")
+            .is_some());
+
+        let neighbors = store.causal_graph.neighbors(macro_digest);
+        assert!(!neighbors.contains(&(EdgeType::Finalizes, consistency_digest)));
+
+        let event = store.sep_log.events.last().expect("missing sep event");
+        assert_eq!(event.object_digest, macro_digest);
+        assert!(event
+            .reason_codes
+            .contains(&ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()));
     }
 
     fn sample_pev(digest: [u8; 32], epoch: u64) -> PolicyEcologyVector {
@@ -4649,6 +4734,99 @@ mod tests {
             e.reason_codes
                 .contains(&ReasonCodes::GV_CBV_UPDATED.to_string())
         }));
+    }
+
+    #[test]
+    fn macro_finalize_accepts_high_feedback_and_updates_cbv_and_graphs() {
+        let prev = [9u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let consistency_digest = [0x41u8; 32];
+        let meso_digest = [0x42u8; 32];
+        let meso_ref = Ref {
+            id: hex::encode(meso_digest),
+        };
+
+        store_consistency_feedback(&mut store, consistency_digest, "CONSISTENCY_HIGH");
+
+        let mut macro_milestone = macro_with_updates(
+            "macro-high",
+            vec![cbv_update(
+                "baseline_approval_strictness_offset",
+                TraitDirection::IncreaseStrictness,
+                MagnitudeClass::Low,
+            )],
+        );
+        macro_milestone.meso_refs = vec![meso_ref];
+        let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap();
+
+        let proposal_req = make_macro_request(
+            &macro_proposal_from(&macro_milestone),
+            &store,
+            1,
+            None,
+            CommitType::MacroMilestonePropose,
+        );
+        let (proposal_receipt, _) =
+            verify_and_commit(proposal_req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(proposal_receipt.status, ReceiptStatus::Accepted);
+        assert!(store.cbv_store.latest().is_none());
+
+        let finalize_req = make_macro_request(
+            &macro_milestone,
+            &store,
+            1,
+            Some(consistency_digest),
+            CommitType::MacroMilestoneFinalize,
+        );
+
+        let (receipt, proof) =
+            verify_and_commit(finalize_req.clone(), &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof.is_some());
+        let cbv_epoch = store.cbv_store.latest().expect("cbv missing").cbv_epoch;
+        assert_eq!(cbv_epoch, 1);
+
+        let neighbors = store.causal_graph.neighbors(macro_digest);
+        assert!(neighbors.contains(&(EdgeType::Finalizes, meso_digest)));
+        assert!(neighbors.contains(&(EdgeType::Finalizes, consistency_digest)));
+
+        assert!(store.sep_log.events.iter().any(|e| {
+            e.object_digest == macro_digest
+                && e.reason_codes
+                    .contains(&ReasonCodes::GV_MACRO_PROPOSED.to_string())
+        }));
+        assert!(store.sep_log.events.iter().any(|e| {
+            e.object_digest == macro_digest
+                && e.reason_codes
+                    .contains(&ReasonCodes::GV_MACRO_FINALIZED.to_string())
+                && e.reason_codes
+                    .contains(&ReasonCodes::GV_CONSISTENCY_APPENDED.to_string())
+        }));
+        assert!(store.sep_log.events.iter().any(|e| {
+            e.reason_codes
+                .contains(&ReasonCodes::GV_CBV_UPDATED.to_string())
+        }));
+
+        let (dup_receipt, dup_proof) =
+            verify_and_commit(finalize_req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(dup_receipt.status, ReceiptStatus::Rejected);
+        assert!(dup_proof.is_none());
+        assert_eq!(
+            store.cbv_store.latest().expect("cbv missing").cbv_epoch,
+            cbv_epoch
+        );
+        assert_eq!(
+            dup_receipt.reject_reason_codes,
+            vec![ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()]
+        );
+
+        let last_event = store.sep_log.events.last().expect("missing sep event");
+        assert_eq!(last_event.object_digest, macro_digest);
+        assert_eq!(last_event.reason_codes, dup_receipt.reject_reason_codes);
     }
 
     #[test]
