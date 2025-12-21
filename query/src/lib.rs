@@ -164,7 +164,6 @@ pub fn get_latest_pev_digest(store: &PvgsStore) -> Option<[u8; 32]> {
 }
 
 /// List all known PEV version digests in insertion order.
-
 pub fn is_session_sealed(store: &PvgsStore, session_id: &str) -> bool {
     store.forensic_mode
         && store.sep_log.events.iter().any(|event| {
