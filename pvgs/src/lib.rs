@@ -33,8 +33,8 @@ use tool_registry_state::{ToolRegistryError, ToolRegistryState};
 use ucf_protocol::ucf::v1::{
     self as protocol, CharacterBaselineVector, ConsistencyFeedback, Digest32, DlpDecision,
     DlpDecisionForm, ExperienceRecord, FinalizationHeader, MacroMilestone, MacroMilestoneState,
-    PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReceiptStatus, RecordType, Ref, ReplayFidelity,
-    ReplayPlan, ReplayTargetKind, ToolRegistryContainer,
+    PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes, ReceiptStatus, RecordType, Ref,
+    ReplayFidelity, ReplayPlan, ReplayTargetKind, ToolRegistryContainer,
 };
 use vrf::VrfEngine;
 
@@ -520,6 +520,126 @@ pub struct PvgsStore {
     pub receipt_gate_enabled: bool,
     pub forensic_mode: bool,
     pub ruleset_state: RulesetState,
+}
+
+/// Helper for planned commits that require mutable access to the PVGS store and cryptographic
+/// material.
+pub struct PvgsPlanner<'a> {
+    store: &'a mut PvgsStore,
+    keystore: &'a mut KeyStore,
+    vrf_engine: &'a mut VrfEngine,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum Error {
+    #[error("key epoch ids must increase (last {last}, next {next})")]
+    NonMonotonic { last: u64, next: u64 },
+    #[error("key epoch commit rejected: {0:?}")]
+    Rejected(Vec<String>),
+    #[error(transparent)]
+    Sep(#[from] SepError),
+}
+
+impl<'a> PvgsPlanner<'a> {
+    pub fn new(
+        store: &'a mut PvgsStore,
+        keystore: &'a mut KeyStore,
+        vrf_engine: &'a mut VrfEngine,
+    ) -> Self {
+        Self {
+            store,
+            keystore,
+            vrf_engine,
+        }
+    }
+
+    /// Rotate the attestation and VRF keys, announce them via the KeyEpochUpdate flow, and log
+    /// SEP evidence for the rotation.
+    pub fn planned_rotate_keys(
+        &mut self,
+        new_epoch_id: u64,
+        created_at_ms: u64,
+    ) -> Result<PVGSKeyEpoch, Error> {
+        let last_committed = self
+            .store
+            .key_epoch_history
+            .current()
+            .map(|epoch| epoch.key_epoch_id)
+            .unwrap_or(0);
+        let last_epoch = last_committed.max(self.keystore.current_epoch());
+
+        if new_epoch_id <= last_epoch {
+            return Err(Error::NonMonotonic {
+                last: last_epoch,
+                next: new_epoch_id,
+            });
+        }
+
+        let prev_digest = self
+            .store
+            .key_epoch_history
+            .current()
+            .map(|epoch| epoch.announcement_digest.0);
+
+        self.vrf_engine.rotate(new_epoch_id);
+        self.keystore.rotate(new_epoch_id);
+        let epoch = self.keystore.make_key_epoch_proto(
+            new_epoch_id,
+            created_at_ms,
+            self.vrf_engine.vrf_public_key().to_vec(),
+            prev_digest,
+        );
+
+        let commit_id = format!("key-epoch-{new_epoch_id}");
+        let req = PvgsCommitRequest {
+            commit_id: commit_id.clone(),
+            commit_type: CommitType::KeyEpochUpdate,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: self.store.ruleset_state.charter_version_digest.clone(),
+                policy_version_digest: self.store.ruleset_state.policy_version_digest.clone(),
+                prev_record_digest: self.store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+            payload_digests: vec![epoch.announcement_digest.0],
+            epoch_id: self.keystore.current_epoch(),
+            key_epoch: Some(epoch.clone()),
+            experience_record_payload: None,
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+        };
+
+        let (receipt, _) = verify_and_commit(req, self.store, self.keystore, self.vrf_engine);
+
+        if !matches!(receipt.status, ReceiptStatus::Accepted) {
+            return Err(Error::Rejected(receipt.reject_reason_codes));
+        }
+
+        self.store.record_sep_event(
+            &commit_id,
+            SepEventType::EvKeyEpoch,
+            epoch.announcement_digest.0,
+            vec![ReasonCodes::GV_KEY_EPOCH_ROTATED.to_string()],
+        )?;
+
+        Ok(self
+            .store
+            .key_epoch_history
+            .current()
+            .cloned()
+            .unwrap_or(epoch))
+    }
 }
 
 impl PvgsStore {
@@ -6000,6 +6120,48 @@ mod tests {
         let last_event = store.sep_log.events.last().expect("missing event");
         assert_eq!(last_event.event_type, SepEventType::EvKeyEpoch);
         assert_eq!(last_event.object_digest, epoch.announcement_digest.0);
+    }
+
+    #[test]
+    fn planned_key_rotation_commits_and_logs() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let mut keystore = KeyStore::new_dev_keystore(0);
+        let mut vrf_engine = VrfEngine::new_dev(0);
+
+        let mut planner = PvgsPlanner::new(&mut store, &mut keystore, &mut vrf_engine);
+        let epoch = planner
+            .planned_rotate_keys(1, 7777)
+            .expect("rotation should succeed");
+
+        let latest = store.key_epoch_history.current().expect("missing epoch");
+        assert_eq!(latest.key_epoch_id, 1);
+        assert_eq!(latest.announcement_digest, epoch.announcement_digest);
+
+        let last_event = store.sep_log.events.last().expect("missing sep event");
+        assert_eq!(last_event.event_type, SepEventType::EvKeyEpoch);
+        assert_eq!(last_event.object_digest, epoch.announcement_digest.0);
+        assert_eq!(
+            last_event.reason_codes,
+            vec![ReasonCodes::GV_KEY_EPOCH_ROTATED.to_string()]
+        );
+    }
+
+    #[test]
+    fn planned_key_rotation_rejects_regressions() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let mut keystore = KeyStore::new_dev_keystore(0);
+        let mut vrf_engine = VrfEngine::new_dev(0);
+
+        let mut planner = PvgsPlanner::new(&mut store, &mut keystore, &mut vrf_engine);
+        let _ = planner.planned_rotate_keys(1, 10).expect("first rotation");
+
+        let err = planner
+            .planned_rotate_keys(1, 20)
+            .expect_err("non-monotonic rotation should fail");
+
+        assert!(matches!(err, Error::NonMonotonic { last: 1, next: 1 }));
     }
 
     #[test]

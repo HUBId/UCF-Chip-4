@@ -86,6 +86,21 @@ impl VrfEngine {
         );
         temporary_vrf_digest(&self.signing_key, &message)
     }
+
+    /// Rotate the VRF keypair to a new epoch identifier.
+    pub fn rotate(&mut self, new_epoch_id: u64) {
+        let mut rng = OsRng;
+        let signing_key = SigningKey::generate(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+
+        self.current = VrfKeypair {
+            key_id: format!("vrf-epoch-{new_epoch_id}"),
+            epoch_id: new_epoch_id,
+            vrf_pk: verifying_key.to_bytes().to_vec(),
+            vrf_sk: signing_key.to_bytes().to_vec(),
+        };
+        self.signing_key = signing_key;
+    }
 }
 
 fn record_vrf_message(
