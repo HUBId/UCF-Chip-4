@@ -375,6 +375,10 @@ pub mod ucf {
             pub const GV_TOOL_REGISTRY_UPDATED: &'static str = "RC.GV.TOOL_REGISTRY.UPDATED";
             pub const GV_RULESET_CHANGED: &'static str = "RC.GV.RULESET.CHANGED";
             pub const RE_REPLAY_MISMATCH: &'static str = "RC.RE.REPLAY.MISMATCH";
+            pub const RE_REPLAY_PLAN_REF_MISSING: &'static str = "RC.RE.REPLAY.PLAN_REF_MISSING";
+            pub const RE_REPLAY_PLAN_MISSING: &'static str = "RC.RE.REPLAY.PLAN_MISSING";
+            pub const RE_REPLAY_INVALID_EMBEDDED_ACTION: &'static str =
+                "RC.RE.REPLAY.INVALID_EMBEDDED_ACTION";
             pub const RE_INTEGRITY_OK: &'static str = "RC.RE.INTEGRITY.OK";
             pub const CD_DLP_EXPORT_BLOCKED: &'static str = "RC.CD.DLP.EXPORT_BLOCKED";
             pub const CD_DLP_SECRET_PATTERN: &'static str = "RC.CD.DLP.SECRET_PATTERN";
@@ -443,6 +447,7 @@ pub mod ucf {
             RtOutput = 2,
             RtPerception = 3,
             RtDecision = 4,
+            RtReplay = 5,
         }
 
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

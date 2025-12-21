@@ -3389,6 +3389,7 @@ fn validate_experience_record(
                 reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
             }
         }
+        RecordType::RtReplay => {}
         RecordType::Unspecified => {
             reasons.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
         }
@@ -3595,6 +3596,9 @@ fn now_ms() -> u64 {
 }
 
 const RC_RE_DLP_DECISION_MISSING: &str = "RC.RE.DLP_DECISION.MISSING";
+const RC_RE_REPLAY_PLAN_REF_MISSING: &str = "RC.RE.REPLAY.PLAN_REF_MISSING";
+const RC_RE_REPLAY_PLAN_MISSING: &str = "RC.RE.REPLAY.PLAN_MISSING";
+const RC_RE_REPLAY_INVALID_EMBEDDED_ACTION: &str = "RC.RE.REPLAY.INVALID_EMBEDDED_ACTION";
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3618,6 +3622,7 @@ pub struct CompletenessChecker<'a> {
     graph: &'a CausalGraph,
     sep_log: &'a mut SepLog,
     dlp_store: &'a DlpDecisionStore,
+    replay_plans: &'a ReplayPlanStore,
     records: &'a [ExperienceRecord],
 }
 
@@ -3626,12 +3631,14 @@ impl<'a> CompletenessChecker<'a> {
         graph: &'a CausalGraph,
         sep_log: &'a mut SepLog,
         dlp_store: &'a DlpDecisionStore,
+        replay_plans: &'a ReplayPlanStore,
         records: &'a [ExperienceRecord],
     ) -> Self {
         Self {
             graph,
             sep_log,
             dlp_store,
+            replay_plans,
             records,
         }
     }
@@ -3835,6 +3842,47 @@ impl<'a> CompletenessChecker<'a> {
             }
         }
 
+        for (record_digest, record) in self.replay_records_for_session(session_id) {
+            let (plan_digest, has_embedded_action) = replay_plan_digest_from_record(&record);
+
+            if has_embedded_action {
+                status = CompletenessStatus::Fail;
+                reason_codes.insert(protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string());
+                reason_codes.insert(RC_RE_REPLAY_INVALID_EMBEDDED_ACTION.to_string());
+                self.sep_log.append_event(
+                    session_id.to_string(),
+                    SepEventType::EvReplay,
+                    record_digest,
+                    vec![RC_RE_REPLAY_INVALID_EMBEDDED_ACTION.to_string()],
+                );
+            }
+
+            let Some(plan_digest) = plan_digest else {
+                if !matches!(status, CompletenessStatus::Fail) {
+                    status = CompletenessStatus::Degraded;
+                }
+                reason_codes.insert(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+                reason_codes.insert(RC_RE_REPLAY_PLAN_REF_MISSING.to_string());
+                continue;
+            };
+
+            if !self.replay_plan_exists(plan_digest) {
+                if !matches!(status, CompletenessStatus::Fail) {
+                    status = CompletenessStatus::Degraded;
+                }
+                if missing_nodes.insert(plan_digest) {
+                    self.sep_log.append_event(
+                        session_id.to_string(),
+                        SepEventType::EvReplay,
+                        plan_digest,
+                        vec![RC_RE_REPLAY_PLAN_MISSING.to_string()],
+                    );
+                }
+                reason_codes.insert(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+                reason_codes.insert(RC_RE_REPLAY_PLAN_MISSING.to_string());
+            }
+        }
+
         missing_edges.sort();
 
         CompletenessReport {
@@ -3874,6 +3922,33 @@ impl<'a> CompletenessChecker<'a> {
         outputs.into_iter().collect()
     }
 
+    fn replay_records_for_session(&self, session_id: &str) -> Vec<([u8; 32], ExperienceRecord)> {
+        self.sep_log
+            .events
+            .iter()
+            .filter(|event| {
+                event.session_id == session_id
+                    && matches!(event.event_type, SepEventType::EvAgentStep)
+            })
+            .filter_map(|event| {
+                self.find_record(event.object_digest).and_then(|record| {
+                    RecordType::try_from(record.record_type)
+                        .ok()
+                        .filter(|record_type| matches!(record_type, RecordType::RtReplay))
+                        .map(|_| (compute_experience_record_digest(record), record.clone()))
+                })
+            })
+            .collect()
+    }
+
+    fn replay_plan_exists(&self, digest: [u8; 32]) -> bool {
+        self.replay_plans
+            .plans
+            .iter()
+            .filter_map(|plan| digest_from_bytes(&plan.replay_digest))
+            .any(|candidate| candidate == digest)
+    }
+
     fn find_record(&self, record_digest: [u8; 32]) -> Option<&ExperienceRecord> {
         self.records
             .iter()
@@ -3891,6 +3966,35 @@ impl<'a> CompletenessChecker<'a> {
                 .iter()
                 .any(|(edge, digest)| matches!(edge, EdgeType::References) && digest == to)
     }
+}
+
+fn replay_plan_digest_from_record(record: &ExperienceRecord) -> (Option<[u8; 32]>, bool) {
+    let mut has_embedded_action = false;
+    let mut replay_plan_digest = None;
+
+    if let Some(gov) = &record.governance_frame {
+        for reference in &gov.policy_decision_refs {
+            match reference.id.split(':').next().unwrap_or("") {
+                "replay_plan" => {
+                    if replay_plan_digest.is_none() {
+                        replay_plan_digest = digest_from_ref(reference);
+                    }
+                }
+                "action" | "action_spec" => {
+                    has_embedded_action = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if replay_plan_digest.is_none() {
+        if let Some(reference) = &record.governance_frame_ref {
+            replay_plan_digest = digest_from_ref(reference);
+        }
+    }
+
+    (replay_plan_digest, has_embedded_action)
 }
 
 fn key_epoch_payload_digest(req: &PvgsCommitRequest) -> Option<[u8; 32]> {
@@ -4689,6 +4793,24 @@ mod tests {
             governance_frame_ref: Some(Ref {
                 id: hex::encode([7u8; 32]),
             }),
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        }
+    }
+
+    fn replay_record(related_refs: Vec<Ref>, governance_ref: Option<Ref>) -> ExperienceRecord {
+        ExperienceRecord {
+            record_type: RecordType::RtReplay as i32,
+            core_frame: None,
+            metabolic_frame: None,
+            governance_frame: Some(GovernanceFrame {
+                policy_decision_refs: related_refs,
+                pvgs_receipt_ref: None,
+                dlp_refs: Vec::new(),
+            }),
+            core_frame_ref: None,
+            metabolic_frame_ref: None,
+            governance_frame_ref: governance_ref,
             dlp_refs: Vec::new(),
             finalization_header: None,
         }
@@ -6107,8 +6229,10 @@ mod tests {
         );
 
         let dlp_store = DlpDecisionStore::default();
+        let replay_plans = ReplayPlanStore::default();
         let records = Vec::new();
-        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
+        let mut checker =
+            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
         let report = checker.check_actions("sess-ok", vec![action]);
 
         assert!(report.missing_edges.is_empty());
@@ -6121,8 +6245,10 @@ mod tests {
         let graph = CausalGraph::default();
         let mut sep_log = SepLog::default();
         let dlp_store = DlpDecisionStore::default();
+        let replay_plans = ReplayPlanStore::default();
         let records = Vec::new();
-        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
+        let mut checker =
+            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
 
         let report = checker.check_actions("sess-missing", vec![[9u8; 32]]);
 
@@ -6159,8 +6285,10 @@ mod tests {
         );
 
         let dlp_store = DlpDecisionStore::default();
+        let replay_plans = ReplayPlanStore::default();
         let records = Vec::new();
-        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
+        let mut checker =
+            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
         let report = checker.check_actions("sess-degraded", vec![action]);
 
         assert_eq!(report.status, CompletenessStatus::Degraded);
@@ -6193,7 +6321,9 @@ mod tests {
         );
 
         let records = vec![record];
-        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
+        let replay_plans = ReplayPlanStore::default();
+        let mut checker =
+            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
         let report = checker.check_actions("sess-o-c1-ok", vec![]);
 
         assert_eq!(report.status, CompletenessStatus::Ok);
@@ -6220,7 +6350,9 @@ mod tests {
 
         let dlp_store = DlpDecisionStore::default();
         let records = vec![record];
-        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
+        let replay_plans = ReplayPlanStore::default();
+        let mut checker =
+            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
         let report = checker.check_actions("sess-o-c1-missing", vec![]);
 
         assert_eq!(report.status, CompletenessStatus::Degraded);
@@ -6261,8 +6393,10 @@ mod tests {
         );
 
         let dlp_store = DlpDecisionStore::default();
+        let replay_plans = ReplayPlanStore::default();
         let records = Vec::new();
-        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
+        let mut checker =
+            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
         let report_one = checker.check_actions("sess-deterministic", vec![action]);
         let report_two = checker.check_actions("sess-deterministic", vec![action]);
 
@@ -6295,12 +6429,202 @@ mod tests {
         );
 
         let dlp_store = DlpDecisionStore::default();
+        let replay_plans = ReplayPlanStore::default();
         let records = Vec::new();
-        let mut checker = CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &records);
+        let mut checker =
+            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
         let report = checker.check_actions("sess-cf", vec![action]);
 
         assert_eq!(report.status, CompletenessStatus::Degraded);
         assert!(report.missing_nodes.iter().any(|digest| digest == &profile));
+    }
+
+    #[test]
+    fn completeness_accepts_present_replay_plan() {
+        let graph = CausalGraph::default();
+        let mut sep_log = SepLog::default();
+        let plan = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "sess-replay-present".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![Ref {
+                id: "target".to_string(),
+            }],
+            fidelity: ReplayFidelity::Low,
+            counter: 1,
+            trigger_reason_codes: Vec::new(),
+        });
+
+        let mut replay_plans = ReplayPlanStore::default();
+        replay_plans.push(plan.clone()).unwrap();
+        let plan_digest = digest_from_bytes(&plan.replay_digest).unwrap();
+
+        let record = replay_record(
+            vec![Ref {
+                id: format!("replay_plan:{}", hex::encode(plan_digest)),
+            }],
+            None,
+        );
+        let record_digest = compute_experience_record_digest(&record);
+        sep_log.append_event(
+            "sess-replay-present".to_string(),
+            SepEventType::EvAgentStep,
+            record_digest,
+            Vec::new(),
+        );
+
+        let dlp_store = DlpDecisionStore::default();
+        let records = vec![record];
+        let mut checker =
+            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let report = checker.check_actions("sess-replay-present", vec![]);
+
+        assert_eq!(report.status, CompletenessStatus::Ok);
+        assert!(report.missing_nodes.is_empty());
+        assert!(!report
+            .reason_codes
+            .contains(&RC_RE_REPLAY_PLAN_MISSING.to_string()));
+    }
+
+    #[test]
+    fn completeness_degrades_when_replay_plan_missing() {
+        let graph = CausalGraph::default();
+        let mut sep_log = SepLog::default();
+        let plan_digest = [9u8; 32];
+        let record = replay_record(
+            vec![Ref {
+                id: format!("replay_plan:{}", hex::encode(plan_digest)),
+            }],
+            None,
+        );
+        let record_digest = compute_experience_record_digest(&record);
+        sep_log.append_event(
+            "sess-replay-missing-plan".to_string(),
+            SepEventType::EvAgentStep,
+            record_digest,
+            Vec::new(),
+        );
+
+        let dlp_store = DlpDecisionStore::default();
+        let replay_plans = ReplayPlanStore::default();
+        let records = vec![record];
+        let mut checker =
+            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let report = checker.check_actions("sess-replay-missing-plan", vec![]);
+
+        assert_eq!(report.status, CompletenessStatus::Degraded);
+        assert!(report.missing_nodes.contains(&plan_digest));
+        assert!(report
+            .reason_codes
+            .contains(&ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()));
+        assert!(report
+            .reason_codes
+            .contains(&RC_RE_REPLAY_PLAN_MISSING.to_string()));
+
+        let has_sep_event = sep_log.events.iter().any(|event| {
+            event.session_id == "sess-replay-missing-plan"
+                && event.event_type == SepEventType::EvReplay
+                && event.object_digest == plan_digest
+                && event
+                    .reason_codes
+                    .contains(&RC_RE_REPLAY_PLAN_MISSING.to_string())
+        });
+        assert!(has_sep_event);
+    }
+
+    #[test]
+    fn completeness_degrades_when_replay_plan_ref_missing() {
+        let graph = CausalGraph::default();
+        let mut sep_log = SepLog::default();
+        let record = replay_record(Vec::new(), None);
+        let record_digest = compute_experience_record_digest(&record);
+        sep_log.append_event(
+            "sess-replay-missing-ref".to_string(),
+            SepEventType::EvAgentStep,
+            record_digest,
+            Vec::new(),
+        );
+
+        let dlp_store = DlpDecisionStore::default();
+        let replay_plans = ReplayPlanStore::default();
+        let records = vec![record];
+        let mut checker =
+            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let report = checker.check_actions("sess-replay-missing-ref", vec![]);
+
+        assert_eq!(report.status, CompletenessStatus::Degraded);
+        assert!(report
+            .reason_codes
+            .contains(&ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()));
+        assert!(report
+            .reason_codes
+            .contains(&RC_RE_REPLAY_PLAN_REF_MISSING.to_string()));
+    }
+
+    #[test]
+    fn completeness_fails_on_embedded_action_refs_in_replay_record() {
+        let graph = CausalGraph::default();
+        let mut sep_log = SepLog::default();
+        let plan = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "sess-replay-invalid-action".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![Ref {
+                id: "target".to_string(),
+            }],
+            fidelity: ReplayFidelity::Low,
+            counter: 1,
+            trigger_reason_codes: Vec::new(),
+        });
+
+        let mut replay_plans = ReplayPlanStore::default();
+        replay_plans.push(plan.clone()).unwrap();
+        let plan_digest = digest_from_bytes(&plan.replay_digest).unwrap();
+
+        let record = replay_record(
+            vec![
+                Ref {
+                    id: format!("replay_plan:{}", hex::encode(plan_digest)),
+                },
+                Ref {
+                    id: format!("action:{}", hex::encode([2u8; 32])),
+                },
+            ],
+            None,
+        );
+        let record_digest = compute_experience_record_digest(&record);
+        sep_log.append_event(
+            "sess-replay-invalid-action".to_string(),
+            SepEventType::EvAgentStep,
+            record_digest,
+            Vec::new(),
+        );
+
+        let dlp_store = DlpDecisionStore::default();
+        let records = vec![record];
+        let mut checker =
+            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let report = checker.check_actions("sess-replay-invalid-action", vec![]);
+
+        assert_eq!(report.status, CompletenessStatus::Fail);
+        assert!(report
+            .reason_codes
+            .contains(&RC_RE_REPLAY_INVALID_EMBEDDED_ACTION.to_string()));
+        assert!(report
+            .reason_codes
+            .contains(&ReasonCodes::RE_INTEGRITY_FAIL.to_string()));
+
+        let has_sep_event = sep_log.events.iter().any(|event| {
+            event.session_id == "sess-replay-invalid-action"
+                && event.event_type == SepEventType::EvReplay
+                && event.object_digest == record_digest
+                && event
+                    .reason_codes
+                    .contains(&RC_RE_REPLAY_INVALID_EMBEDDED_ACTION.to_string())
+        });
+        assert!(has_sep_event);
     }
 
     #[test]
