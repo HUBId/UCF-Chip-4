@@ -363,6 +363,8 @@ pub mod ucf {
             pub const GV_CBV_NO_CHANGE: &'static str = "RC.GV.CBV.NO_CHANGE";
             pub const GV_CBV_NO_OP: &'static str = "RC.GV.CBV.NO_OP";
             pub const GV_CBV_UPDATE_FAILED: &'static str = "RC.GV.CBV.UPDATE_FAILED";
+            pub const GV_MACRO_PROPOSED: &'static str = "RC.GV.MACRO.PROPOSED";
+            pub const GV_MACRO_FINALIZED: &'static str = "RC.GV.MACRO.FINALIZED";
             pub const GV_MILESTONE_MACRO_APPENDED: &'static str = "RC.GV.MILESTONE.MACRO_APPENDED";
             pub const GV_CONSISTENCY_APPENDED: &'static str = "RC.GV.CONSISTENCY.APPENDED";
             pub const GV_CONSISTENCY_LOW: &'static str = "RC.GV.CONSISTENCY.LOW";
