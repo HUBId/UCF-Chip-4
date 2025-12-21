@@ -262,6 +262,7 @@ fn commit_type_label(commit_type: &protocol::CommitType) -> &'static str {
         protocol::CommitType::FrameEvidenceAppend => "FrameEvidenceAppend",
         protocol::CommitType::DlpDecisionAppend => "DlpDecisionAppend",
         protocol::CommitType::ReplayPlanAppend => "ReplayPlanAppend",
+        protocol::CommitType::ConsistencyFeedbackAppend => "ConsistencyFeedbackAppend",
     }
 }
 

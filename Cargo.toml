@@ -21,6 +21,7 @@ members = [
     "gem",
     "dlp_store",
     "milestones",
+    "crates/consistency",
 ]
 resolver = "2"
 

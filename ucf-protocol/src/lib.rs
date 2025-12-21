@@ -40,6 +40,7 @@ pub mod ucf {
             RecordAppend,
             ExperienceRecordAppend,
             MilestoneAppend,
+            ConsistencyFeedbackAppend,
             CharterUpdate,
             ToolRegistryUpdate,
             RecoveryUpdate,
@@ -242,6 +243,19 @@ pub mod ucf {
 
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
         #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct ConsistencyFeedback {
+            #[prost(bytes = "vec", optional, tag = "1")]
+            pub cf_digest: Option<Vec<u8>>,
+            #[prost(string, tag = "2")]
+            pub consistency_class: String,
+            #[prost(string, repeated, tag = "3")]
+            pub flags: Vec<String>,
+            #[prost(message, optional, tag = "4")]
+            pub proof_receipt_ref: Option<Ref>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
         pub struct CharacterBaselineVector {
             #[prost(uint64, tag = "1")]
             pub cbv_epoch: u64,
@@ -341,6 +355,8 @@ pub mod ucf {
             pub const GV_CBV_NO_OP: &'static str = "RC.GV.CBV.NO_OP";
             pub const GV_CBV_UPDATE_FAILED: &'static str = "RC.GV.CBV.UPDATE_FAILED";
             pub const GV_MILESTONE_MACRO_APPENDED: &'static str = "RC.GV.MILESTONE.MACRO_APPENDED";
+            pub const GV_CONSISTENCY_APPENDED: &'static str = "RC.GV.CONSISTENCY.APPENDED";
+            pub const GV_CONSISTENCY_LOW: &'static str = "RC.GV.CONSISTENCY.LOW";
             pub const GV_REPLAY_PLANNED: &'static str = "RC.GV.REPLAY.PLANNED";
             pub const GV_PEV_UPDATED: &'static str = "RC.GV.PEV.UPDATED";
             pub const GV_TOOL_REGISTRY_UPDATED: &'static str = "RC.GV.TOOL_REGISTRY.UPDATED";

@@ -39,6 +39,8 @@ fn main() {
         dlp_decision_payload: None,
         tool_registry_container: None,
         pev: None,
+        consistency_feedback_payload: None,
+        macro_consistency_digest: None,
     };
 
     let keystore = KeyStore::new_dev_keystore(0);

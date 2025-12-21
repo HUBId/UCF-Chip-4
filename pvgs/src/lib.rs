@@ -5,6 +5,7 @@ use cbv::{
     cbv_attestation_preimage, compute_cbv_verified_fields_digest, derive_next_cbv,
     CbvDeriverConfig, CbvStore,
 };
+use consistency::{validate_feedback, ConsistencyStore};
 use dlp_store::DlpDecisionStore;
 use ed25519_dalek::Signer;
 use keys::{verify_key_epoch_signature, KeyEpochHistory, KeyStore};
@@ -25,10 +26,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tool_registry_state::{ToolRegistryError, ToolRegistryState};
 use ucf_protocol::ucf::v1::{
-    self as protocol, CharacterBaselineVector, Digest32, DlpDecision, DlpDecisionForm,
-    ExperienceRecord, FinalizationHeader, MacroMilestone, MacroMilestoneState, PVGSKeyEpoch,
-    PVGSReceipt, ProofReceipt, ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayPlan,
-    ReplayTargetKind, ToolRegistryContainer,
+    self as protocol, CharacterBaselineVector, ConsistencyFeedback, Digest32, DlpDecision,
+    DlpDecisionForm, ExperienceRecord, FinalizationHeader, MacroMilestone, MacroMilestoneState,
+    PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReceiptStatus, RecordType, Ref, ReplayFidelity,
+    ReplayPlan, ReplayTargetKind, ToolRegistryContainer,
 };
 use vrf::VrfEngine;
 
@@ -43,6 +44,7 @@ pub enum CommitType {
     RecordAppend,
     ExperienceRecordAppend,
     MilestoneAppend,
+    ConsistencyFeedbackAppend,
     CharterUpdate,
     ToolRegistryUpdate,
     RecoveryUpdate,
@@ -160,6 +162,8 @@ pub struct PvgsCommitRequest {
     pub dlp_decision_payload: Option<Vec<u8>>,
     pub tool_registry_container: Option<Vec<u8>>,
     pub pev: Option<PolicyEcologyVector>,
+    pub consistency_feedback_payload: Option<Vec<u8>>,
+    pub macro_consistency_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +203,7 @@ pub struct PvgsStore {
     pub cbv_store: CbvStore,
     pub pev_store: PevStore,
     pub dlp_store: DlpDecisionStore,
+    pub consistency_store: ConsistencyStore,
     pub tool_registry_state: ToolRegistryState,
     pub micro_milestones: MicroMilestoneStore,
     pub meso_milestones: MesoMilestoneStore,
@@ -237,6 +242,7 @@ impl PvgsStore {
             cbv_store: CbvStore::default(),
             pev_store: PevStore::default(),
             dlp_store: DlpDecisionStore::default(),
+            consistency_store: ConsistencyStore::default(),
             tool_registry_state: ToolRegistryState::default(),
             micro_milestones: MicroMilestoneStore::default(),
             meso_milestones: MesoMilestoneStore::default(),
@@ -683,6 +689,8 @@ impl PvgsStore {
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
         };
 
         let (receipt, _proof) = verify_meso_milestone_append(req, self, keystore, vrf_engine);
@@ -734,6 +742,8 @@ impl PvgsStore {
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: self.consistency_store.map.keys().next().copied(),
         };
 
         let (receipt, _proof) = verify_macro_milestone_append(req, self, keystore, vrf_engine);
@@ -930,6 +940,7 @@ fn event_type_for_commit(
         CommitType::ExperienceRecordAppend => SepEventType::EvIntent,
         CommitType::DlpDecisionAppend => SepEventType::EvDlpDecision,
         CommitType::ReplayPlanAppend => SepEventType::EvReplay,
+        CommitType::ConsistencyFeedbackAppend => SepEventType::EvRecoveryGov,
         CommitType::FrameEvidenceAppend => match frame_kind {
             Some(FrameEventKind::ControlFrame) => SepEventType::EvControlFrame,
             Some(FrameEventKind::SignalFrame) => SepEventType::EvSignalFrame,
@@ -1076,6 +1087,10 @@ pub fn verify_and_commit(
 
     if req.commit_type == CommitType::ExperienceRecordAppend {
         return verify_experience_record_append(req, store, keystore, vrf_engine);
+    }
+
+    if req.commit_type == CommitType::ConsistencyFeedbackAppend {
+        return verify_consistency_feedback_append(req, store, keystore, vrf_engine);
     }
 
     if req.commit_type == CommitType::DlpDecisionAppend {
@@ -1455,11 +1470,55 @@ fn verify_macro_milestone_append(
     };
 
     let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap_or([0u8; 32]);
+    let Some(consistency_digest) = req.macro_consistency_digest else {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(macro_digest),
+            event_reason_codes: None,
+        });
+    };
 
     if req.payload_digests.is_empty() {
         req.payload_digests = vec![macro_digest];
     } else if req.payload_digests.len() != 1 || req.payload_digests[0] != macro_digest {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    let Some(feedback) = store.consistency_store.get(consistency_digest) else {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(macro_digest),
+            event_reason_codes: None,
+        });
+    };
+
+    if feedback.consistency_class != "CONSISTENCY_HIGH" {
+        reject_reason_codes.push(protocol::ReasonCodes::GV_CONSISTENCY_LOW.to_string());
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(macro_digest),
+            event_reason_codes: None,
+        });
     }
 
     if !reject_reason_codes.is_empty() {
@@ -1519,13 +1578,21 @@ fn verify_macro_milestone_append(
     store.macro_deriver.register_committed(&macro_milestone);
     store.committed_payload_digests.insert(macro_digest);
 
-    add_macro_edges(store, macro_digest, &macro_milestone);
+    add_macro_edges(
+        store,
+        macro_digest,
+        &macro_milestone,
+        Some(consistency_digest),
+    );
 
     store.sep_log.append_event(
         req.commit_id.clone(),
         SepEventType::EvRecoveryGov,
         macro_digest,
-        vec![protocol::ReasonCodes::GV_MILESTONE_MACRO_APPENDED.to_string()],
+        vec![
+            protocol::ReasonCodes::GV_MILESTONE_MACRO_APPENDED.to_string(),
+            protocol::ReasonCodes::GV_CONSISTENCY_APPENDED.to_string(),
+        ],
     );
 
     attempt_cbv_update_from_macro(store, keystore, vrf_engine, macro_milestone, macro_digest);
@@ -2296,6 +2363,183 @@ fn verify_experience_record_append(
     (receipt, Some(proof_receipt))
 }
 
+fn verify_consistency_feedback_append(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+    vrf_engine: &VrfEngine,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let payload = match req.consistency_feedback_payload.take() {
+        Some(payload) => payload,
+        None => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let payload_digest = *blake3::hash(&payload).as_bytes();
+    if req.payload_digests.is_empty() {
+        req.payload_digests = vec![payload_digest];
+    }
+
+    let receipt_input = to_receipt_input(&req);
+    let mut reject_reason_codes = Vec::new();
+
+    if req.payload_digests.len() != 1 || req.payload_digests[0] != payload_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if req.epoch_id != keystore.current_epoch() {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+    }
+
+    if req.bindings.prev_record_digest != store.current_head_record_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+    }
+
+    if !req
+        .required_checks
+        .iter()
+        .any(|check| matches!(check, RequiredCheck::SchemaOk))
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if !store
+        .known_charter_versions
+        .contains(&req.bindings.charter_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_CHARTER_SCOPE.to_string());
+    }
+
+    if !store
+        .known_policy_versions
+        .contains(&req.bindings.policy_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_INTEGRITY_REQUIRED.to_string());
+    }
+
+    let feedback = match ConsistencyFeedback::decode(payload.as_slice()) {
+        Ok(feedback) => feedback,
+        Err(_) => {
+            reject_reason_codes
+                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes,
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: Some(payload_digest),
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let (sanitized_feedback, cf_digest) = match validate_feedback(feedback) {
+        Ok(result) => result,
+        Err(_) => {
+            reject_reason_codes
+                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes,
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: Some(payload_digest),
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    if store.committed_payload_digests.contains(&payload_digest) {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_REPLAY_MISMATCH.to_string());
+    }
+
+    if !reject_reason_codes.is_empty() {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(cf_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    store.refresh_ruleset_state(
+        &req.bindings.charter_version_digest,
+        &req.bindings.policy_version_digest,
+    );
+
+    let verified_fields_digest =
+        compute_verified_fields_digest(&req.bindings, req.required_receipt_kind);
+    let record_digest = compute_record_digest(
+        verified_fields_digest,
+        req.bindings.prev_record_digest,
+        &req.commit_id,
+    );
+    let vrf_digest = vrf_engine.eval_record_vrf(
+        req.bindings.prev_record_digest,
+        record_digest,
+        &req.bindings.charter_version_digest,
+        req.bindings.profile_digest.unwrap_or([0u8; 32]),
+        req.epoch_id,
+    );
+
+    let mut proof_receipt = issue_proof_receipt(
+        store.ruleset_state.ruleset_digest,
+        verified_fields_digest,
+        vrf_digest,
+        keystore,
+    );
+
+    let receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        Vec::new(),
+        keystore,
+    );
+
+    proof_receipt.receipt_digest = receipt.receipt_digest.clone();
+
+    store.add_receipt_edges(&receipt);
+    store
+        .consistency_store
+        .insert(sanitized_feedback)
+        .expect("validated feedback");
+    store.committed_payload_digests.insert(payload_digest);
+
+    store.sep_log.append_event(
+        req.commit_id.clone(),
+        SepEventType::EvRecoveryGov,
+        cf_digest,
+        vec![protocol::ReasonCodes::GV_CONSISTENCY_APPENDED.to_string()],
+    );
+
+    (receipt, Some(proof_receipt))
+}
+
 fn verify_dlp_decision_append(
     mut req: PvgsCommitRequest,
     store: &mut PvgsStore,
@@ -2691,6 +2935,7 @@ fn add_macro_edges(
     store: &mut PvgsStore,
     macro_digest: [u8; 32],
     macro_milestone: &MacroMilestone,
+    consistency_digest: Option<[u8; 32]>,
 ) {
     for meso_ref in &macro_milestone.meso_refs {
         if let Some(meso_digest) = digest_from_ref(meso_ref) {
@@ -2698,6 +2943,12 @@ fn add_macro_edges(
                 .causal_graph
                 .add_edge(macro_digest, EdgeType::References, meso_digest);
         }
+    }
+
+    if let Some(consistency) = consistency_digest {
+        store
+            .causal_graph
+            .add_edge(macro_digest, EdgeType::References, consistency);
     }
 }
 
@@ -3200,6 +3451,9 @@ impl From<CommitType> for protocol::CommitType {
             CommitType::RecordAppend => protocol::CommitType::RecordAppend,
             CommitType::ExperienceRecordAppend => protocol::CommitType::ExperienceRecordAppend,
             CommitType::MilestoneAppend => protocol::CommitType::MilestoneAppend,
+            CommitType::ConsistencyFeedbackAppend => {
+                protocol::CommitType::ConsistencyFeedbackAppend
+            }
             CommitType::CharterUpdate => protocol::CommitType::CharterUpdate,
             CommitType::ToolRegistryUpdate => protocol::CommitType::ToolRegistryUpdate,
             CommitType::RecoveryUpdate => protocol::CommitType::RecoveryUpdate,
@@ -3251,9 +3505,9 @@ mod tests {
     use receipts::verify_pvgs_receipt_attestation;
     use sep::{EdgeType, SepEventType};
     use ucf_protocol::ucf::v1::{
-        CoreFrame, GovernanceFrame, MacroMilestone, MacroMilestoneState, MagnitudeClass,
-        MetabolicFrame, PolicyEcologyDimension, PolicyEcologyVector, RecordType, Ref,
-        ReplayTargetKind, TraitDirection, TraitUpdate,
+        ConsistencyFeedback, CoreFrame, GovernanceFrame, MacroMilestone, MacroMilestoneState,
+        MagnitudeClass, MetabolicFrame, PolicyEcologyDimension, PolicyEcologyVector, RecordType,
+        Ref, ReplayTargetKind, TraitDirection, TraitUpdate,
     };
     use vrf::VrfEngine;
 
@@ -3301,6 +3555,8 @@ mod tests {
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
         }
     }
 
@@ -3345,6 +3601,8 @@ mod tests {
                 dlp_decision_payload: None,
                 tool_registry_container: None,
                 pev: None,
+                consistency_feedback_payload: None,
+                macro_consistency_digest: None,
             },
             epoch,
         )
@@ -3380,6 +3638,20 @@ mod tests {
             consistency_class: "CONSISTENCY_HIGH".to_string(),
             identity_anchor_flag: true,
         }
+    }
+
+    fn store_consistency_feedback(store: &mut PvgsStore, digest: [u8; 32], class: &str) {
+        let feedback = ConsistencyFeedback {
+            cf_digest: Some(digest.to_vec()),
+            consistency_class: class.to_string(),
+            flags: Vec::new(),
+            proof_receipt_ref: None,
+        };
+
+        store
+            .consistency_store
+            .insert(feedback)
+            .expect("valid feedback");
     }
 
     fn micro_with_priority(id: u64, priority: PriorityClass) -> MicroMilestone {
@@ -3424,6 +3696,7 @@ mod tests {
         macro_milestone: &MacroMilestone,
         store: &PvgsStore,
         epoch_id: u64,
+        consistency_digest: [u8; 32],
     ) -> PvgsCommitRequest {
         let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap();
 
@@ -3452,7 +3725,149 @@ mod tests {
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: Some(consistency_digest),
         }
+    }
+
+    #[test]
+    fn consistency_feedback_append_is_stored() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let digest = [0xAAu8; 32];
+
+        let feedback = ConsistencyFeedback {
+            cf_digest: Some(digest.to_vec()),
+            consistency_class: "CONSISTENCY_HIGH".to_string(),
+            flags: vec!["alpha".to_string()],
+            proof_receipt_ref: None,
+        };
+
+        let req = PvgsCommitRequest {
+            commit_id: "cf-append".to_string(),
+            commit_type: CommitType::ConsistencyFeedbackAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: Some(feedback.encode_to_vec()),
+            macro_consistency_digest: None,
+        };
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof.is_some());
+        let stored = store
+            .consistency_store
+            .get(digest)
+            .expect("feedback missing");
+        assert_eq!(stored.consistency_class, "CONSISTENCY_HIGH");
+
+        let event = store.sep_log.events.last().expect("missing sep event");
+        assert!(event
+            .reason_codes
+            .contains(&ReasonCodes::GV_CONSISTENCY_APPENDED.to_string()));
+        assert_eq!(event.object_digest, digest);
+    }
+
+    #[test]
+    fn macro_append_rejects_without_consistency_ref() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let macro_milestone = macro_with_updates(
+            "macro-no-ref",
+            vec![cbv_update(
+                "baseline_caution_offset",
+                TraitDirection::IncreaseStrictness,
+                MagnitudeClass::Low,
+            )],
+        );
+        let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap();
+
+        let req = PvgsCommitRequest {
+            commit_id: macro_milestone.macro_id.clone(),
+            commit_type: CommitType::MilestoneAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: vec![macro_digest],
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            macro_milestone: Some(macro_milestone),
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+        };
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert!(proof.is_none());
+        assert!(receipt
+            .reject_reason_codes
+            .contains(&ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()));
+        assert!(store.macro_milestones.is_empty());
+        assert!(store.cbv_store.latest().is_none());
+    }
+
+    #[test]
+    fn macro_append_rejects_low_consistency() {
+        let prev = [8u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let macro_milestone = macro_with_state("macro-low", MacroMilestoneState::Finalized);
+        let consistency_digest = [0x21u8; 32];
+        store_consistency_feedback(&mut store, consistency_digest, "CONSISTENCY_LOW");
+
+        let req = make_macro_request(&macro_milestone, &store, 1, consistency_digest);
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert!(proof.is_none());
+        assert!(receipt
+            .reject_reason_codes
+            .contains(&ReasonCodes::GV_CONSISTENCY_LOW.to_string()));
+        assert!(store.macro_milestones.is_empty());
+        assert!(store.cbv_store.latest().is_none());
     }
 
     fn sample_pev(digest: [u8; 32], epoch: u64) -> PolicyEcologyVector {
@@ -3548,6 +3963,8 @@ mod tests {
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
         }
     }
 
@@ -3557,6 +3974,8 @@ mod tests {
         let mut store = base_store(prev);
         let keystore = KeyStore::new_dev_keystore(1);
         let vrf_engine = VrfEngine::new_dev(1);
+        let consistency_digest = [0x11u8; 32];
+        store_consistency_feedback(&mut store, consistency_digest, "CONSISTENCY_HIGH");
         let macro_milestone = macro_with_updates(
             "macro-1",
             vec![cbv_update(
@@ -3565,7 +3984,7 @@ mod tests {
                 MagnitudeClass::Low,
             )],
         );
-        let req = make_macro_request(&macro_milestone, &store, 1);
+        let req = make_macro_request(&macro_milestone, &store, 1, consistency_digest);
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
 
@@ -3574,9 +3993,16 @@ mod tests {
         let latest_cbv = store.cbv_store.latest().expect("cbv missing");
         assert_eq!(latest_cbv.cbv_epoch, 1);
 
+        let macro_digest = digest_from_bytes(&macro_milestone.macro_digest).unwrap();
+        let neighbors = store.causal_graph.neighbors(macro_digest);
+        assert!(neighbors.contains(&(EdgeType::References, consistency_digest)));
+
         assert!(store.sep_log.events.iter().any(|e| e
             .reason_codes
             .contains(&ReasonCodes::GV_MILESTONE_MACRO_APPENDED.to_string())));
+        assert!(store.sep_log.events.iter().any(|e| e
+            .reason_codes
+            .contains(&ReasonCodes::GV_CONSISTENCY_APPENDED.to_string())));
         assert!(store.sep_log.events.iter().any(|e| e
             .reason_codes
             .contains(&ReasonCodes::GV_CBV_UPDATED.to_string())));
@@ -3588,6 +4014,8 @@ mod tests {
         let mut store = base_store(prev);
         let keystore = KeyStore::new_dev_keystore(1);
         let vrf_engine = VrfEngine::new_dev(1);
+        let consistency_digest = [0x12u8; 32];
+        store_consistency_feedback(&mut store, consistency_digest, "CONSISTENCY_HIGH");
         let macro_milestone = macro_with_updates(
             "macro-2",
             vec![cbv_update(
@@ -3596,7 +4024,7 @@ mod tests {
                 MagnitudeClass::Low,
             )],
         );
-        let req = make_macro_request(&macro_milestone, &store, 1);
+        let req = make_macro_request(&macro_milestone, &store, 1, consistency_digest);
 
         verify_and_commit(req.clone(), &mut store, &keystore, &vrf_engine);
         verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -3616,8 +4044,10 @@ mod tests {
         let mut store = base_store(prev);
         let keystore = KeyStore::new_dev_keystore(1);
         let vrf_engine = VrfEngine::new_dev(1);
+        let consistency_digest = [0x13u8; 32];
+        store_consistency_feedback(&mut store, consistency_digest, "CONSISTENCY_HIGH");
         let macro_milestone = macro_with_state("macro-3", MacroMilestoneState::Draft);
-        let req = make_macro_request(&macro_milestone, &store, 1);
+        let req = make_macro_request(&macro_milestone, &store, 1, consistency_digest);
 
         let (receipt, _proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
 
@@ -3779,6 +4209,8 @@ mod tests {
         let mut store = base_store(prev);
         let keystore = KeyStore::new_dev_keystore(1);
         let vrf_engine = VrfEngine::new_dev(1);
+
+        store_consistency_feedback(&mut store, [0x31u8; 32], "CONSISTENCY_HIGH");
 
         for i in 0..8 {
             let priority = if i == 0 {
@@ -4076,6 +4508,8 @@ mod tests {
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
         };
 
         let (receipt, proof) = verify_and_commit(backward_req, &mut store, &keystore, &vrf_engine);
@@ -4140,6 +4574,8 @@ mod tests {
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
         };
 
         let (receipt, proof) = verify_and_commit(dup_req, &mut store, &keystore, &vrf_engine);
@@ -4180,6 +4616,8 @@ mod tests {
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
         };
 
         let keystore = KeyStore::new_dev_keystore(1);
@@ -4236,6 +4674,8 @@ mod tests {
             dlp_decision_payload: Some(decision.encode_to_vec()),
             tool_registry_container: None,
             pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -4292,6 +4732,8 @@ mod tests {
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: Some(pev.clone()),
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -4373,6 +4815,8 @@ mod tests {
             dlp_decision_payload: None,
             tool_registry_container: None,
             pev: Some(pev),
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
         };
 
         let (_, pev_proof) = verify_and_commit(pev_req, &mut store, &keystore, &vrf_engine);
@@ -4448,6 +4892,8 @@ mod tests {
             dlp_decision_payload: None,
             tool_registry_container: Some(container.encode_to_vec()),
             pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
