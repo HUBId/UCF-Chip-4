@@ -8,3 +8,4 @@ blake3 = "1"
 prost = { version = "0.12", features = ["prost-derive"] }
 thiserror = "1"
 ucf-protocol = { path = "../../ucf-protocol" }
+limits = { path = "../limits" }

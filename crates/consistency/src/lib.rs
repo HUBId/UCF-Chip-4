@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
+use limits::StoreLimits;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 use blake3::Hasher;
 use prost::Message;
@@ -9,9 +11,17 @@ use ucf_protocol::ucf::v1::ConsistencyFeedback;
 
 const MAX_FLAGS: usize = 16;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ConsistencyStore {
     pub map: HashMap<[u8; 32], ConsistencyFeedback>,
+    order: VecDeque<[u8; 32]>,
+    limits: StoreLimits,
+}
+
+impl Default for ConsistencyStore {
+    fn default() -> Self {
+        Self::with_limits(StoreLimits::default())
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -27,14 +37,44 @@ pub enum ConsistencyStoreError {
 }
 
 impl ConsistencyStore {
+    pub fn with_limits(limits: StoreLimits) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            limits,
+        }
+    }
+
     pub fn insert(
         &mut self,
         feedback: ConsistencyFeedback,
-    ) -> Result<[u8; 32], ConsistencyStoreError> {
+    ) -> Result<([u8; 32], Vec<[u8; 32]>), ConsistencyStoreError> {
         let (sanitized, digest) = validate_feedback(feedback)?;
 
+        let mut evicted = Vec::new();
+        let limit = self.limits.max_consistency_feedbacks;
+
+        if limit == 0 {
+            self.map.clear();
+            self.order.clear();
+            evicted.push(digest);
+            return Ok((digest, evicted));
+        }
+
+        if let Some(pos) = self.order.iter().position(|d| *d == digest) {
+            self.order.remove(pos);
+        }
+
+        while self.order.len() >= limit {
+            if let Some(removed) = self.order.pop_front() {
+                self.map.remove(&removed);
+                evicted.push(removed);
+            }
+        }
+
+        self.order.push_back(digest);
         self.map.insert(digest, sanitized);
-        Ok(digest)
+        Ok((digest, evicted))
     }
 
     pub fn get(&self, digest: [u8; 32]) -> Option<&ConsistencyFeedback> {
@@ -107,13 +147,15 @@ mod tests {
     #[test]
     fn inserts_with_digest() {
         let mut store = ConsistencyStore::default();
-        store.insert(feedback("CONSISTENCY_HIGH")).unwrap();
+        let (digest, evicted) = store.insert(feedback("CONSISTENCY_HIGH")).unwrap();
 
+        assert!(evicted.is_empty());
         assert!(store.get([7u8; 32]).is_some());
         assert_eq!(
             store.get([7u8; 32]).unwrap().flags,
             vec!["a".to_string(), "b".to_string()]
         );
+        assert_eq!(digest, [7u8; 32]);
     }
 
     #[test]
@@ -122,7 +164,8 @@ mod tests {
         let mut feedback = feedback("CONSISTENCY_LOW");
         feedback.cf_digest = None;
 
-        let digest = store.insert(feedback.clone()).unwrap();
+        let (digest, evicted) = store.insert(feedback.clone()).unwrap();
+        assert!(evicted.is_empty());
         assert_eq!(
             store.get(digest).unwrap().cf_digest.as_deref(),
             Some(digest.as_slice())
@@ -165,5 +208,27 @@ mod tests {
 
         let err = store.insert(feedback).unwrap_err();
         assert_eq!(err, ConsistencyStoreError::InvalidDigestLength);
+    }
+
+    #[test]
+    fn evicts_oldest_feedback_in_fifo_order() {
+        let mut store = ConsistencyStore::with_limits(StoreLimits {
+            max_consistency_feedbacks: 1,
+            ..StoreLimits::default()
+        });
+
+        let first = feedback("CONSISTENCY_HIGH");
+        let mut second = feedback("CONSISTENCY_HIGH");
+        second.cf_digest = Some([8u8; 32].to_vec());
+
+        let (_, evicted_first) = store.insert(first.clone()).unwrap();
+        assert!(evicted_first.is_empty());
+
+        let (_, evicted_second) = store.insert(second.clone()).unwrap();
+        assert_eq!(evicted_second, vec![[7u8; 32]]);
+        assert!(store.get([7u8; 32]).is_none());
+        let mut expected = second.clone();
+        expected.flags.sort();
+        assert_eq!(store.get([8u8; 32]), Some(&expected));
     }
 }
