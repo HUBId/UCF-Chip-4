@@ -2,6 +2,7 @@
 
 use blake3::Hasher;
 use hex::encode;
+use limits::DEFAULT_LIMITS;
 use prost::Message;
 use std::str::FromStr;
 use thiserror::Error;
@@ -14,8 +15,8 @@ use ucf_protocol::ucf::v1::{
 use serde::{Deserialize, Serialize};
 
 const REPLAY_PLAN_DOMAIN: &[u8] = b"UCF:HASH:REPLAY_PLAN";
-const MAX_TARGET_REFS: usize = 16;
-const MAX_PENDING_PLANS: usize = 128;
+const MAX_TARGET_REFS: usize = DEFAULT_LIMITS.max_replay_target_refs;
+const MAX_PENDING_PLANS: usize = DEFAULT_LIMITS.max_pending_replay_plans;
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]

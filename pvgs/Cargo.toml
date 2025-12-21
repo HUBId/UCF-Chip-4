@@ -23,6 +23,7 @@ tool_registry_state = { path = "../tool_registry_state" }
 hex = "0.4"
 milestones = { path = "../milestones" }
 consistency = { path = "../crates/consistency" }
+limits = { workspace = true }
 
 [features]
 default = []
