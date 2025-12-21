@@ -1320,7 +1320,9 @@ pub fn verify_and_commit(
 ) -> (PVGSReceipt, Option<ProofReceipt>) {
     if matches!(
         req.commit_type,
-        CommitType::MilestoneAppend | CommitType::MacroMilestonePropose | CommitType::MacroMilestoneFinalize
+        CommitType::MilestoneAppend
+            | CommitType::MacroMilestonePropose
+            | CommitType::MacroMilestoneFinalize
     ) {
         if req.meso_milestone.is_some() {
             return verify_meso_milestone_append(req, store, keystore, vrf_engine);
@@ -1960,11 +1962,7 @@ fn verify_macro_milestone_finalization(
         reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
     }
 
-    let Some(feedback) = store
-        .consistency_store
-        .get(consistency_digest)
-        .cloned()
-    else {
+    let Some(feedback) = store.consistency_store.get(consistency_digest).cloned() else {
         reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
         return finalize_receipt(FinalizeReceiptArgs {
             req: &req,
@@ -1984,11 +1982,12 @@ fn verify_macro_milestone_finalization(
     macro_milestone.consistency_class = feedback.consistency_class.clone();
     macro_milestone.macro_digest = macro_digest.to_vec();
     macro_milestone.consistency_digest = Some(consistency_digest.to_vec());
-    macro_milestone.consistency_feedback_ref = macro_milestone
-        .consistency_feedback_ref
-        .or_else(|| Some(Ref {
-            id: hex::encode(consistency_digest),
-        }));
+    macro_milestone.consistency_feedback_ref =
+        macro_milestone.consistency_feedback_ref.or_else(|| {
+            Some(Ref {
+                id: hex::encode(consistency_digest),
+            })
+        });
     macro_milestone
         .proof_receipt_ref
         .get_or_insert_with(Ref::default);
@@ -2073,9 +2072,7 @@ fn verify_macro_milestone_finalization(
 
     store.add_receipt_edges(&receipt);
     store.macro_deriver.register_committed(&macro_milestone);
-    store
-        .committed_payload_digests
-        .insert(consistency_digest);
+    store.committed_payload_digests.insert(consistency_digest);
     store.committed_payload_digests.insert(macro_digest);
 
     add_macro_edges(
