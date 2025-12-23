@@ -52,6 +52,10 @@ pub struct TraceResult {
     pub records: Vec<NodeKey>,
     pub profiles: Vec<NodeKey>,
     pub path: Vec<NodeKey>,
+    pub micro_snapshots_lc: Vec<[u8; 32]>,
+    pub micro_snapshots_sn: Vec<[u8; 32]>,
+    pub micro_configs_lc: Vec<[u8; 32]>,
+    pub micro_configs_sn: Vec<[u8; 32]>,
     pub micro_evidence: MicroEvidenceSummary,
 }
 
@@ -60,6 +64,8 @@ pub struct TraceResult {
 pub struct MicroEvidenceSummary {
     pub lc_snapshots: Vec<[u8; 32]>,
     pub sn_snapshots: Vec<[u8; 32]>,
+    pub lc_configs: Vec<[u8; 32]>,
+    pub sn_configs: Vec<[u8; 32]>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -875,6 +881,10 @@ pub fn trace_action(store: &PvgsStore, action_digest: [u8; 32]) -> TraceResult {
         records: records.into_iter().collect(),
         profiles: profiles.into_iter().collect(),
         path,
+        micro_snapshots_lc: micro_evidence.lc_snapshots.clone(),
+        micro_snapshots_sn: micro_evidence.sn_snapshots.clone(),
+        micro_configs_lc: micro_evidence.lc_configs.clone(),
+        micro_configs_sn: micro_evidence.sn_configs.clone(),
         micro_evidence,
     }
 }
@@ -929,6 +939,8 @@ pub fn list_microcircuit_evidence(store: &PvgsStore, session_id: &str) -> MicroE
 
     let mut lc_snapshots = BTreeSet::new();
     let mut sn_snapshots = BTreeSet::new();
+    let mut lc_configs = BTreeSet::new();
+    let mut sn_configs = BTreeSet::new();
 
     for digest in record_digests {
         if let Some(record) = find_record(store, digest) {
@@ -940,12 +952,18 @@ pub fn list_microcircuit_evidence(store: &PvgsStore, session_id: &str) -> MicroE
                     if let Some(micro_digest) = digest_from_labeled_ref(reference, "mc:sn") {
                         sn_snapshots.insert(micro_digest);
                     }
+                    if let Some(micro_digest) = digest_from_labeled_ref(reference, "mc_cfg:lc") {
+                        lc_configs.insert(micro_digest);
+                    }
+                    if let Some(micro_digest) = digest_from_labeled_ref(reference, "mc_cfg:sn") {
+                        sn_configs.insert(micro_digest);
+                    }
                 }
             }
         }
     }
 
-    micro_evidence_from_sets(lc_snapshots, sn_snapshots)
+    micro_evidence_from_sets(lc_snapshots, sn_snapshots, lc_configs, sn_configs)
 }
 
 /// List export attempts for a session in deterministic order.
@@ -1146,6 +1164,8 @@ fn dlp_digests_from_record(record: &ExperienceRecord) -> Vec<NodeKey> {
 fn micro_evidence_from_record(record: &ExperienceRecord) -> MicroEvidenceSummary {
     let mut lc_snapshots = BTreeSet::new();
     let mut sn_snapshots = BTreeSet::new();
+    let mut lc_configs = BTreeSet::new();
+    let mut sn_configs = BTreeSet::new();
 
     if let Some(gov) = &record.governance_frame {
         for reference in &gov.policy_decision_refs {
@@ -1155,10 +1175,16 @@ fn micro_evidence_from_record(record: &ExperienceRecord) -> MicroEvidenceSummary
             if let Some(digest) = digest_from_labeled_ref(reference, "mc:sn") {
                 sn_snapshots.insert(digest);
             }
+            if let Some(digest) = digest_from_labeled_ref(reference, "mc_cfg:lc") {
+                lc_configs.insert(digest);
+            }
+            if let Some(digest) = digest_from_labeled_ref(reference, "mc_cfg:sn") {
+                sn_configs.insert(digest);
+            }
         }
     }
 
-    micro_evidence_from_sets(lc_snapshots, sn_snapshots)
+    micro_evidence_from_sets(lc_snapshots, sn_snapshots, lc_configs, sn_configs)
 }
 
 fn collect_micro_evidence_from_records(
@@ -1167,6 +1193,8 @@ fn collect_micro_evidence_from_records(
 ) -> MicroEvidenceSummary {
     let mut lc_snapshots = BTreeSet::new();
     let mut sn_snapshots = BTreeSet::new();
+    let mut lc_configs = BTreeSet::new();
+    let mut sn_configs = BTreeSet::new();
 
     for record_digest in records {
         if let Some(record) = find_record(store, *record_digest) {
@@ -1178,27 +1206,41 @@ fn collect_micro_evidence_from_records(
                     if let Some(digest) = digest_from_labeled_ref(reference, "mc:sn") {
                         sn_snapshots.insert(digest);
                     }
+                    if let Some(digest) = digest_from_labeled_ref(reference, "mc_cfg:lc") {
+                        lc_configs.insert(digest);
+                    }
+                    if let Some(digest) = digest_from_labeled_ref(reference, "mc_cfg:sn") {
+                        sn_configs.insert(digest);
+                    }
                 }
             }
         }
     }
 
-    micro_evidence_from_sets(lc_snapshots, sn_snapshots)
+    micro_evidence_from_sets(lc_snapshots, sn_snapshots, lc_configs, sn_configs)
 }
 
 fn micro_evidence_from_sets(
     lc_snapshots: BTreeSet<[u8; 32]>,
     sn_snapshots: BTreeSet<[u8; 32]>,
+    lc_configs: BTreeSet<[u8; 32]>,
+    sn_configs: BTreeSet<[u8; 32]>,
 ) -> MicroEvidenceSummary {
     let mut lc_snapshots: Vec<[u8; 32]> = lc_snapshots.into_iter().collect();
     let mut sn_snapshots: Vec<[u8; 32]> = sn_snapshots.into_iter().collect();
+    let mut lc_configs: Vec<[u8; 32]> = lc_configs.into_iter().collect();
+    let mut sn_configs: Vec<[u8; 32]> = sn_configs.into_iter().collect();
 
     lc_snapshots.truncate(MAX_MICRO_EVIDENCE);
     sn_snapshots.truncate(MAX_MICRO_EVIDENCE);
+    lc_configs.truncate(MAX_MICRO_EVIDENCE);
+    sn_configs.truncate(MAX_MICRO_EVIDENCE);
 
     MicroEvidenceSummary {
         lc_snapshots,
         sn_snapshots,
+        lc_configs,
+        sn_configs,
     }
 }
 
@@ -2037,7 +2079,14 @@ mod tests {
 
         let lc_digest = [1u8; 32];
         let sn_digest = [2u8; 32];
-        let refs = vec![micro_ref("mc:lc", lc_digest), micro_ref("mc:sn", sn_digest)];
+        let lc_config_digest = [3u8; 32];
+        let sn_config_digest = [4u8; 32];
+        let refs = vec![
+            micro_ref("mc:lc", lc_digest),
+            micro_ref("mc:sn", sn_digest),
+            micro_ref("mc_cfg:lc", lc_config_digest),
+            micro_ref("mc_cfg:sn", sn_config_digest),
+        ];
 
         let record_digest =
             append_decision_record_with_refs(&mut store, &keystore, &vrf_engine, "session", refs);
@@ -2052,10 +2101,14 @@ mod tests {
 
         assert!(references.contains(&lc_digest));
         assert!(references.contains(&sn_digest));
+        assert!(references.contains(&lc_config_digest));
+        assert!(references.contains(&sn_config_digest));
 
         let trace = trace_record(&store, record_digest);
         assert_eq!(trace.micro_evidence.lc_snapshots, vec![lc_digest]);
         assert_eq!(trace.micro_evidence.sn_snapshots, vec![sn_digest]);
+        assert_eq!(trace.micro_evidence.lc_configs, vec![lc_config_digest]);
+        assert_eq!(trace.micro_evidence.sn_configs, vec![sn_config_digest]);
     }
 
     #[test]
@@ -2067,6 +2120,10 @@ mod tests {
         let lc_second = [3u8; 32];
         let sn_first = [2u8; 32];
         let sn_second = [4u8; 32];
+        let lc_config_first = [5u8; 32];
+        let lc_config_second = [7u8; 32];
+        let sn_config_first = [6u8; 32];
+        let sn_config_second = [8u8; 32];
 
         let mut store = trace_store(profile);
 
@@ -2078,6 +2135,8 @@ mod tests {
                 policy_decision_refs: vec![
                     micro_ref("mc:lc", lc_first),
                     micro_ref("mc:sn", sn_first),
+                    micro_ref("mc_cfg:lc", lc_config_first),
+                    micro_ref("mc_cfg:sn", sn_config_first),
                 ],
                 pvgs_receipt_ref: None,
                 dlp_refs: Vec::new(),
@@ -2099,6 +2158,8 @@ mod tests {
                 policy_decision_refs: vec![
                     micro_ref("mc:lc", lc_second),
                     micro_ref("mc:sn", sn_second),
+                    micro_ref("mc_cfg:lc", lc_config_second),
+                    micro_ref("mc_cfg:sn", sn_config_second),
                 ],
                 pvgs_receipt_ref: None,
                 dlp_refs: Vec::new(),
@@ -2139,6 +2200,14 @@ mod tests {
         let trace = trace_action(&store, action);
         assert_eq!(trace.micro_evidence.lc_snapshots, vec![lc_first, lc_second]);
         assert_eq!(trace.micro_evidence.sn_snapshots, vec![sn_first, sn_second]);
+        assert_eq!(
+            trace.micro_evidence.lc_configs,
+            vec![lc_config_first, lc_config_second]
+        );
+        assert_eq!(
+            trace.micro_evidence.sn_configs,
+            vec![sn_config_first, sn_config_second]
+        );
     }
 
     #[test]
@@ -2161,7 +2230,7 @@ mod tests {
 
         for idx in 0..(MAX_MICRO_EVIDENCE + 8) {
             let digest = [idx as u8; 32];
-            let refs = vec![micro_ref("mc:lc", digest)];
+            let refs = vec![micro_ref("mc:lc", digest), micro_ref("mc_cfg:lc", digest)];
             append_decision_record_with_refs(
                 &mut store,
                 &keystore,
@@ -2175,7 +2244,54 @@ mod tests {
         assert_eq!(summary.lc_snapshots.len(), MAX_MICRO_EVIDENCE);
         assert_eq!(summary.lc_snapshots.first().copied(), Some([0u8; 32]));
         assert_eq!(summary.lc_snapshots.last().copied(), Some([31u8; 32]));
+        assert_eq!(summary.lc_configs.len(), MAX_MICRO_EVIDENCE);
+        assert_eq!(summary.lc_configs.first().copied(), Some([0u8; 32]));
+        assert_eq!(summary.lc_configs.last().copied(), Some([31u8; 32]));
         assert!(summary.sn_snapshots.is_empty());
+        assert!(summary.sn_configs.is_empty());
+    }
+
+    #[test]
+    fn list_microcircuit_evidence_includes_configs() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+
+        let lc_snapshot = [10u8; 32];
+        let sn_snapshot = [11u8; 32];
+        let lc_config = [12u8; 32];
+        let sn_config = [13u8; 32];
+        let refs = vec![
+            micro_ref("mc:lc", lc_snapshot),
+            micro_ref("mc:sn", sn_snapshot),
+            micro_ref("mc_cfg:lc", lc_config),
+            micro_ref("mc_cfg:sn", sn_config),
+        ];
+        append_decision_record_with_refs(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            "session-configs",
+            refs,
+        );
+
+        let summary = list_microcircuit_evidence(&store, "session-configs");
+        assert_eq!(summary.lc_snapshots, vec![lc_snapshot]);
+        assert_eq!(summary.sn_snapshots, vec![sn_snapshot]);
+        assert_eq!(summary.lc_configs, vec![lc_config]);
+        assert_eq!(summary.sn_configs, vec![sn_config]);
     }
 
     fn store_dlp_decision(

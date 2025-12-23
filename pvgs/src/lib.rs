@@ -1388,6 +1388,8 @@ impl PvgsStore {
 
         let mut lc_digests = Vec::new();
         let mut sn_digests = Vec::new();
+        let mut lc_config_digests = Vec::new();
+        let mut sn_config_digests = Vec::new();
 
         for reference in &gov.policy_decision_refs {
             if let Some(digest) = micro_digest_from_ref(reference, "mc:lc") {
@@ -1396,9 +1398,20 @@ impl PvgsStore {
             if let Some(digest) = micro_digest_from_ref(reference, "mc:sn") {
                 sn_digests.push(digest);
             }
+            if let Some(digest) = micro_digest_from_ref(reference, "mc_cfg:lc") {
+                lc_config_digests.push(digest);
+            }
+            if let Some(digest) = micro_digest_from_ref(reference, "mc_cfg:sn") {
+                sn_config_digests.push(digest);
+            }
         }
 
-        for digest in lc_digests.into_iter().chain(sn_digests) {
+        for digest in lc_digests
+            .into_iter()
+            .chain(sn_digests)
+            .chain(lc_config_digests)
+            .chain(sn_config_digests)
+        {
             self.add_graph_edge(
                 record_digest,
                 EdgeType::References,
