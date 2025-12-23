@@ -26,6 +26,7 @@ milestones = { path = "../milestones" }
 consistency = { path = "../crates/consistency" }
 limits = { workspace = true }
 recovery = { path = "../crates/recovery" }
+micro_evidence = { path = "../crates/micro_evidence" }
 
 [features]
 default = []

@@ -499,6 +499,19 @@ pub fn list_micros(store: &PvgsStore) -> Vec<MicroMilestone> {
     micros
 }
 
+/// Return the latest microcircuit config digest for a module, if present.
+pub fn get_microcircuit_config_digest(store: &PvgsStore, module: &str) -> Option<[u8; 32]> {
+    store
+        .micro_config_store
+        .latest_for_module(module)
+        .map(|entry| entry.config_digest)
+}
+
+/// List current microcircuit configs in deterministic module order.
+pub fn list_microcircuit_configs(store: &PvgsStore) -> Vec<(String, [u8; 32], u32)> {
+    store.micro_config_store.list_latest()
+}
+
 /// List all meso milestones in deterministic order.
 pub fn list_mesos(store: &PvgsStore) -> Vec<MesoMilestone> {
     let mut mesos = store.meso_milestones.list().to_vec();
@@ -1308,6 +1321,7 @@ fn is_profile_node(store: &PvgsStore, digest: &NodeKey) -> bool {
 mod tests {
     use super::*;
     use keys::KeyStore;
+    use micro_evidence::{compute_config_digest, MicrocircuitConfigEvidence};
     use pev::PolicyEcologyDimension;
     use prost::Message;
     use pvgs::{
@@ -1397,6 +1411,48 @@ mod tests {
             known_policy_versions,
             known_profiles,
         )
+    }
+
+    #[test]
+    fn microcircuit_config_queries_return_latest() {
+        let mut store = minimal_store();
+        let lc_digest = compute_config_digest("LC", 1, b"lc-config");
+        let sn_digest = compute_config_digest("SN", 2, b"sn-config");
+
+        store.micro_config_store.append(MicrocircuitConfigEvidence {
+            module: "LC".to_string(),
+            config_version: 1,
+            config_digest: lc_digest,
+            created_at_ms: 10,
+            attested_by_key_id: None,
+            signature: None,
+        });
+        store.micro_config_store.append(MicrocircuitConfigEvidence {
+            module: "SN".to_string(),
+            config_version: 2,
+            config_digest: sn_digest,
+            created_at_ms: 20,
+            attested_by_key_id: None,
+            signature: None,
+        });
+
+        assert_eq!(
+            get_microcircuit_config_digest(&store, "LC"),
+            Some(lc_digest)
+        );
+        assert_eq!(
+            get_microcircuit_config_digest(&store, "SN"),
+            Some(sn_digest)
+        );
+
+        let configs = list_microcircuit_configs(&store);
+        assert_eq!(
+            configs,
+            vec![
+                ("LC".to_string(), lc_digest, 1),
+                ("SN".to_string(), sn_digest, 2),
+            ]
+        );
     }
 
     fn dummy_proof_receipt(record_digest: [u8; 32]) -> ProofReceipt {
@@ -1866,6 +1922,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -2142,6 +2199,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, _) = verify_and_commit(req, store, keystore, vrf_engine);
@@ -2207,6 +2265,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, _) = verify_and_commit(req, store, keystore, vrf_engine);
