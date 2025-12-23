@@ -26,7 +26,7 @@ use sep::{
     CausalGraph, EdgeType, FrameEventKind, NodeKey, SepError, SepEventInternal, SepEventType,
     SepLog, SessionSeal,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -563,6 +563,14 @@ pub struct PvgsStore {
     pub forensic_mode: bool,
     pub ruleset_state: RulesetState,
     pub suspended_tools: BTreeSet<(String, String)>,
+    pub tool_event_correlations: BTreeMap<[u8; 32], ToolEventCorrelation>,
+    pub registry_ruleset_correlation: BTreeMap<[u8; 32], [u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolEventCorrelation {
+    pub ruleset_digest: [u8; 32],
+    pub tool_registry_digest: Option<[u8; 32]>,
 }
 
 /// Helper for planned commits that require mutable access to the PVGS store and cryptographic
@@ -775,6 +783,8 @@ impl PvgsStore {
             forensic_mode: false,
             ruleset_state: RulesetState::new(charter_version_digest, policy_version_digest),
             suspended_tools: BTreeSet::new(),
+            tool_event_correlations: BTreeMap::new(),
+            registry_ruleset_correlation: BTreeMap::new(),
         }
     }
 
@@ -807,6 +817,21 @@ impl PvgsStore {
     pub fn update_tool_registry_digest(&mut self, tool_registry_digest: Option<[u8; 32]>) -> bool {
         self.ruleset_state.tool_registry_digest = tool_registry_digest;
         self.ruleset_state.recompute_ruleset_digest()
+    }
+
+    pub fn correlate_tool_event(&mut self, event_digest: [u8; 32]) {
+        self.tool_event_correlations.insert(
+            event_digest,
+            ToolEventCorrelation {
+                ruleset_digest: self.ruleset_state.ruleset_digest,
+                tool_registry_digest: self.ruleset_state.tool_registry_digest,
+            },
+        );
+    }
+
+    pub fn correlate_registry_ruleset(&mut self, registry_digest: [u8; 32]) {
+        self.registry_ruleset_correlation
+            .insert(registry_digest, self.ruleset_state.ruleset_digest);
     }
 
     pub fn collect_replay_signals(&self, session_id: &str) -> ReplaySignals {
@@ -3599,6 +3624,9 @@ fn verify_tool_registry_update(
     }
     let tool_ruleset_changed =
         store.update_tool_registry_digest(store.tool_registry_state.current());
+    if let Some(digest) = store.tool_registry_state.current() {
+        store.correlate_registry_ruleset(digest);
+    }
     let effective_tool_change =
         tool_ruleset_changed || (ruleset_changed && !charter_or_policy_changed);
 
@@ -4250,6 +4278,7 @@ fn verify_tool_event_append(
     let digest = stored_digest.unwrap_or_else(|| event_digest.unwrap_or([0u8; 32]));
     store.committed_payload_digests.insert(payload_digest);
     update_suspended_tools(store, &event);
+    store.correlate_tool_event(digest);
 
     let mut event_reason_codes =
         vec![protocol::ReasonCodes::GV_TOOL_ONBOARDING_EVENT_APPENDED.to_string()];
