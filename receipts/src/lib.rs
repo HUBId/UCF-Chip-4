@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use blake3::Hasher;
+use common::digest::{blake3_digest, encode_deterministic};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use keys::KeyStore;
 use std::convert::TryInto;
@@ -23,38 +23,123 @@ pub fn compute_receipt_digest(
     status: ReceiptStatus,
     reject_reason_codes: &[String],
 ) -> [u8; 32] {
-    let mut hasher = Hasher::new();
-    hasher.update(b"UCF:PVGS:RECEIPT");
-    hasher.update(req.commit_id.as_bytes());
-    hasher.update(commit_type_label(&req.commit_type).as_bytes());
+    let preimage = receipt_digest_preimage(req, status, reject_reason_codes);
+    blake3_digest("UCF", "PVGS:RECEIPT", "v1", &preimage)
+}
 
-    update_optional_digest_hasher(&mut hasher, &req.bindings.action_digest);
-    update_optional_digest_hasher(&mut hasher, &req.bindings.decision_digest);
-    update_optional_string_hasher(&mut hasher, &req.bindings.grant_id);
-    hasher.update(req.bindings.charter_version_digest.as_bytes());
-    hasher.update(req.bindings.policy_version_digest.as_bytes());
-    hasher.update(&req.bindings.prev_record_digest.0);
-    update_optional_digest_hasher(&mut hasher, &req.bindings.profile_digest);
-    update_optional_digest_hasher(&mut hasher, &req.bindings.tool_profile_digest);
-    update_optional_digest_hasher(&mut hasher, &req.bindings.pev_digest);
+fn receipt_digest_preimage(
+    req: &ReceiptInput,
+    status: ReceiptStatus,
+    reject_reason_codes: &[String],
+) -> Vec<u8> {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(req.commit_id.as_bytes());
+    preimage.extend_from_slice(commit_type_label(&req.commit_type).as_bytes());
 
-    hasher.update(required_receipt_kind_label(&req.required_receipt_kind).as_bytes());
+    update_optional_digest(
+        &mut preimage,
+        &req.bindings.action_digest.as_ref().map(|d| d.0),
+    );
+    update_optional_digest(
+        &mut preimage,
+        &req.bindings.decision_digest.as_ref().map(|d| d.0),
+    );
+    update_optional_string(&mut preimage, &req.bindings.grant_id);
+    preimage.extend_from_slice(req.bindings.charter_version_digest.as_bytes());
+    preimage.extend_from_slice(req.bindings.policy_version_digest.as_bytes());
+    preimage.extend_from_slice(&req.bindings.prev_record_digest.0);
+    update_optional_digest(
+        &mut preimage,
+        &req.bindings.profile_digest.as_ref().map(|d| d.0),
+    );
+    update_optional_digest(
+        &mut preimage,
+        &req.bindings.tool_profile_digest.as_ref().map(|d| d.0),
+    );
+    update_optional_digest(
+        &mut preimage,
+        &req.bindings.pev_digest.as_ref().map(|d| d.0),
+    );
+
+    preimage.extend_from_slice(required_receipt_kind_label(&req.required_receipt_kind).as_bytes());
 
     for check in &req.required_checks {
-        hasher.update(required_check_label(check).as_bytes());
+        preimage.extend_from_slice(required_check_label(check).as_bytes());
     }
 
     for digest in &req.payload_digests {
-        hasher.update(digest);
+        preimage.extend_from_slice(digest);
     }
 
-    hasher.update(status_label(status).as_bytes());
+    preimage.extend_from_slice(status_label(status).as_bytes());
     for rc in reject_reason_codes {
-        hasher.update(rc.as_bytes());
+        preimage.extend_from_slice(rc.as_bytes());
     }
-    hasher.update(&req.epoch_id.to_le_bytes());
+    preimage.extend_from_slice(&req.epoch_id.to_le_bytes());
 
-    *hasher.finalize().as_bytes()
+    preimage
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ReceiptSignaturePreimage {
+    #[prost(string, tag = "1")]
+    commit_id: String,
+    #[prost(string, tag = "2")]
+    commit_type: String,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    action_digest: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "4")]
+    decision_digest: Option<Vec<u8>>,
+    #[prost(string, optional, tag = "5")]
+    grant_id: Option<String>,
+    #[prost(string, tag = "6")]
+    charter_version_digest: String,
+    #[prost(string, tag = "7")]
+    policy_version_digest: String,
+    #[prost(bytes = "vec", tag = "8")]
+    prev_record_digest: Vec<u8>,
+    #[prost(bytes = "vec", optional, tag = "9")]
+    profile_digest: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "10")]
+    tool_profile_digest: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "11")]
+    pev_digest: Option<Vec<u8>>,
+    #[prost(string, tag = "12")]
+    required_receipt_kind: String,
+    #[prost(string, repeated, tag = "13")]
+    required_checks: Vec<String>,
+    #[prost(bytes = "vec", repeated, tag = "14")]
+    payload_digests: Vec<Vec<u8>>,
+    #[prost(string, tag = "15")]
+    status: String,
+    #[prost(string, repeated, tag = "16")]
+    reject_reason_codes: Vec<String>,
+    #[prost(uint64, tag = "17")]
+    epoch_id: u64,
+    #[prost(bytes = "vec", tag = "18")]
+    receipt_digest: Vec<u8>,
+    #[prost(string, tag = "19")]
+    receipt_id: String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ProofReceiptSignaturePreimage {
+    #[prost(bytes = "vec", tag = "1")]
+    ruleset_digest: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    verified_fields_digest: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    vrf_digest: Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    receipt_digest: Vec<u8>,
+    #[prost(bytes = "vec", tag = "5")]
+    proof_receipt_digest: Vec<u8>,
+    #[prost(string, tag = "6")]
+    proof_receipt_id: String,
+    #[prost(uint64, tag = "7")]
+    timestamp_ms: u64,
+    #[prost(uint64, tag = "8")]
+    epoch_id: u64,
 }
 
 /// Issue a PVGS receipt for a given commit request and status.
@@ -174,57 +259,81 @@ pub fn verify_proof_receipt_attestation(proof: &ProofReceipt, pubkey: [u8; 32]) 
 }
 
 fn pvgs_attestation_preimage(receipt: &PVGSReceipt) -> Vec<u8> {
-    let mut preimage = Vec::new();
+    let mut reject_reason_codes = receipt.reject_reason_codes.clone();
+    reject_reason_codes.sort();
+
+    let payload = ReceiptSignaturePreimage {
+        commit_id: receipt.commit_id.clone(),
+        commit_type: commit_type_label(&receipt.commit_type).to_string(),
+        action_digest: receipt
+            .bindings
+            .action_digest
+            .as_ref()
+            .map(|d| d.0.to_vec()),
+        decision_digest: receipt
+            .bindings
+            .decision_digest
+            .as_ref()
+            .map(|d| d.0.to_vec()),
+        grant_id: receipt.bindings.grant_id.clone(),
+        charter_version_digest: receipt.bindings.charter_version_digest.clone(),
+        policy_version_digest: receipt.bindings.policy_version_digest.clone(),
+        prev_record_digest: receipt.bindings.prev_record_digest.0.to_vec(),
+        profile_digest: receipt
+            .bindings
+            .profile_digest
+            .as_ref()
+            .map(|d| d.0.to_vec()),
+        tool_profile_digest: receipt
+            .bindings
+            .tool_profile_digest
+            .as_ref()
+            .map(|d| d.0.to_vec()),
+        pev_digest: receipt.bindings.pev_digest.as_ref().map(|d| d.0.to_vec()),
+        required_receipt_kind: required_receipt_kind_label(&receipt.required_receipt_kind)
+            .to_string(),
+        required_checks: receipt
+            .required_checks
+            .iter()
+            .map(|c| required_check_label(c).to_string())
+            .collect(),
+        payload_digests: receipt
+            .payload_digests
+            .iter()
+            .map(|d| d.0.to_vec())
+            .collect(),
+        status: status_label(receipt.status).to_string(),
+        reject_reason_codes,
+        epoch_id: receipt.epoch_id,
+        receipt_digest: receipt.receipt_digest.0.to_vec(),
+        receipt_id: receipt.receipt_id.clone(),
+    };
+
+    let encoded = encode_deterministic(&payload);
+
+    let mut preimage = Vec::with_capacity(b"UCF:SIGN:PVGS_RECEIPT".len() + encoded.len());
     preimage.extend_from_slice(b"UCF:SIGN:PVGS_RECEIPT");
-    preimage.extend_from_slice(&receipt.epoch_id.to_le_bytes());
-    preimage.extend_from_slice(receipt.receipt_id.as_bytes());
-    preimage.extend_from_slice(&receipt.receipt_digest.0);
-    preimage.extend_from_slice(status_label(receipt.status).as_bytes());
-
-    update_optional_digest(
-        &mut preimage,
-        &receipt.bindings.action_digest.as_ref().map(|d| d.0),
-    );
-    update_optional_digest(
-        &mut preimage,
-        &receipt.bindings.decision_digest.as_ref().map(|d| d.0),
-    );
-    update_optional_string(&mut preimage, &receipt.bindings.grant_id);
-    preimage.extend_from_slice(receipt.bindings.charter_version_digest.as_bytes());
-    preimage.extend_from_slice(receipt.bindings.policy_version_digest.as_bytes());
-    preimage.extend_from_slice(&receipt.bindings.prev_record_digest.0);
-    update_optional_digest(
-        &mut preimage,
-        &receipt.bindings.profile_digest.as_ref().map(|d| d.0),
-    );
-    update_optional_digest(
-        &mut preimage,
-        &receipt.bindings.tool_profile_digest.as_ref().map(|d| d.0),
-    );
-    update_optional_digest(
-        &mut preimage,
-        &receipt.bindings.pev_digest.as_ref().map(|d| d.0),
-    );
-
-    let mut reason_codes = receipt.reject_reason_codes.clone();
-    reason_codes.sort();
-    for rc in reason_codes {
-        preimage.extend_from_slice(rc.as_bytes());
-    }
-
+    preimage.extend_from_slice(&encoded);
     preimage
 }
 
 fn proof_attestation_preimage(proof: &ProofReceipt) -> Vec<u8> {
-    let mut preimage = Vec::new();
+    let payload = ProofReceiptSignaturePreimage {
+        ruleset_digest: proof.ruleset_digest.0.to_vec(),
+        verified_fields_digest: proof.verified_fields_digest.0.to_vec(),
+        vrf_digest: proof.vrf_digest.0.to_vec(),
+        timestamp_ms: proof.timestamp_ms,
+        epoch_id: proof.epoch_id,
+        proof_receipt_id: proof.proof_receipt_id.clone(),
+        proof_receipt_digest: proof.proof_receipt_digest.0.to_vec(),
+        receipt_digest: proof.receipt_digest.0.to_vec(),
+    };
+
+    let encoded = encode_deterministic(&payload);
+
+    let mut preimage = Vec::with_capacity(b"UCF:SIGN:PROOF_RECEIPT".len() + encoded.len());
     preimage.extend_from_slice(b"UCF:SIGN:PROOF_RECEIPT");
-    preimage.extend_from_slice(&proof.ruleset_digest.0);
-    preimage.extend_from_slice(&proof.verified_fields_digest.0);
-    preimage.extend_from_slice(&proof.vrf_digest.0);
-    preimage.extend_from_slice(&proof.timestamp_ms.to_le_bytes());
-    preimage.extend_from_slice(&proof.epoch_id.to_le_bytes());
-    preimage.extend_from_slice(proof.proof_receipt_id.as_bytes());
-    preimage.extend_from_slice(&proof.proof_receipt_digest.0);
+    preimage.extend_from_slice(&encoded);
     preimage
 }
 
@@ -236,15 +345,14 @@ fn compute_proof_receipt_digest(
     timestamp_ms: u64,
     epoch_id: u64,
 ) -> [u8; 32] {
-    let mut hasher = Hasher::new();
-    hasher.update(b"UCF:PVGS:PROOF_RECEIPT");
-    hasher.update(proof_receipt_id.as_bytes());
-    hasher.update(&ruleset_digest);
-    hasher.update(&verified_fields_digest);
-    hasher.update(&maybe_vrf_digest);
-    hasher.update(&timestamp_ms.to_le_bytes());
-    hasher.update(&epoch_id.to_le_bytes());
-    *hasher.finalize().as_bytes()
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(proof_receipt_id.as_bytes());
+    preimage.extend_from_slice(&ruleset_digest);
+    preimage.extend_from_slice(&verified_fields_digest);
+    preimage.extend_from_slice(&maybe_vrf_digest);
+    preimage.extend_from_slice(&timestamp_ms.to_le_bytes());
+    preimage.extend_from_slice(&epoch_id.to_le_bytes());
+    blake3_digest("UCF", "PVGS:PROOF_RECEIPT", "v1", &preimage)
 }
 
 fn commit_type_label(commit_type: &protocol::CommitType) -> &'static str {
@@ -289,30 +397,6 @@ fn required_receipt_kind_label(kind: &protocol::RequiredReceiptKind) -> &'static
         protocol::RequiredReceiptKind::Execute => "EXECUTE",
         protocol::RequiredReceiptKind::Export => "EXPORT",
         protocol::RequiredReceiptKind::Persist => "PERSIST",
-    }
-}
-
-fn update_optional_digest_hasher(hasher: &mut Hasher, digest: &Option<Digest32>) {
-    match digest {
-        Some(d) => {
-            hasher.update(&[1u8]);
-            hasher.update(&d.0);
-        }
-        None => {
-            hasher.update(&[0u8]);
-        }
-    }
-}
-
-fn update_optional_string_hasher(hasher: &mut Hasher, value: &Option<String>) {
-    match value {
-        Some(v) => {
-            hasher.update(&[1u8]);
-            hasher.update(v.as_bytes());
-        }
-        None => {
-            hasher.update(&[0u8]);
-        }
     }
 }
 
