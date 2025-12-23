@@ -52,6 +52,14 @@ pub struct TraceResult {
     pub records: Vec<NodeKey>,
     pub profiles: Vec<NodeKey>,
     pub path: Vec<NodeKey>,
+    pub micro_evidence: MicroEvidenceSummary,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MicroEvidenceSummary {
+    pub lc_snapshots: Vec<[u8; 32]>,
+    pub sn_snapshots: Vec<[u8; 32]>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -60,6 +68,7 @@ pub struct RecordTrace {
     pub references: Vec<NodeKey>,
     pub referenced_by: Vec<NodeKey>,
     pub dlp_decisions: Vec<NodeKey>,
+    pub micro_evidence: MicroEvidenceSummary,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -754,6 +763,7 @@ fn macro_ref_matches(reference: &ucf_protocol::ucf::v1::Ref, macro_digest: [u8; 
 }
 
 const MAX_TRACE_NODES: usize = 256;
+const MAX_MICRO_EVIDENCE: usize = 32;
 
 /// Traverse the causal graph starting from an action digest to collect receipts,
 /// related decisions, records, and profiles.
@@ -839,12 +849,15 @@ pub fn trace_action(store: &PvgsStore, action_digest: [u8; 32]) -> TraceResult {
         }
     }
 
+    let micro_evidence = collect_micro_evidence_from_records(store, &records);
+
     TraceResult {
         receipts: receipts.into_iter().collect(),
         decisions: decisions.into_iter().collect(),
         records: records.into_iter().collect(),
         profiles: profiles.into_iter().collect(),
         path,
+        micro_evidence,
     }
 }
 
@@ -853,6 +866,7 @@ pub fn trace_record(store: &PvgsStore, record_digest: [u8; 32]) -> RecordTrace {
     let mut references = BTreeSet::new();
     let mut referenced_by = BTreeSet::new();
     let mut dlp_decisions = BTreeSet::new();
+    let mut micro_evidence = MicroEvidenceSummary::default();
 
     for (edge, neighbor) in sorted_edges(store.causal_graph.neighbors(record_digest)) {
         if matches!(edge, EdgeType::References) {
@@ -870,13 +884,50 @@ pub fn trace_record(store: &PvgsStore, record_digest: [u8; 32]) -> RecordTrace {
         for digest in dlp_digests_from_record(record) {
             dlp_decisions.insert(digest);
         }
+        micro_evidence = micro_evidence_from_record(record);
     }
 
     RecordTrace {
         references: references.into_iter().collect(),
         referenced_by: referenced_by.into_iter().collect(),
         dlp_decisions: dlp_decisions.into_iter().collect(),
+        micro_evidence,
     }
+}
+
+/// List microcircuit evidence digests for a session in deterministic order.
+pub fn list_microcircuit_evidence(store: &PvgsStore, session_id: &str) -> MicroEvidenceSummary {
+    let mut record_digests: Vec<[u8; 32]> = store
+        .sep_log
+        .events
+        .iter()
+        .filter(|event| event.session_id == session_id)
+        .filter(|event| matches!(event.event_type, SepEventType::EvAgentStep))
+        .map(|event| event.object_digest)
+        .collect();
+
+    record_digests.sort();
+    record_digests.dedup();
+
+    let mut lc_snapshots = BTreeSet::new();
+    let mut sn_snapshots = BTreeSet::new();
+
+    for digest in record_digests {
+        if let Some(record) = find_record(store, digest) {
+            if let Some(gov) = &record.governance_frame {
+                for reference in &gov.policy_decision_refs {
+                    if let Some(micro_digest) = digest_from_labeled_ref(reference, "mc:lc") {
+                        lc_snapshots.insert(micro_digest);
+                    }
+                    if let Some(micro_digest) = digest_from_labeled_ref(reference, "mc:sn") {
+                        sn_snapshots.insert(micro_digest);
+                    }
+                }
+            }
+        }
+    }
+
+    micro_evidence_from_sets(lc_snapshots, sn_snapshots)
 }
 
 /// List export attempts for a session in deterministic order.
@@ -1072,6 +1123,65 @@ fn dlp_digests_from_record(record: &ExperienceRecord) -> Vec<NodeKey> {
     }
 
     digests.into_iter().collect()
+}
+
+fn micro_evidence_from_record(record: &ExperienceRecord) -> MicroEvidenceSummary {
+    let mut lc_snapshots = BTreeSet::new();
+    let mut sn_snapshots = BTreeSet::new();
+
+    if let Some(gov) = &record.governance_frame {
+        for reference in &gov.policy_decision_refs {
+            if let Some(digest) = digest_from_labeled_ref(reference, "mc:lc") {
+                lc_snapshots.insert(digest);
+            }
+            if let Some(digest) = digest_from_labeled_ref(reference, "mc:sn") {
+                sn_snapshots.insert(digest);
+            }
+        }
+    }
+
+    micro_evidence_from_sets(lc_snapshots, sn_snapshots)
+}
+
+fn collect_micro_evidence_from_records(
+    store: &PvgsStore,
+    records: &BTreeSet<[u8; 32]>,
+) -> MicroEvidenceSummary {
+    let mut lc_snapshots = BTreeSet::new();
+    let mut sn_snapshots = BTreeSet::new();
+
+    for record_digest in records {
+        if let Some(record) = find_record(store, *record_digest) {
+            if let Some(gov) = &record.governance_frame {
+                for reference in &gov.policy_decision_refs {
+                    if let Some(digest) = digest_from_labeled_ref(reference, "mc:lc") {
+                        lc_snapshots.insert(digest);
+                    }
+                    if let Some(digest) = digest_from_labeled_ref(reference, "mc:sn") {
+                        sn_snapshots.insert(digest);
+                    }
+                }
+            }
+        }
+    }
+
+    micro_evidence_from_sets(lc_snapshots, sn_snapshots)
+}
+
+fn micro_evidence_from_sets(
+    lc_snapshots: BTreeSet<[u8; 32]>,
+    sn_snapshots: BTreeSet<[u8; 32]>,
+) -> MicroEvidenceSummary {
+    let mut lc_snapshots: Vec<[u8; 32]> = lc_snapshots.into_iter().collect();
+    let mut sn_snapshots: Vec<[u8; 32]> = sn_snapshots.into_iter().collect();
+
+    lc_snapshots.truncate(MAX_MICRO_EVIDENCE);
+    sn_snapshots.truncate(MAX_MICRO_EVIDENCE);
+
+    MicroEvidenceSummary {
+        lc_snapshots,
+        sn_snapshots,
+    }
 }
 
 fn digest_from_labeled_ref(
@@ -1301,6 +1411,12 @@ mod tests {
             proof_receipt_digest: Digest32([0u8; 32]),
             proof_attestation_key_id: String::new(),
             proof_attestation_sig: Vec::new(),
+        }
+    }
+
+    fn micro_ref(prefix: &str, digest: [u8; 32]) -> Ref {
+        Ref {
+            id: format!("{prefix}:{}", hex::encode(digest)),
         }
     }
 
@@ -1614,6 +1730,7 @@ mod tests {
             result.path,
             vec![action, receipt, decision, record, profile]
         );
+        assert_eq!(result.micro_evidence, MicroEvidenceSummary::default());
     }
 
     #[test]
@@ -1675,6 +1792,7 @@ mod tests {
         assert_eq!(result_one.records, result_two.records);
         assert_eq!(result_one.profiles, result_two.profiles);
         assert_eq!(result_one.path, result_two.path);
+        assert_eq!(result_one.micro_evidence, result_two.micro_evidence);
     }
 
     #[test]
@@ -1757,6 +1875,168 @@ mod tests {
         let trace = trace_record(&store, record_digest);
 
         assert_eq!(trace.dlp_decisions, vec![dlp_digest]);
+        assert_eq!(trace.micro_evidence, MicroEvidenceSummary::default());
+    }
+
+    #[test]
+    fn trace_record_includes_micro_evidence() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+
+        let lc_digest = [1u8; 32];
+        let sn_digest = [2u8; 32];
+        let refs = vec![micro_ref("mc:lc", lc_digest), micro_ref("mc:sn", sn_digest)];
+
+        let record_digest =
+            append_decision_record_with_refs(&mut store, &keystore, &vrf_engine, "session", refs);
+
+        let references: Vec<_> = store
+            .causal_graph
+            .neighbors(record_digest)
+            .iter()
+            .filter(|(edge, _)| matches!(edge, EdgeType::References))
+            .map(|(_, digest)| *digest)
+            .collect();
+
+        assert!(references.contains(&lc_digest));
+        assert!(references.contains(&sn_digest));
+
+        let trace = trace_record(&store, record_digest);
+        assert_eq!(trace.micro_evidence.lc_snapshots, vec![lc_digest]);
+        assert_eq!(trace.micro_evidence.sn_snapshots, vec![sn_digest]);
+    }
+
+    #[test]
+    fn trace_action_collects_micro_evidence() {
+        let action = [11u8; 32];
+        let receipt = [12u8; 32];
+        let profile = [13u8; 32];
+        let lc_first = [1u8; 32];
+        let lc_second = [3u8; 32];
+        let sn_first = [2u8; 32];
+        let sn_second = [4u8; 32];
+
+        let mut store = trace_store(profile);
+
+        let record_one = ExperienceRecord {
+            record_type: RecordType::RtActionExec as i32,
+            core_frame: None,
+            metabolic_frame: None,
+            governance_frame: Some(GovernanceFrame {
+                policy_decision_refs: vec![
+                    micro_ref("mc:lc", lc_first),
+                    micro_ref("mc:sn", sn_first),
+                ],
+                pvgs_receipt_ref: None,
+                dlp_refs: Vec::new(),
+            }),
+            core_frame_ref: None,
+            metabolic_frame_ref: None,
+            governance_frame_ref: Some(Ref {
+                id: hex::encode([8u8; 32]),
+            }),
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        };
+
+        let record_two = ExperienceRecord {
+            record_type: RecordType::RtActionExec as i32,
+            core_frame: None,
+            metabolic_frame: None,
+            governance_frame: Some(GovernanceFrame {
+                policy_decision_refs: vec![
+                    micro_ref("mc:lc", lc_second),
+                    micro_ref("mc:sn", sn_second),
+                ],
+                pvgs_receipt_ref: None,
+                dlp_refs: Vec::new(),
+            }),
+            core_frame_ref: None,
+            metabolic_frame_ref: None,
+            governance_frame_ref: Some(Ref {
+                id: hex::encode([9u8; 32]),
+            }),
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        };
+
+        let record_one_digest = compute_experience_record_digest(&record_one);
+        let record_two_digest = compute_experience_record_digest(&record_two);
+
+        store.experience_store.records.push(record_one);
+        store.experience_store.records.push(record_two);
+        store
+            .experience_store
+            .proof_receipts
+            .insert(record_one_digest, dummy_proof_receipt(record_one_digest));
+        store
+            .experience_store
+            .proof_receipts
+            .insert(record_two_digest, dummy_proof_receipt(record_two_digest));
+
+        store
+            .causal_graph
+            .add_edge(action, EdgeType::Authorizes, receipt, None);
+        store
+            .causal_graph
+            .add_edge(record_one_digest, EdgeType::References, action, None);
+        store
+            .causal_graph
+            .add_edge(record_two_digest, EdgeType::References, action, None);
+
+        let trace = trace_action(&store, action);
+        assert_eq!(trace.micro_evidence.lc_snapshots, vec![lc_first, lc_second]);
+        assert_eq!(trace.micro_evidence.sn_snapshots, vec![sn_first, sn_second]);
+    }
+
+    #[test]
+    fn list_microcircuit_evidence_is_bounded() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+
+        for idx in 0..(MAX_MICRO_EVIDENCE + 8) {
+            let digest = [idx as u8; 32];
+            let refs = vec![micro_ref("mc:lc", digest)];
+            append_decision_record_with_refs(
+                &mut store,
+                &keystore,
+                &vrf_engine,
+                "session-bounded",
+                refs,
+            );
+        }
+
+        let summary = list_microcircuit_evidence(&store, "session-bounded");
+        assert_eq!(summary.lc_snapshots.len(), MAX_MICRO_EVIDENCE);
+        assert_eq!(summary.lc_snapshots.first().copied(), Some([0u8; 32]));
+        assert_eq!(summary.lc_snapshots.last().copied(), Some([31u8; 32]));
+        assert!(summary.sn_snapshots.is_empty());
     }
 
     fn store_dlp_decision(
@@ -1822,6 +2102,71 @@ mod tests {
             record_type: RecordType::RtOutput as i32,
             core_frame: None,
             metabolic_frame,
+            governance_frame: Some(governance_frame),
+            core_frame_ref: None,
+            metabolic_frame_ref: None,
+            governance_frame_ref: Some(Ref {
+                id: hex::encode([9u8; 32]),
+            }),
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        };
+
+        let req = PvgsCommitRequest {
+            commit_id: commit_id.to_string(),
+            commit_type: CommitType::ExperienceRecordAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: Some(record.encode_to_vec()),
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: None,
+        };
+
+        let (receipt, _) = verify_and_commit(req, store, keystore, vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+
+        store.experience_store.head_record_digest
+    }
+
+    fn append_decision_record_with_refs(
+        store: &mut PvgsStore,
+        keystore: &KeyStore,
+        vrf_engine: &VrfEngine,
+        commit_id: &str,
+        related_refs: Vec<Ref>,
+    ) -> [u8; 32] {
+        let governance_frame = GovernanceFrame {
+            policy_decision_refs: related_refs,
+            pvgs_receipt_ref: None,
+            dlp_refs: Vec::new(),
+        };
+
+        let record = ExperienceRecord {
+            record_type: RecordType::RtDecision as i32,
+            core_frame: None,
+            metabolic_frame: None,
             governance_frame: Some(governance_frame),
             core_frame_ref: None,
             metabolic_frame_ref: None,
