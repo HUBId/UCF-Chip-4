@@ -1205,6 +1205,7 @@ impl PvgsStore {
         }
 
         self.add_frame_reference_edges(session_id, record_digest, record);
+        self.add_micro_reference_edges(session_id, record_digest, record);
 
         match RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified) {
             RecordType::RtActionExec => {
@@ -1308,6 +1309,38 @@ impl PvgsStore {
             if let Some(target) = digest_from_ref(reference) {
                 self.add_graph_edge(from, EdgeType::References, target, Some(session_id));
             }
+        }
+    }
+
+    fn add_micro_reference_edges(
+        &mut self,
+        session_id: &str,
+        record_digest: NodeKey,
+        record: &ExperienceRecord,
+    ) {
+        let Some(gov) = &record.governance_frame else {
+            return;
+        };
+
+        let mut lc_digests = Vec::new();
+        let mut sn_digests = Vec::new();
+
+        for reference in &gov.policy_decision_refs {
+            if let Some(digest) = micro_digest_from_ref(reference, "mc:lc") {
+                lc_digests.push(digest);
+            }
+            if let Some(digest) = micro_digest_from_ref(reference, "mc:sn") {
+                sn_digests.push(digest);
+            }
+        }
+
+        for digest in lc_digests.into_iter().chain(sn_digests) {
+            self.add_graph_edge(
+                record_digest,
+                EdgeType::References,
+                digest,
+                Some(session_id),
+            );
         }
     }
 
@@ -4594,6 +4627,16 @@ fn digest_from_ref(reference: &Ref) -> Option<[u8; 32]> {
                 .and_then(digest_from_hex_str)
         })
         .or_else(|| digest_from_bytes(reference.id.as_bytes()))
+}
+
+fn micro_digest_from_ref(reference: &Ref, target_id: &str) -> Option<[u8; 32]> {
+    let prefix = format!("{target_id}:");
+    let value = reference.id.strip_prefix(&prefix)?;
+    digest_from_labeled_value(value)
+}
+
+fn digest_from_labeled_value(value: &str) -> Option<[u8; 32]> {
+    digest_from_hex_str(value).or_else(|| digest_from_bytes(value.as_bytes()))
 }
 
 fn add_macro_edges(
