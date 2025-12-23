@@ -8,5 +8,7 @@ serde = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
 ucf-protocol = { path = "../ucf-protocol" }
 keys = { path = "../keys" }
+common = { path = "../crates/common" }
+prost.workspace = true
 blake3.workspace = true
 ed25519-dalek.workspace = true
