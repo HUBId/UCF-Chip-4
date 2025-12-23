@@ -90,6 +90,19 @@ pub struct ExportAudit {
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSuspensionExplanation {
+    pub tool_id: String,
+    pub action_id: String,
+    pub suspended: bool,
+    pub latest_event_digest: Option<[u8; 32]>,
+    pub latest_reason_codes: Vec<String>,
+    pub event_ruleset_digest: Option<[u8; 32]>,
+    pub event_tool_registry_digest: Option<[u8; 32]>,
+    pub event_timestamp_ms: Option<u64>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacroStatusView {
     pub macro_id: String,
     pub macro_digest: [u8; 32],
@@ -196,6 +209,78 @@ pub fn list_tool_events(
     action_id: &str,
 ) -> Vec<ToolOnboardingEvent> {
     store.tool_event_store.list_for(tool_id, action_id)
+}
+
+pub fn explain_tool_suspension(
+    store: &PvgsStore,
+    tool_id: &str,
+    action_id: &str,
+) -> ToolSuspensionExplanation {
+    let mut latest: Option<(&ToolOnboardingEvent, usize)> = None;
+
+    for (idx, event) in store.tool_event_store.iter().enumerate() {
+        if event.tool_id != tool_id || event.action_id != action_id {
+            continue;
+        }
+
+        if !matches!(
+            ToolOnboardingStage::try_from(event.stage).ok(),
+            Some(ToolOnboardingStage::To6Suspended)
+        ) {
+            continue;
+        }
+
+        if let Some((prev, prev_idx)) = latest {
+            if is_newer_tool_event(event, idx, prev, prev_idx) {
+                latest = Some((event, idx));
+            }
+        } else {
+            latest = Some((event, idx));
+        }
+    }
+
+    let mut explanation = ToolSuspensionExplanation {
+        tool_id: tool_id.to_string(),
+        action_id: action_id.to_string(),
+        suspended: latest.is_some(),
+        latest_event_digest: None,
+        latest_reason_codes: Vec::new(),
+        event_ruleset_digest: None,
+        event_tool_registry_digest: None,
+        event_timestamp_ms: None,
+    };
+
+    if let Some((event, _)) = latest {
+        explanation.event_timestamp_ms = event.created_at_ms;
+        explanation.latest_reason_codes = event.reason_codes.clone();
+
+        if let Some(digest) = event.event_digest.as_deref().and_then(digest_from_bytes) {
+            explanation.latest_event_digest = Some(digest);
+
+            if let Some(correlation) = store.tool_event_correlations.get(&digest) {
+                explanation.event_ruleset_digest = Some(correlation.ruleset_digest);
+                explanation.event_tool_registry_digest = correlation.tool_registry_digest;
+            }
+        }
+    }
+
+    explanation
+}
+
+pub fn list_suspended_tools_with_reasons(store: &PvgsStore) -> Vec<ToolSuspensionExplanation> {
+    let mut explanations: Vec<_> = store
+        .suspended_tools
+        .iter()
+        .map(|(tool_id, action_id)| explain_tool_suspension(store, tool_id, action_id))
+        .collect();
+
+    explanations.sort_by(|a, b| {
+        a.tool_id
+            .cmp(&b.tool_id)
+            .then(a.action_id.cmp(&b.action_id))
+    });
+
+    explanations
 }
 
 pub fn is_tool_suspended(store: &PvgsStore, tool_id: &str, action_id: &str) -> bool {
@@ -423,8 +508,10 @@ pub fn get_previous_ruleset_digest(store: &PvgsStore) -> Option<[u8; 32]> {
 }
 
 /// List all ruleset change digests observed in the SEP log.
-pub fn list_ruleset_changes(log: &SepLog, session_id: Option<&str>) -> Vec<[u8; 32]> {
-    log.events
+pub fn list_ruleset_changes(store: &PvgsStore, session_id: Option<&str>) -> Vec<[u8; 32]> {
+    store
+        .sep_log
+        .events
         .iter()
         .filter(|event| {
             event
@@ -435,6 +522,24 @@ pub fn list_ruleset_changes(log: &SepLog, session_id: Option<&str>) -> Vec<[u8; 
         })
         .map(|event| event.object_digest)
         .collect()
+}
+
+/// List all committed tool registry digests in deterministic order.
+pub fn list_tool_registry_history(store: &PvgsStore) -> Vec<[u8; 32]> {
+    store.tool_registry_state.history.clone()
+}
+
+/// Correlate tool registry digests to the ruleset digest they produced.
+pub fn correlate_registry_to_ruleset(store: &PvgsStore) -> Vec<([u8; 32], [u8; 32])> {
+    let mut pairs: Vec<_> = store
+        .registry_ruleset_correlation
+        .iter()
+        .map(|(registry, ruleset)| (*registry, *ruleset))
+        .collect();
+
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    pairs
 }
 
 /// List proposed macro milestones in deterministic order.
@@ -1010,6 +1115,20 @@ fn digest_from_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
     Some(digest)
 }
 
+fn is_newer_tool_event(
+    current: &ToolOnboardingEvent,
+    current_idx: usize,
+    prev: &ToolOnboardingEvent,
+    prev_idx: usize,
+) -> bool {
+    match (current.created_at_ms, prev.created_at_ms) {
+        (Some(a), Some(b)) => a > b || (a == b && current_idx > prev_idx),
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => current_idx > prev_idx,
+    }
+}
+
 fn record_timestamp_ms(record: &ExperienceRecord) -> Option<u64> {
     record
         .finalization_header
@@ -1343,10 +1462,13 @@ mod tests {
         )
         .unwrap();
 
-        let all_changes = list_ruleset_changes(&log, None);
+        let mut store = minimal_store();
+        store.sep_log = log.clone();
+
+        let all_changes = list_ruleset_changes(&store, None);
         assert_eq!(all_changes, vec![digest_one, digest_two]);
 
-        let filtered = list_ruleset_changes(&log, Some("session-b"));
+        let filtered = list_ruleset_changes(&store, Some("session-b"));
         assert_eq!(filtered, vec![digest_two]);
     }
 
@@ -2196,6 +2318,113 @@ mod tests {
             suspended,
             vec![("tool-q".to_string(), "action-q".to_string())]
         );
+    }
+
+    #[test]
+    fn explain_suspension_returns_correlation_and_reasons() {
+        let mut store = minimal_store();
+        store.ruleset_state.ruleset_digest = [9u8; 32];
+        store.ruleset_state.tool_registry_digest = Some([7u8; 32]);
+
+        let mut event = ToolOnboardingEvent {
+            event_id: "evt-1".to_string(),
+            stage: ToolOnboardingStage::To6Suspended as i32,
+            tool_id: "tool-1".to_string(),
+            action_id: "action-1".to_string(),
+            reason_codes: vec!["b".to_string(), "a".to_string()],
+            signatures: Vec::new(),
+            event_digest: None,
+            created_at_ms: Some(2),
+        };
+
+        let digest = store
+            .tool_event_store
+            .insert(event.clone())
+            .expect("event inserted");
+        store
+            .suspended_tools
+            .insert((event.tool_id.clone(), event.action_id.clone()));
+        store.correlate_tool_event(digest);
+
+        event.reason_codes.sort();
+        let explanation = explain_tool_suspension(&store, "tool-1", "action-1");
+
+        assert!(explanation.suspended);
+        assert_eq!(explanation.latest_event_digest, Some(digest));
+        assert_eq!(explanation.event_ruleset_digest, Some([9u8; 32]));
+        assert_eq!(explanation.event_tool_registry_digest, Some([7u8; 32]));
+        assert_eq!(explanation.latest_reason_codes, event.reason_codes);
+        assert_eq!(explanation.event_timestamp_ms, event.created_at_ms);
+    }
+
+    #[test]
+    fn list_suspended_tools_is_deterministic() {
+        let mut store = minimal_store();
+        store.ruleset_state.ruleset_digest = [3u8; 32];
+
+        let first = ToolOnboardingEvent {
+            event_id: "evt-1".to_string(),
+            stage: ToolOnboardingStage::To6Suspended as i32,
+            tool_id: "tool-a".to_string(),
+            action_id: "action-b".to_string(),
+            reason_codes: vec!["r1".to_string()],
+            signatures: Vec::new(),
+            event_digest: None,
+            created_at_ms: None,
+        };
+
+        let mut second = first.clone();
+        second.tool_id = "tool-a".to_string();
+        second.action_id = "action-a".to_string();
+        second.reason_codes = vec!["r2".to_string(), "r0".to_string()];
+        second.created_at_ms = Some(5);
+
+        let first_digest = store.tool_event_store.insert(first).unwrap();
+        store.correlate_tool_event(first_digest);
+        let second_digest = store.tool_event_store.insert(second.clone()).unwrap();
+        store.ruleset_state.ruleset_digest = [4u8; 32];
+        store.correlate_tool_event(second_digest);
+
+        store
+            .suspended_tools
+            .insert(("tool-a".to_string(), "action-a".to_string()));
+        store
+            .suspended_tools
+            .insert(("tool-a".to_string(), "action-b".to_string()));
+
+        let explanations = list_suspended_tools_with_reasons(&store);
+        assert_eq!(explanations.len(), 2);
+        assert_eq!(explanations[0].action_id, "action-a");
+        assert_eq!(explanations[0].latest_event_digest, Some(second_digest));
+        assert_eq!(explanations[1].action_id, "action-b");
+        assert!(explanations[1].latest_event_digest.is_some());
+    }
+
+    #[test]
+    fn registry_ruleset_correlation_tracks_history() {
+        let mut store = minimal_store();
+        let registry_one = [1u8; 32];
+        let registry_two = [2u8; 32];
+
+        store.tool_registry_state.set_current(registry_one).unwrap();
+        store.ruleset_state.ruleset_digest = [5u8; 32];
+        store.ruleset_state.tool_registry_digest = Some(registry_one);
+        store.correlate_registry_ruleset(registry_one);
+
+        store.tool_registry_state.set_current(registry_two).unwrap();
+        store.ruleset_state.ruleset_digest = [6u8; 32];
+        store.ruleset_state.tool_registry_digest = Some(registry_two);
+        store.correlate_registry_ruleset(registry_two);
+
+        assert_eq!(
+            list_tool_registry_history(&store),
+            vec![registry_one, registry_two]
+        );
+
+        let correlations = correlate_registry_to_ruleset(&store);
+        assert_eq!(correlations.len(), 2);
+        assert!(correlations.contains(&(registry_one, [5u8; 32])));
+        assert!(correlations.contains(&(registry_two, [6u8; 32])));
     }
 
     #[test]
