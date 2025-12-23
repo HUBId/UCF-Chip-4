@@ -29,6 +29,12 @@ pub struct StoreLimits {
     pub max_experience_records: usize,
     /// Maximum number of SEP events retained in memory.
     pub max_sep_events: usize,
+    /// Maximum number of tool onboarding events retained per tool/action index entry.
+    pub max_tool_events_per_action: usize,
+    /// Maximum reason codes retained on a tool onboarding event.
+    pub max_tool_event_reason_codes: usize,
+    /// Maximum signatures retained on a tool onboarding event.
+    pub max_tool_event_signatures: usize,
 }
 
 /// Default limits used throughout the PVGS components.
@@ -44,6 +50,9 @@ pub const DEFAULT_LIMITS: StoreLimits = StoreLimits {
     max_pending_replay_plans: 128,
     max_experience_records: 4096,
     max_sep_events: 4096,
+    max_tool_events_per_action: 256,
+    max_tool_event_reason_codes: 64,
+    max_tool_event_signatures: 16,
 };
 
 impl Default for StoreLimits {

@@ -45,6 +45,7 @@ pub mod ucf {
             ConsistencyFeedbackAppend,
             CharterUpdate,
             ToolRegistryUpdate,
+            ToolOnboardingEventAppend,
             RecoveryCaseCreate,
             RecoveryCaseAdvance,
             RecoveryApproval,
@@ -410,6 +411,9 @@ pub mod ucf {
             pub const GV_REPLAY_SPOTCHECK: &'static str = "RC.GV.REPLAY.SPOTCHECK";
             pub const GV_PEV_UPDATED: &'static str = "RC.GV.PEV.UPDATED";
             pub const GV_TOOL_REGISTRY_UPDATED: &'static str = "RC.GV.TOOL_REGISTRY.UPDATED";
+            pub const GV_TOOL_ONBOARDING_EVENT_APPENDED: &'static str =
+                "RC.GV.TOOL.ONBOARDING_EVENT_APPENDED";
+            pub const GV_TOOL_SUSPENDED: &'static str = "RC.GV.TOOL.SUSPENDED";
             pub const GV_RULESET_CHANGED: &'static str = "RC.GV.RULESET.CHANGED";
             pub const GV_GRAPH_TRIMMED: &'static str = "RC.GV.GRAPH.TRIMMED";
             pub const GV_RECOVERY_CREATED: &'static str = "RC.GV.RECOVERY.CREATED";
@@ -624,6 +628,40 @@ pub mod ucf {
             pub dlp_refs: Vec<Ref>,
             #[prost(message, optional, tag = "9")]
             pub finalization_header: Option<FinalizationHeader>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum ToolOnboardingStage {
+            To0Registered = 0,
+            To1Validated = 1,
+            To2Enabled = 2,
+            To3Assessed = 3,
+            To4Approved = 4,
+            To5ProductionReady = 5,
+            To6Suspended = 6,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct ToolOnboardingEvent {
+            #[prost(string, tag = "1")]
+            pub event_id: String,
+            #[prost(enumeration = "ToolOnboardingStage", tag = "2")]
+            pub stage: i32,
+            #[prost(string, tag = "3")]
+            pub tool_id: String,
+            #[prost(string, tag = "4")]
+            pub action_id: String,
+            #[prost(string, repeated, tag = "5")]
+            pub reason_codes: Vec<String>,
+            #[prost(bytes = "vec", repeated, tag = "6")]
+            pub signatures: Vec<Vec<u8>>,
+            #[prost(bytes = "vec", optional, tag = "7")]
+            pub event_digest: Option<Vec<u8>>,
+            #[prost(uint64, optional, tag = "8")]
+            pub created_at_ms: Option<u64>,
         }
     }
 }

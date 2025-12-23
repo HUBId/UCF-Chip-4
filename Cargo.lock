@@ -588,6 +588,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "thiserror",
+ "tool_events",
  "tool_registry_state",
  "ucf-protocol",
  "vrf",
@@ -620,6 +621,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "thiserror",
+ "tool_events",
  "ucf-protocol",
  "vrf",
  "wire",
@@ -879,6 +881,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tool_events"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "limits",
+ "prost",
+ "thiserror",
+ "ucf-protocol",
 ]
 
 [[package]]

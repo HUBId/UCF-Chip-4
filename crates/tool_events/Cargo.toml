@@ -1,0 +1,11 @@
+[package]
+name = "tool_events"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ucf-protocol = { path = "../../ucf-protocol" }
+limits = { path = "../limits" }
+blake3 = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
