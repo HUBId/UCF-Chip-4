@@ -274,9 +274,10 @@ mod tests {
 
     #[test]
     fn index_is_bounded() {
-        let mut limits = StoreLimits::default();
-        limits.max_tool_events_per_action = 1;
-        let mut store = ToolEventStore::with_limits(limits);
+        let mut store = ToolEventStore::with_limits(StoreLimits {
+            max_tool_events_per_action: 1,
+            ..Default::default()
+        });
 
         store
             .insert(sample_event(ToolOnboardingStage::To1Validated))
