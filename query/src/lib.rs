@@ -19,6 +19,7 @@ use ucf_protocol::ucf::v1::{
     ConsistencyFeedback, DlpDecisionForm, ExperienceRecord, PVGSKeyEpoch, PVGSReceipt,
     ProofReceipt, ReasonCodes, RecoveryCase as ProtoRecoveryCase,
     RecoveryCheck as ProtoRecoveryCheck, RecoveryState as ProtoRecoveryState, ReplayPlan,
+    ToolOnboardingEvent, ToolOnboardingStage,
 };
 use wire::{AuthContext, Envelope};
 
@@ -187,6 +188,29 @@ pub fn get_unlock_permit_digest(store: &PvgsStore, session_id: &str) -> Option<[
         .unlock_permits
         .get(session_id)
         .map(|permit| permit.permit_digest)
+}
+
+pub fn list_tool_events(
+    store: &PvgsStore,
+    tool_id: &str,
+    action_id: &str,
+) -> Vec<ToolOnboardingEvent> {
+    store.tool_event_store.list_for(tool_id, action_id)
+}
+
+pub fn is_tool_suspended(store: &PvgsStore, tool_id: &str, action_id: &str) -> bool {
+    let Some((event, _)) = store.tool_event_store.latest_for(tool_id, action_id) else {
+        return false;
+    };
+
+    matches!(
+        ToolOnboardingStage::try_from(event.stage).ok(),
+        Some(ToolOnboardingStage::To6Suspended)
+    )
+}
+
+pub fn list_suspended_tools(store: &PvgsStore) -> Vec<(String, String)> {
+    store.suspended_tools.iter().cloned().collect()
 }
 
 pub fn get_recovery_case_for_session(
@@ -1601,6 +1625,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -1714,6 +1739,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (receipt, _) = verify_and_commit(req, store, keystore, vrf_engine);
@@ -2119,6 +2145,56 @@ mod tests {
                 .map(|audit| audit.record_digest)
                 .collect::<Vec<_>>(),
             expected_records
+        );
+    }
+
+    #[test]
+    fn tool_event_queries_reflect_suspension() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+
+        let first = ToolOnboardingEvent {
+            event_id: "evt-b".to_string(),
+            stage: ToolOnboardingStage::To1Validated as i32,
+            tool_id: "tool-q".to_string(),
+            action_id: "action-q".to_string(),
+            reason_codes: vec!["z".to_string()],
+            signatures: Vec::new(),
+            event_digest: None,
+            created_at_ms: Some(5),
+        };
+
+        let mut second = first.clone();
+        second.event_id = "evt-a".to_string();
+        second.stage = ToolOnboardingStage::To6Suspended as i32;
+        second.created_at_ms = Some(6);
+
+        store.tool_event_store.insert(first).unwrap();
+        store.tool_event_store.insert(second.clone()).unwrap();
+        store
+            .suspended_tools
+            .insert((second.tool_id.clone(), second.action_id.clone()));
+
+        let events = list_tool_events(&store, "tool-q", "action-q");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_id, "evt-a".to_string());
+        assert!(is_tool_suspended(&store, "tool-q", "action-q"));
+
+        let suspended = list_suspended_tools(&store);
+        assert_eq!(
+            suspended,
+            vec![("tool-q".to_string(), "action-q".to_string())]
         );
     }
 

@@ -26,16 +26,20 @@ use sep::{
     CausalGraph, EdgeType, FrameEventKind, NodeKey, SepError, SepEventInternal, SepEventType,
     SepLog, SessionSeal,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tool_events::{
+    compute_event_digest as compute_tool_event_digest, ToolEventError, ToolEventStore,
+};
 use tool_registry_state::{ToolRegistryError, ToolRegistryState};
 use ucf_protocol::ucf::v1::{
     self as protocol, CharacterBaselineVector, ConsistencyFeedback, Digest32, DlpDecision,
     DlpDecisionForm, ExperienceRecord, FinalizationHeader, MacroMilestone, MacroMilestoneState,
     PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes, ReceiptStatus, RecordType, Ref,
-    ReplayFidelity, ReplayPlan, ReplayTargetKind, ToolRegistryContainer,
+    ReplayFidelity, ReplayPlan, ReplayTargetKind, ToolOnboardingEvent, ToolOnboardingStage,
+    ToolRegistryContainer,
 };
 use vrf::VrfEngine;
 
@@ -59,6 +63,7 @@ pub enum CommitType {
     ConsistencyFeedbackAppend,
     CharterUpdate,
     ToolRegistryUpdate,
+    ToolOnboardingEventAppend,
     RecoveryCaseCreate,
     RecoveryCaseAdvance,
     RecoveryApproval,
@@ -305,6 +310,7 @@ pub struct PvgsCommitRequest {
     pub macro_consistency_digest: Option<[u8; 32]>,
     pub recovery_case: Option<RecoveryCase>,
     pub unlock_permit: Option<UnlockPermit>,
+    pub tool_onboarding_event: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,6 +544,7 @@ pub struct PvgsStore {
     pub cbv_store: CbvStore,
     pub pev_store: PevStore,
     pub dlp_store: DlpDecisionStore,
+    pub tool_event_store: ToolEventStore,
     pub consistency_store: ConsistencyStore,
     pub consistency_history: ConsistencyHistory,
     pub tool_registry_state: ToolRegistryState,
@@ -555,6 +562,7 @@ pub struct PvgsStore {
     pub receipt_gate_enabled: bool,
     pub forensic_mode: bool,
     pub ruleset_state: RulesetState,
+    pub suspended_tools: BTreeSet<(String, String)>,
 }
 
 /// Helper for planned commits that require mutable access to the PVGS store and cryptographic
@@ -655,6 +663,7 @@ impl<'a> PvgsPlanner<'a> {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (receipt, _) = verify_and_commit(req, self.store, self.keystore, self.vrf_engine);
@@ -747,6 +756,7 @@ impl PvgsStore {
             cbv_store: CbvStore::with_limits(limits),
             pev_store: PevStore::with_limits(limits),
             dlp_store: DlpDecisionStore::default(),
+            tool_event_store: ToolEventStore::with_limits(limits),
             consistency_store: ConsistencyStore::with_limits(limits),
             consistency_history: ConsistencyHistory::default(),
             tool_registry_state: ToolRegistryState::default(),
@@ -764,6 +774,7 @@ impl PvgsStore {
             receipt_gate_enabled: false,
             forensic_mode: false,
             ruleset_state: RulesetState::new(charter_version_digest, policy_version_digest),
+            suspended_tools: BTreeSet::new(),
         }
     }
 
@@ -1476,6 +1487,7 @@ impl PvgsStore {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (receipt, _proof) = verify_meso_milestone_append(req, self, keystore, vrf_engine);
@@ -1533,6 +1545,7 @@ impl PvgsStore {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (proposal_receipt, _) =
@@ -1607,6 +1620,7 @@ impl PvgsStore {
             macro_consistency_digest: Some(consistency_digest),
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (receipt, _) =
@@ -2071,6 +2085,7 @@ fn event_type_for_commit(
         CommitType::KeyEpochUpdate => SepEventType::EvKeyEpoch,
         CommitType::PevUpdate => SepEventType::EvPevUpdate,
         CommitType::ToolRegistryUpdate => SepEventType::EvToolOnboarding,
+        CommitType::ToolOnboardingEventAppend => SepEventType::EvToolOnboarding,
         CommitType::ExperienceRecordAppend => SepEventType::EvIntent,
         CommitType::DlpDecisionAppend => SepEventType::EvDlpDecision,
         CommitType::ReplayPlanAppend => SepEventType::EvReplay,
@@ -2287,6 +2302,10 @@ pub fn verify_and_commit(
 
     if req.commit_type == CommitType::ToolRegistryUpdate {
         return verify_tool_registry_update(req, store, keystore, vrf_engine);
+    }
+
+    if req.commit_type == CommitType::ToolOnboardingEventAppend {
+        return verify_tool_event_append(req, store, keystore);
     }
 
     if req.commit_type == CommitType::ExperienceRecordAppend {
@@ -4136,6 +4155,166 @@ fn verify_dlp_decision_append(
     })
 }
 
+fn verify_tool_event_append(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let payload = match req.tool_onboarding_event.take() {
+        Some(payload) => payload,
+        None => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let payload_digest = *blake3::hash(&payload).as_bytes();
+    if req.payload_digests.is_empty() {
+        req.payload_digests = vec![payload_digest];
+    }
+
+    let receipt_input = to_receipt_input(&req);
+    let mut reject_reason_codes = Vec::new();
+
+    if req.payload_digests.len() != 1 || req.payload_digests[0] != payload_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if req.epoch_id != keystore.current_epoch() {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+    }
+
+    if req.bindings.prev_record_digest != store.current_head_record_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+    }
+
+    let event = match ToolOnboardingEvent::decode(payload.as_slice()) {
+        Ok(event) => event,
+        Err(_) => {
+            reject_reason_codes
+                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes,
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: Some(payload_digest),
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let event_digest = compute_tool_event_digest(&event).ok();
+
+    if store.committed_payload_digests.contains(&payload_digest) {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_REPLAY_MISMATCH.to_string());
+    }
+
+    let mut stored_digest = None;
+    if reject_reason_codes.is_empty() {
+        match store.tool_event_store.insert(event.clone()) {
+            Ok(digest) => stored_digest = Some(digest),
+            Err(err) => reject_reason_codes.push(reason_code_for_tool_event_error(err)),
+        }
+    }
+
+    if !reject_reason_codes.is_empty() {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: stored_digest.or(event_digest).or(Some(payload_digest)),
+            event_reason_codes: None,
+        });
+    }
+
+    let digest = stored_digest.unwrap_or_else(|| event_digest.unwrap_or([0u8; 32]));
+    store.committed_payload_digests.insert(payload_digest);
+    update_suspended_tools(store, &event);
+
+    let mut event_reason_codes =
+        vec![protocol::ReasonCodes::GV_TOOL_ONBOARDING_EVENT_APPENDED.to_string()];
+    if matches!(
+        ToolOnboardingStage::try_from(event.stage).ok(),
+        Some(ToolOnboardingStage::To6Suspended)
+    ) {
+        event_reason_codes.push(protocol::ReasonCodes::GV_TOOL_SUSPENDED.to_string());
+    }
+
+    let receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        reject_reason_codes,
+        keystore,
+    );
+    store.add_receipt_edges(&receipt);
+
+    let event_type = event_type_for_commit(req.commit_type, None);
+    let _ = store.record_sep_event(
+        &req.commit_id,
+        event_type,
+        digest,
+        event_reason_codes.clone(),
+    );
+
+    let verified_fields_digest =
+        compute_verified_fields_digest(&req.bindings, req.required_receipt_kind);
+    let mut proof_receipt = issue_proof_receipt(
+        store.ruleset_state.ruleset_digest,
+        verified_fields_digest,
+        [0u8; 32],
+        keystore,
+    );
+    proof_receipt.receipt_digest = receipt.receipt_digest.clone();
+
+    (receipt, Some(proof_receipt))
+}
+
+fn reason_code_for_tool_event_error(err: ToolEventError) -> String {
+    match err {
+        ToolEventError::MissingEventId
+        | ToolEventError::MissingToolId
+        | ToolEventError::InvalidStage
+        | ToolEventError::TooManyReasonCodes
+        | ToolEventError::TooManySignatures
+        | ToolEventError::InvalidDigestLength
+        | ToolEventError::DigestMismatch => {
+            protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+        }
+    }
+}
+
+fn update_suspended_tools(store: &mut PvgsStore, event: &ToolOnboardingEvent) {
+    let key = (event.tool_id.clone(), event.action_id.clone());
+    if matches!(
+        ToolOnboardingStage::try_from(event.stage).ok(),
+        Some(ToolOnboardingStage::To6Suspended)
+    ) {
+        store.suspended_tools.insert(key);
+    } else {
+        store.suspended_tools.remove(&key);
+    }
+}
+
 fn build_finalization_header(
     req: &PvgsCommitRequest,
     record_digest: [u8; 32],
@@ -5020,6 +5199,9 @@ impl From<CommitType> for protocol::CommitType {
             }
             CommitType::CharterUpdate => protocol::CommitType::CharterUpdate,
             CommitType::ToolRegistryUpdate => protocol::CommitType::ToolRegistryUpdate,
+            CommitType::ToolOnboardingEventAppend => {
+                protocol::CommitType::ToolOnboardingEventAppend
+            }
             CommitType::RecoveryCaseCreate => protocol::CommitType::RecoveryCaseCreate,
             CommitType::RecoveryCaseAdvance => protocol::CommitType::RecoveryCaseAdvance,
             CommitType::RecoveryApproval => protocol::CommitType::RecoveryApproval,
@@ -5076,7 +5258,8 @@ mod tests {
     use ucf_protocol::ucf::v1::{
         ConsistencyFeedback, CoreFrame, GovernanceFrame, MacroMilestone, MacroMilestoneState,
         MagnitudeClass, MetabolicFrame, PolicyEcologyDimension, PolicyEcologyVector, RecordType,
-        Ref, ReplayTargetKind, TraitDirection, TraitUpdate,
+        Ref, ReplayTargetKind, ToolOnboardingEvent, ToolOnboardingStage, TraitDirection,
+        TraitUpdate,
     };
     use vrf::VrfEngine;
 
@@ -5128,6 +5311,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         }
     }
 
@@ -5182,6 +5366,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case,
             unlock_permit: None,
+            tool_onboarding_event: None,
         }
     }
 
@@ -5230,6 +5415,7 @@ mod tests {
                 macro_consistency_digest: None,
                 recovery_case: None,
                 unlock_permit: None,
+                tool_onboarding_event: None,
             },
             epoch,
         )
@@ -5387,6 +5573,7 @@ mod tests {
             macro_consistency_digest: consistency_digest,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         }
     }
 
@@ -5670,6 +5857,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -5735,6 +5923,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -5988,6 +6177,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         }
     }
 
@@ -6770,6 +6960,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (receipt, proof) = verify_and_commit(backward_req, &mut store, &keystore, &vrf_engine);
@@ -6838,6 +7029,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (receipt, proof) = verify_and_commit(dup_req, &mut store, &keystore, &vrf_engine);
@@ -6882,6 +7074,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let keystore = KeyStore::new_dev_keystore(1);
@@ -6942,6 +7135,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -7002,6 +7196,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -7087,6 +7282,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (_, pev_proof) = verify_and_commit(pev_req, &mut store, &keystore, &vrf_engine);
@@ -7166,6 +7362,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -7195,6 +7392,75 @@ mod tests {
             store.ruleset_state.prev_ruleset_digest,
             Some(initial_ruleset)
         );
+    }
+
+    #[test]
+    fn tool_onboarding_suspension_is_tracked_and_logged() {
+        let prev = [4u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let event = ToolOnboardingEvent {
+            event_id: "to-event-1".to_string(),
+            stage: ToolOnboardingStage::To6Suspended as i32,
+            tool_id: "tool-9".to_string(),
+            action_id: "action-9".to_string(),
+            reason_codes: vec!["b".to_string(), "a".to_string()],
+            signatures: Vec::new(),
+            event_digest: None,
+            created_at_ms: Some(10),
+        };
+
+        let req = PvgsCommitRequest {
+            commit_id: "tool-event".to_string(),
+            commit_type: CommitType::ToolOnboardingEventAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: prev,
+                profile_digest: Some([9u8; 32]),
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: Some(event.encode_to_vec()),
+        };
+
+        let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        let proof = proof.expect("missing proof receipt");
+
+        let digest = compute_tool_event_digest(&event).expect("event digest");
+        assert!(store.tool_event_store.get(digest).is_some());
+        assert_eq!(proof.ruleset_digest.0, store.ruleset_state.ruleset_digest);
+
+        let sep_event = store.sep_log.events.last().expect("sep event");
+        assert_eq!(sep_event.event_type, SepEventType::EvToolOnboarding);
+        assert_eq!(sep_event.object_digest, digest);
+        assert!(sep_event
+            .reason_codes
+            .contains(&ReasonCodes::GV_TOOL_SUSPENDED.to_string()));
+        assert!(store
+            .suspended_tools
+            .contains(&("tool-9".to_string(), "action-9".to_string())));
     }
 
     #[test]

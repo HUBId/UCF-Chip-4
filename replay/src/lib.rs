@@ -599,6 +599,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         }
     }
 
@@ -672,6 +673,7 @@ mod tests {
             macro_consistency_digest: None,
             recovery_case: None,
             unlock_permit: None,
+            tool_onboarding_event: None,
         }
     }
 

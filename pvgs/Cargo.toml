@@ -20,6 +20,7 @@ cbv = { path = "../cbv" }
 thiserror.workspace = true
 ed25519-dalek.workspace = true
 tool_registry_state = { path = "../tool_registry_state" }
+tool_events = { path = "../crates/tool_events" }
 hex = "0.4"
 milestones = { path = "../milestones" }
 consistency = { path = "../crates/consistency" }

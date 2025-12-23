@@ -257,6 +257,7 @@ fn commit_type_label(commit_type: &protocol::CommitType) -> &'static str {
         protocol::CommitType::MacroMilestoneFinalize => "MacroMilestoneFinalize",
         protocol::CommitType::CharterUpdate => "CharterUpdate",
         protocol::CommitType::ToolRegistryUpdate => "ToolRegistryUpdate",
+        protocol::CommitType::ToolOnboardingEventAppend => "ToolOnboardingEventAppend",
         protocol::CommitType::RecoveryCaseCreate => "RecoveryCaseCreate",
         protocol::CommitType::RecoveryCaseAdvance => "RecoveryCaseAdvance",
         protocol::CommitType::RecoveryApproval => "RecoveryApproval",
