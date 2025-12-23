@@ -23,3 +23,6 @@ hex = "0.4"
 prost = { workspace = true }
 recovery = { path = "../crates/recovery" }
 tool_events = { path = "../crates/tool_events" }
+
+[dev-dependencies]
+micro_evidence = { path = "../crates/micro_evidence" }

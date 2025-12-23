@@ -479,6 +479,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "micro_evidence"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+]
+
+[[package]]
 name = "milestones"
 version = "0.1.0"
 dependencies = [
@@ -586,6 +594,7 @@ dependencies = [
  "hex",
  "keys",
  "limits",
+ "micro_evidence",
  "milestones",
  "pev",
  "prost",
@@ -618,6 +627,7 @@ dependencies = [
  "dlp_store",
  "hex",
  "keys",
+ "micro_evidence",
  "milestones",
  "pev",
  "prost",

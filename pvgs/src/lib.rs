@@ -10,6 +10,7 @@ use dlp_store::DlpDecisionStore;
 use ed25519_dalek::Signer;
 use keys::{verify_key_epoch_signature, KeyEpochHistory, KeyStore};
 use limits::{StoreLimits, DEFAULT_LIMITS};
+use micro_evidence::{module_is_bounded, MicrocircuitConfigEvidence};
 use milestones::{
     compute_meso_digest, MacroDeriver, MesoDeriver, MesoMilestone, MesoMilestoneStore,
     MicroMilestoneStore,
@@ -74,6 +75,7 @@ pub enum CommitType {
     FrameEvidenceAppend,
     DlpDecisionAppend,
     ReplayPlanAppend,
+    MicrocircuitConfigAppend,
 }
 
 /// Required checks requested by the caller.
@@ -311,6 +313,7 @@ pub struct PvgsCommitRequest {
     pub recovery_case: Option<RecoveryCase>,
     pub unlock_permit: Option<UnlockPermit>,
     pub tool_onboarding_event: Option<Vec<u8>>,
+    pub microcircuit_config: Option<MicrocircuitConfigEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,6 +464,35 @@ impl MacroMilestoneStore {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MicroConfigStore {
+    entries: BTreeMap<String, Vec<MicrocircuitConfigEvidence>>,
+}
+
+impl MicroConfigStore {
+    pub fn append(&mut self, evidence: MicrocircuitConfigEvidence) {
+        self.entries
+            .entry(evidence.module.clone())
+            .or_default()
+            .push(evidence);
+    }
+
+    pub fn latest_for_module(&self, module: &str) -> Option<&MicrocircuitConfigEvidence> {
+        self.entries.get(module).and_then(|entries| entries.last())
+    }
+
+    pub fn list_latest(&self) -> Vec<(String, [u8; 32], u32)> {
+        self.entries
+            .iter()
+            .filter_map(|(module, entries)| {
+                entries
+                    .last()
+                    .map(|entry| (module.clone(), entry.config_digest, entry.config_version))
+            })
+            .collect()
+    }
+}
+
 fn validate_macro_proposal(macro_milestone: &MacroMilestone) -> Result<(), MacroValidationError> {
     if macro_milestone.macro_digest.len() != 32 {
         return Err(MacroValidationError::MissingDigest);
@@ -548,6 +580,7 @@ pub struct PvgsStore {
     pub consistency_store: ConsistencyStore,
     pub consistency_history: ConsistencyHistory,
     pub tool_registry_state: ToolRegistryState,
+    pub micro_config_store: MicroConfigStore,
     pub micro_milestones: MicroMilestoneStore,
     pub meso_milestones: MesoMilestoneStore,
     pub meso_deriver: MesoDeriver,
@@ -672,6 +705,7 @@ impl<'a> PvgsPlanner<'a> {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, _) = verify_and_commit(req, self.store, self.keystore, self.vrf_engine);
@@ -768,6 +802,7 @@ impl PvgsStore {
             consistency_store: ConsistencyStore::with_limits(limits),
             consistency_history: ConsistencyHistory::default(),
             tool_registry_state: ToolRegistryState::default(),
+            micro_config_store: MicroConfigStore::default(),
             micro_milestones: MicroMilestoneStore::default(),
             meso_milestones: MesoMilestoneStore::default(),
             meso_deriver: MesoDeriver::new_beta(),
@@ -1546,6 +1581,7 @@ impl PvgsStore {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, _proof) = verify_meso_milestone_append(req, self, keystore, vrf_engine);
@@ -1604,6 +1640,7 @@ impl PvgsStore {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (proposal_receipt, _) =
@@ -1679,6 +1716,7 @@ impl PvgsStore {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, _) =
@@ -2153,6 +2191,7 @@ fn event_type_for_commit(
         CommitType::ConsistencyFeedbackAppend => SepEventType::EvRecoveryGov,
         CommitType::MacroMilestonePropose => SepEventType::EvRecoveryGov,
         CommitType::MacroMilestoneFinalize => SepEventType::EvRecoveryGov,
+        CommitType::MicrocircuitConfigAppend => SepEventType::EvRecoveryGov,
         CommitType::FrameEvidenceAppend => match frame_kind {
             Some(FrameEventKind::ControlFrame) => SepEventType::EvControlFrame,
             Some(FrameEventKind::SignalFrame) => SepEventType::EvSignalFrame,
@@ -2376,6 +2415,10 @@ pub fn verify_and_commit(
 
     if req.commit_type == CommitType::DlpDecisionAppend {
         return verify_dlp_decision_append(req, store, keystore);
+    }
+
+    if req.commit_type == CommitType::MicrocircuitConfigAppend {
+        return verify_microcircuit_config_append(req, store, keystore);
     }
 
     if req.commit_type == CommitType::RecoveryCaseCreate {
@@ -4216,6 +4259,125 @@ fn verify_dlp_decision_append(
     })
 }
 
+fn verify_microcircuit_config_append(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let evidence = match req.microcircuit_config.take() {
+        Some(evidence) => evidence,
+        None => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let payload_digest = evidence.config_digest;
+    if req.payload_digests.is_empty() {
+        req.payload_digests = vec![payload_digest];
+    }
+
+    let receipt_input = to_receipt_input(&req);
+    let mut reject_reason_codes = Vec::new();
+
+    if req.payload_digests.len() != 1 || req.payload_digests[0] != payload_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if evidence.config_version == 0 {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if !module_is_bounded(&evidence.module) || !matches!(evidence.module.as_str(), "LC" | "SN") {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if req.epoch_id != keystore.current_epoch() {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+    }
+
+    if req.bindings.prev_record_digest != store.current_head_record_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+    }
+
+    if !req
+        .required_checks
+        .iter()
+        .any(|check| matches!(check, RequiredCheck::SchemaOk))
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if !store
+        .known_charter_versions
+        .contains(&req.bindings.charter_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_CHARTER_SCOPE.to_string());
+    }
+
+    if !store
+        .known_policy_versions
+        .contains(&req.bindings.policy_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_INTEGRITY_REQUIRED.to_string());
+    }
+
+    if !reject_reason_codes.is_empty() {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(payload_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    let verified_fields_digest =
+        compute_verified_fields_digest(&req.bindings, req.required_receipt_kind);
+    let mut proof_receipt = issue_proof_receipt(
+        store.ruleset_state.ruleset_digest,
+        verified_fields_digest,
+        [0u8; 32],
+        keystore,
+    );
+    let receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        Vec::new(),
+        keystore,
+    );
+    proof_receipt.receipt_digest = receipt.receipt_digest.clone();
+
+    store.add_receipt_edges(&receipt);
+    store.micro_config_store.append(evidence);
+    store.committed_payload_digests.insert(payload_digest);
+
+    let _ = store.record_sep_event(
+        &req.commit_id,
+        SepEventType::EvRecoveryGov,
+        payload_digest,
+        vec![protocol::ReasonCodes::GV_MICROCIRCUIT_CONFIG_APPENDED.to_string()],
+    );
+
+    (receipt, Some(proof_receipt))
+}
+
 fn verify_tool_event_append(
     mut req: PvgsCommitRequest,
     store: &mut PvgsStore,
@@ -5284,6 +5446,7 @@ impl From<CommitType> for protocol::CommitType {
             CommitType::FrameEvidenceAppend => protocol::CommitType::FrameEvidenceAppend,
             CommitType::DlpDecisionAppend => protocol::CommitType::DlpDecisionAppend,
             CommitType::ReplayPlanAppend => protocol::CommitType::ReplayPlanAppend,
+            CommitType::MicrocircuitConfigAppend => protocol::CommitType::MicrocircuitConfigAppend,
         }
     }
 }
@@ -5319,6 +5482,7 @@ impl From<&CommitBindings> for protocol::CommitBindings {
 mod tests {
     use super::UnlockPermit;
     use super::*;
+    use micro_evidence::{compute_config_digest, MicrocircuitConfigEvidence};
     use milestones::{
         derive_micro_from_experience_window, ExperienceRange, MicroMilestone, MicroMilestoneState,
         PriorityClass,
@@ -5384,6 +5548,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         }
     }
 
@@ -5439,6 +5604,7 @@ mod tests {
             recovery_case,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         }
     }
 
@@ -5488,6 +5654,7 @@ mod tests {
                 recovery_case: None,
                 unlock_permit: None,
                 tool_onboarding_event: None,
+                microcircuit_config: None,
             },
             epoch,
         )
@@ -5646,7 +5813,113 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         }
+    }
+
+    fn micro_config_evidence(
+        module: &str,
+        version: u32,
+        canonical_config_bytes: &[u8],
+    ) -> MicrocircuitConfigEvidence {
+        MicrocircuitConfigEvidence {
+            module: module.to_string(),
+            config_version: version,
+            config_digest: compute_config_digest(module, version, canonical_config_bytes),
+            created_at_ms: 123,
+            attested_by_key_id: None,
+            signature: None,
+        }
+    }
+
+    fn micro_config_request(
+        store: &PvgsStore,
+        module: &str,
+        version: u32,
+        canonical_config_bytes: &[u8],
+    ) -> PvgsCommitRequest {
+        PvgsCommitRequest {
+            commit_id: "micro-config-commit".to_string(),
+            commit_type: CommitType::MicrocircuitConfigAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+            payload_digests: Vec::new(),
+            epoch_id: 1,
+            key_epoch: None,
+            experience_record_payload: None,
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: None,
+            microcircuit_config: Some(micro_config_evidence(
+                module,
+                version,
+                canonical_config_bytes,
+            )),
+        }
+    }
+
+    #[test]
+    fn microcircuit_config_append_accepts_and_logs() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let config_bytes = br#"{\"enabled\":true}"#;
+        let expected_digest = compute_config_digest("LC", 1, config_bytes);
+
+        let req = micro_config_request(&store, "LC", 1, config_bytes);
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof_receipt.is_some());
+
+        let stored = store
+            .micro_config_store
+            .latest_for_module("LC")
+            .expect("config stored");
+        assert_eq!(stored.config_digest, expected_digest);
+        assert_eq!(stored.config_version, 1);
+
+        let has_event = store.sep_log.events.iter().any(|event| {
+            event.event_type == SepEventType::EvRecoveryGov
+                && event.object_digest == expected_digest
+                && event
+                    .reason_codes
+                    .contains(&ReasonCodes::GV_MICROCIRCUIT_CONFIG_APPENDED.to_string())
+        });
+        assert!(has_event);
+    }
+
+    #[test]
+    fn microcircuit_config_rejects_unknown_module() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let config_bytes = br#"{\"enabled\":true}"#;
+
+        let req = micro_config_request(&store, "XYZ", 1, config_bytes);
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert!(proof_receipt.is_none());
+        assert!(store.micro_config_store.latest_for_module("XYZ").is_none());
     }
 
     #[test]
@@ -5930,6 +6203,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -5996,6 +6270,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -6250,6 +6525,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         }
     }
 
@@ -7033,6 +7309,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, proof) = verify_and_commit(backward_req, &mut store, &keystore, &vrf_engine);
@@ -7102,6 +7379,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, proof) = verify_and_commit(dup_req, &mut store, &keystore, &vrf_engine);
@@ -7147,6 +7425,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let keystore = KeyStore::new_dev_keystore(1);
@@ -7208,6 +7487,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -7269,6 +7549,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -7355,6 +7636,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (_, pev_proof) = verify_and_commit(pev_req, &mut store, &keystore, &vrf_engine);
@@ -7435,6 +7717,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
+            microcircuit_config: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -7514,6 +7797,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: Some(event.encode_to_vec()),
+            microcircuit_config: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);

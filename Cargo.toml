@@ -26,6 +26,7 @@ members = [
     "crates/retention",
     "crates/recovery",
     "crates/tool_events", "crates/common",
+    "crates/micro_evidence",
 ]
 resolver = "2"
 

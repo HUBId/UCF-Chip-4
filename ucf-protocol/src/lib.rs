@@ -56,6 +56,7 @@ pub mod ucf {
             FrameEvidenceAppend,
             DlpDecisionAppend,
             ReplayPlanAppend,
+            MicrocircuitConfigAppend,
         }
 
         /// Required receipt classes for PVGS commits.
@@ -416,6 +417,8 @@ pub mod ucf {
             pub const GV_TOOL_SUSPENDED: &'static str = "RC.GV.TOOL.SUSPENDED";
             pub const GV_RULESET_CHANGED: &'static str = "RC.GV.RULESET.CHANGED";
             pub const GV_GRAPH_TRIMMED: &'static str = "RC.GV.GRAPH.TRIMMED";
+            pub const GV_MICROCIRCUIT_CONFIG_APPENDED: &'static str =
+                "RC.GV.MICROCIRCUIT.CONFIG_APPENDED";
             pub const GV_RECOVERY_CREATED: &'static str = "RC.GV.RECOVERY.CREATED";
             pub const GV_RECOVERY_ADVANCED: &'static str = "RC.GV.RECOVERY.ADVANCED";
             pub const GV_RECOVERY_UNLOCK_GRANTED: &'static str = "RC.GV.RECOVERY.UNLOCK_GRANTED";
