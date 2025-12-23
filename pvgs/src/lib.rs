@@ -10,7 +10,6 @@ use dlp_store::DlpDecisionStore;
 use ed25519_dalek::Signer;
 use keys::{verify_key_epoch_signature, KeyEpochHistory, KeyStore};
 use limits::{StoreLimits, DEFAULT_LIMITS};
-use micro_evidence::{module_is_bounded, MicrocircuitConfigEvidence};
 use milestones::{
     compute_meso_digest, MacroDeriver, MesoDeriver, MesoMilestone, MesoMilestoneStore,
     MicroMilestoneStore,
@@ -38,9 +37,9 @@ use tool_registry_state::{ToolRegistryError, ToolRegistryState};
 use ucf_protocol::ucf::v1::{
     self as protocol, CharacterBaselineVector, ConsistencyFeedback, Digest32, DlpDecision,
     DlpDecisionForm, ExperienceRecord, FinalizationHeader, MacroMilestone, MacroMilestoneState,
-    PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes, ReceiptStatus, RecordType, Ref,
-    ReplayFidelity, ReplayPlan, ReplayTargetKind, ToolOnboardingEvent, ToolOnboardingStage,
-    ToolRegistryContainer,
+    MicroModule, MicrocircuitConfigEvidence, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes,
+    ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayPlan, ReplayTargetKind,
+    ToolOnboardingEvent, ToolOnboardingStage, ToolRegistryContainer,
 };
 use vrf::VrfEngine;
 
@@ -313,7 +312,7 @@ pub struct PvgsCommitRequest {
     pub recovery_case: Option<RecoveryCase>,
     pub unlock_permit: Option<UnlockPermit>,
     pub tool_onboarding_event: Option<Vec<u8>>,
-    pub microcircuit_config: Option<MicrocircuitConfigEvidence>,
+    pub microcircuit_config_payload: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,31 +465,61 @@ impl MacroMilestoneStore {
 
 #[derive(Debug, Clone, Default)]
 pub struct MicroConfigStore {
-    entries: BTreeMap<String, Vec<MicrocircuitConfigEvidence>>,
+    entries: BTreeMap<(MicroModule, [u8; 32]), MicrocircuitConfigEvidence>,
 }
 
 impl MicroConfigStore {
-    pub fn append(&mut self, evidence: MicrocircuitConfigEvidence) {
-        self.entries
-            .entry(evidence.module.clone())
-            .or_default()
-            .push(evidence);
+    pub fn insert(
+        &mut self,
+        evidence: MicrocircuitConfigEvidence,
+    ) -> Result<bool, MicroConfigStoreError> {
+        let module = MicroModule::try_from(evidence.module)
+            .map_err(|_| MicroConfigStoreError::InvalidModule)?;
+        if module == MicroModule::Unspecified {
+            return Err(MicroConfigStoreError::InvalidModule);
+        }
+        if evidence.config_version == 0 {
+            return Err(MicroConfigStoreError::InvalidVersion);
+        }
+        let digest = digest_from_bytes(&evidence.config_digest)
+            .ok_or(MicroConfigStoreError::InvalidDigest)?;
+        let key = (module, digest);
+        if self.entries.contains_key(&key) {
+            return Ok(false);
+        }
+        self.entries.insert(key, evidence);
+        Ok(true)
     }
 
-    pub fn latest_for_module(&self, module: &str) -> Option<&MicrocircuitConfigEvidence> {
-        self.entries.get(module).and_then(|entries| entries.last())
-    }
-
-    pub fn list_latest(&self) -> Vec<(String, [u8; 32], u32)> {
+    pub fn latest_for_module(&self, module: MicroModule) -> Option<&MicrocircuitConfigEvidence> {
         self.entries
             .iter()
-            .filter_map(|(module, entries)| {
-                entries
-                    .last()
-                    .map(|entry| (module.clone(), entry.config_digest, entry.config_version))
+            .filter_map(|((stored_module, _), entry)| (stored_module == &module).then_some(entry))
+            .max_by(|a, b| {
+                a.created_at_ms
+                    .cmp(&b.created_at_ms)
+                    .then_with(|| a.config_version.cmp(&b.config_version))
+                    .then_with(|| a.config_digest.cmp(&b.config_digest))
             })
-            .collect()
     }
+
+    pub fn list_all(&self) -> Vec<MicrocircuitConfigEvidence> {
+        let mut configs: Vec<MicrocircuitConfigEvidence> = self.entries.values().cloned().collect();
+        configs.sort_by(|a, b| {
+            a.module
+                .cmp(&b.module)
+                .then_with(|| a.config_version.cmp(&b.config_version))
+                .then_with(|| a.created_at_ms.cmp(&b.created_at_ms))
+        });
+        configs
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicroConfigStoreError {
+    InvalidModule,
+    InvalidVersion,
+    InvalidDigest,
 }
 
 fn validate_macro_proposal(macro_milestone: &MacroMilestone) -> Result<(), MacroValidationError> {
@@ -705,7 +734,7 @@ impl<'a> PvgsPlanner<'a> {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (receipt, _) = verify_and_commit(req, self.store, self.keystore, self.vrf_engine);
@@ -1581,7 +1610,7 @@ impl PvgsStore {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (receipt, _proof) = verify_meso_milestone_append(req, self, keystore, vrf_engine);
@@ -1640,7 +1669,7 @@ impl PvgsStore {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (proposal_receipt, _) =
@@ -1716,7 +1745,7 @@ impl PvgsStore {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (receipt, _) =
@@ -4264,8 +4293,8 @@ fn verify_microcircuit_config_append(
     store: &mut PvgsStore,
     keystore: &KeyStore,
 ) -> (PVGSReceipt, Option<ProofReceipt>) {
-    let evidence = match req.microcircuit_config.take() {
-        Some(evidence) => evidence,
+    let payload = match req.microcircuit_config_payload.take() {
+        Some(payload) => payload,
         None => {
             let receipt_input = to_receipt_input(&req);
             return finalize_receipt(FinalizeReceiptArgs {
@@ -4284,23 +4313,54 @@ fn verify_microcircuit_config_append(
         }
     };
 
-    let payload_digest = evidence.config_digest;
+    let evidence = match MicrocircuitConfigEvidence::decode(payload.as_slice()) {
+        Ok(evidence) => evidence,
+        Err(_) => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let payload_digest = digest_from_bytes(&evidence.config_digest);
     if req.payload_digests.is_empty() {
-        req.payload_digests = vec![payload_digest];
+        if let Some(digest) = payload_digest {
+            req.payload_digests = vec![digest];
+        }
     }
 
     let receipt_input = to_receipt_input(&req);
     let mut reject_reason_codes = Vec::new();
 
-    if req.payload_digests.len() != 1 || req.payload_digests[0] != payload_digest {
+    let module = MicroModule::try_from(evidence.module).unwrap_or(MicroModule::Unspecified);
+
+    if payload_digest.is_none() {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if let Some(digest) = payload_digest {
+        if req.payload_digests.len() != 1 || req.payload_digests[0] != digest {
+            reject_reason_codes
+                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+        }
     }
 
     if evidence.config_version == 0 {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
-    if !module_is_bounded(&evidence.module) || !matches!(evidence.module.as_str(), "LC" | "SN") {
+    if module == MicroModule::Unspecified || !matches!(module, MicroModule::Lc | MicroModule::Sn) {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
@@ -4343,7 +4403,7 @@ fn verify_microcircuit_config_append(
             store,
             keystore,
             frame_kind: None,
-            event_object_digest: Some(payload_digest),
+            event_object_digest: payload_digest,
             event_reason_codes: None,
         });
     }
@@ -4365,7 +4425,8 @@ fn verify_microcircuit_config_append(
     proof_receipt.receipt_digest = receipt.receipt_digest.clone();
 
     store.add_receipt_edges(&receipt);
-    store.micro_config_store.append(evidence);
+    let payload_digest = payload_digest.expect("validated payload digest");
+    let _ = store.micro_config_store.insert(evidence);
     store.committed_payload_digests.insert(payload_digest);
 
     let _ = store.record_sep_event(
@@ -5482,20 +5543,21 @@ impl From<&CommitBindings> for protocol::CommitBindings {
 mod tests {
     use super::UnlockPermit;
     use super::*;
-    use micro_evidence::{compute_config_digest, MicrocircuitConfigEvidence};
+    use micro_evidence::compute_config_digest;
     use milestones::{
         derive_micro_from_experience_window, ExperienceRange, MicroMilestone, MicroMilestoneState,
         PriorityClass,
     };
+    use prost::Message;
     use protocol::ReasonCodes;
     use receipts::verify_pvgs_receipt_attestation;
     use recovery::{RecoveryCase, RecoveryCheck, RecoveryState};
     use sep::{EdgeType, SepEventType};
     use ucf_protocol::ucf::v1::{
         ConsistencyFeedback, CoreFrame, GovernanceFrame, MacroMilestone, MacroMilestoneState,
-        MagnitudeClass, MetabolicFrame, PolicyEcologyDimension, PolicyEcologyVector, RecordType,
-        Ref, ReplayTargetKind, ToolOnboardingEvent, ToolOnboardingStage, TraitDirection,
-        TraitUpdate,
+        MagnitudeClass, MetabolicFrame, MicroModule, MicrocircuitConfigEvidence,
+        PolicyEcologyDimension, PolicyEcologyVector, RecordType, Ref, ReplayTargetKind,
+        ToolOnboardingEvent, ToolOnboardingStage, TraitDirection, TraitUpdate,
     };
     use vrf::VrfEngine;
 
@@ -5548,7 +5610,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         }
     }
 
@@ -5604,7 +5666,7 @@ mod tests {
             recovery_case,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         }
     }
 
@@ -5654,7 +5716,7 @@ mod tests {
                 recovery_case: None,
                 unlock_permit: None,
                 tool_onboarding_event: None,
-                microcircuit_config: None,
+                microcircuit_config_payload: None,
             },
             epoch,
         )
@@ -5813,19 +5875,32 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
+        }
+    }
+
+    fn module_label(module: MicroModule) -> &'static str {
+        match module {
+            MicroModule::Lc => "LC",
+            MicroModule::Sn => "SN",
+            MicroModule::Unspecified => "UNSPECIFIED",
         }
     }
 
     fn micro_config_evidence(
-        module: &str,
+        module: MicroModule,
         version: u32,
         canonical_config_bytes: &[u8],
     ) -> MicrocircuitConfigEvidence {
         MicrocircuitConfigEvidence {
-            module: module.to_string(),
+            module: module as i32,
             config_version: version,
-            config_digest: compute_config_digest(module, version, canonical_config_bytes),
+            config_digest: compute_config_digest(
+                module_label(module),
+                version,
+                canonical_config_bytes,
+            )
+            .to_vec(),
             created_at_ms: 123,
             attested_by_key_id: None,
             signature: None,
@@ -5834,10 +5909,12 @@ mod tests {
 
     fn micro_config_request(
         store: &PvgsStore,
-        module: &str,
+        module: MicroModule,
         version: u32,
         canonical_config_bytes: &[u8],
     ) -> PvgsCommitRequest {
+        let evidence = micro_config_evidence(module, version, canonical_config_bytes);
+        let payload = evidence.encode_to_vec();
         PvgsCommitRequest {
             commit_id: "micro-config-commit".to_string(),
             commit_type: CommitType::MicrocircuitConfigAppend,
@@ -5868,11 +5945,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: Some(micro_config_evidence(
-                module,
-                version,
-                canonical_config_bytes,
-            )),
+            microcircuit_config_payload: Some(payload),
         }
     }
 
@@ -5884,7 +5957,7 @@ mod tests {
         let config_bytes = br#"{\"enabled\":true}"#;
         let expected_digest = compute_config_digest("LC", 1, config_bytes);
 
-        let req = micro_config_request(&store, "LC", 1, config_bytes);
+        let req = micro_config_request(&store, MicroModule::Lc, 1, config_bytes);
         let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
 
         assert_eq!(receipt.status, ReceiptStatus::Accepted);
@@ -5892,9 +5965,9 @@ mod tests {
 
         let stored = store
             .micro_config_store
-            .latest_for_module("LC")
+            .latest_for_module(MicroModule::Lc)
             .expect("config stored");
-        assert_eq!(stored.config_digest, expected_digest);
+        assert_eq!(stored.config_digest, expected_digest.to_vec());
         assert_eq!(stored.config_version, 1);
 
         let has_event = store.sep_log.events.iter().any(|event| {
@@ -5908,18 +5981,50 @@ mod tests {
     }
 
     #[test]
-    fn microcircuit_config_rejects_unknown_module() {
+    fn microcircuit_config_rejects_unspecified_module() {
         let mut store = base_store([7u8; 32]);
         let keystore = KeyStore::new_dev_keystore(1);
         let vrf_engine = VrfEngine::new_dev(1);
         let config_bytes = br#"{\"enabled\":true}"#;
 
-        let req = micro_config_request(&store, "XYZ", 1, config_bytes);
+        let req = micro_config_request(&store, MicroModule::Unspecified, 1, config_bytes);
         let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
 
         assert_eq!(receipt.status, ReceiptStatus::Rejected);
         assert!(proof_receipt.is_none());
-        assert!(store.micro_config_store.latest_for_module("XYZ").is_none());
+        assert!(store
+            .micro_config_store
+            .latest_for_module(MicroModule::Unspecified)
+            .is_none());
+    }
+
+    #[test]
+    fn microcircuit_config_append_is_idempotent() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let config_bytes = br#"{\"enabled\":true}"#;
+        let expected_digest = compute_config_digest("LC", 1, config_bytes);
+
+        let first_req = micro_config_request(&store, MicroModule::Lc, 1, config_bytes);
+        let second_req = micro_config_request(&store, MicroModule::Lc, 1, config_bytes);
+
+        let (first_receipt, first_proof) =
+            verify_and_commit(first_req, &mut store, &keystore, &vrf_engine);
+        let (second_receipt, second_proof) =
+            verify_and_commit(second_req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(first_receipt.status, ReceiptStatus::Accepted);
+        assert!(first_proof.is_some());
+        assert_eq!(second_receipt.status, ReceiptStatus::Accepted);
+        assert!(second_proof.is_some());
+
+        let stored = store
+            .micro_config_store
+            .latest_for_module(MicroModule::Lc)
+            .expect("config stored");
+        assert_eq!(stored.config_digest, expected_digest.to_vec());
+        assert_eq!(store.micro_config_store.list_all().len(), 1);
     }
 
     #[test]
@@ -6203,7 +6308,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -6270,7 +6375,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -6525,7 +6630,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         }
     }
 
@@ -7309,7 +7414,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(backward_req, &mut store, &keystore, &vrf_engine);
@@ -7379,7 +7484,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(dup_req, &mut store, &keystore, &vrf_engine);
@@ -7425,7 +7530,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let keystore = KeyStore::new_dev_keystore(1);
@@ -7487,7 +7592,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -7549,7 +7654,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -7636,7 +7741,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (_, pev_proof) = verify_and_commit(pev_req, &mut store, &keystore, &vrf_engine);
@@ -7717,7 +7822,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -7797,7 +7902,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: Some(event.encode_to_vec()),
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);

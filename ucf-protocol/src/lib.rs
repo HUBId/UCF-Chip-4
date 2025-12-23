@@ -458,6 +458,32 @@ pub mod ucf {
             pub reason_codes: Vec<String>,
         }
 
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration, PartialOrd, Ord)]
+        #[repr(i32)]
+        pub enum MicroModule {
+            Unspecified = 0,
+            Lc = 1,
+            Sn = 2,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct MicrocircuitConfigEvidence {
+            #[prost(enumeration = "MicroModule", tag = "1")]
+            pub module: i32,
+            #[prost(uint32, tag = "2")]
+            pub config_version: u32,
+            #[prost(bytes = "vec", tag = "3")]
+            pub config_digest: Vec<u8>,
+            #[prost(uint64, tag = "4")]
+            pub created_at_ms: u64,
+            #[prost(string, optional, tag = "5")]
+            pub attested_by_key_id: Option<String>,
+            #[prost(bytes = "vec", optional, tag = "6")]
+            pub signature: Option<Vec<u8>>,
+        }
+
         /// Lightweight reference type for future graph links.
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
         #[derive(Clone, PartialEq, Eq, Message)]

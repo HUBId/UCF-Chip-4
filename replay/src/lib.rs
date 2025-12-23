@@ -600,7 +600,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         }
     }
 
@@ -675,7 +675,7 @@ mod tests {
             recovery_case: None,
             unlock_permit: None,
             tool_onboarding_event: None,
-            microcircuit_config: None,
+            microcircuit_config_payload: None,
         }
     }
 
