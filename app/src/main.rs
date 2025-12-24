@@ -72,6 +72,22 @@ fn format_snapshot(snapshot: &PvgsSnapshot) -> String {
     ));
 
     lines.push(format!(
+        "micro_config_lc: version={} digest={}",
+        version_or_none(snapshot.micro_card.lc_config_version),
+        hex_or_none(snapshot.micro_card.lc_config_digest),
+    ));
+    lines.push(format!(
+        "micro_config_sn: version={} digest={}",
+        version_or_none(snapshot.micro_card.sn_config_version),
+        hex_or_none(snapshot.micro_card.sn_config_digest),
+    ));
+    lines.push(format!(
+        "micro_config_hpa: version={} digest={}",
+        version_or_none(snapshot.micro_card.hpa_config_version),
+        hex_or_none(snapshot.micro_card.hpa_config_digest),
+    ));
+
+    lines.push(format!(
         "pending_replay_plans: {}",
         snapshot.pending_replay_ids.len()
     ));
@@ -134,17 +150,26 @@ fn hex_or_none(value: Option<[u8; 32]>) -> String {
     value.map(encode).unwrap_or_else(|| "NONE".to_string())
 }
 
+fn version_or_none(value: Option<u32>) -> String {
+    value
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "NONE".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cbv::compute_cbv_digest;
     use cbv::CharacterBaselineVector;
+    use micro_evidence::compute_config_digest;
     use pev::{pev_digest, PolicyEcologyDimension, PolicyEcologyVector};
     use query::{get_current_ruleset_digest, get_previous_ruleset_digest};
     use recovery::{RecoveryCase, RecoveryCheck, RecoveryState};
     use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
     use sep::SepEventType;
-    use ucf_protocol::ucf::v1::{ReplayFidelity, ReplayTargetKind};
+    use ucf_protocol::ucf::v1::{
+        MicroModule, MicrocircuitConfigEvidence, ReplayFidelity, ReplayTargetKind,
+    };
 
     #[test]
     fn pvgs_dump_formats_snapshot() {
@@ -193,6 +218,44 @@ mod tests {
         };
         store.pev_store.push(pev).unwrap();
         store.update_pev_digest(pev_digest(store.pev_store.latest().unwrap()));
+
+        let lc_config_digest = compute_config_digest("LC", 1, b"lc-config");
+        let sn_config_digest = compute_config_digest("SN", 2, b"sn-config");
+        let hpa_config_digest = compute_config_digest("HPA", 3, b"hpa-config");
+
+        store
+            .micro_config_store
+            .insert(MicrocircuitConfigEvidence {
+                module: MicroModule::Lc as i32,
+                config_version: 1,
+                config_digest: lc_config_digest.to_vec(),
+                created_at_ms: 1,
+                attested_by_key_id: None,
+                signature: None,
+            })
+            .unwrap();
+        store
+            .micro_config_store
+            .insert(MicrocircuitConfigEvidence {
+                module: MicroModule::Sn as i32,
+                config_version: 2,
+                config_digest: sn_config_digest.to_vec(),
+                created_at_ms: 2,
+                attested_by_key_id: None,
+                signature: None,
+            })
+            .unwrap();
+        store
+            .micro_config_store
+            .insert(MicrocircuitConfigEvidence {
+                module: MicroModule::Hpa as i32,
+                config_version: 3,
+                config_digest: hpa_config_digest.to_vec(),
+                created_at_ms: 3,
+                attested_by_key_id: None,
+                signature: None,
+            })
+            .unwrap();
 
         let plan_a = build_replay_plan(BuildReplayPlanArgs {
             session_id: "sess-1".into(),
@@ -260,6 +323,15 @@ mod tests {
         assert_eq!(snapshot.latest_cbv_epoch, Some(5));
         assert_eq!(snapshot.latest_cbv_digest, Some(cbv_digest));
         assert_eq!(snapshot.latest_pev_digest, Some([3u8; 32]));
+        assert_eq!(snapshot.micro_card.lc_config_digest, Some(lc_config_digest));
+        assert_eq!(snapshot.micro_card.lc_config_version, Some(1));
+        assert_eq!(snapshot.micro_card.sn_config_digest, Some(sn_config_digest));
+        assert_eq!(snapshot.micro_card.sn_config_version, Some(2));
+        assert_eq!(
+            snapshot.micro_card.hpa_config_digest,
+            Some(hpa_config_digest)
+        );
+        assert_eq!(snapshot.micro_card.hpa_config_version, Some(3));
         assert_eq!(
             snapshot.pending_replay_ids,
             vec![plan_a.replay_id, plan_b.replay_id]
@@ -267,12 +339,15 @@ mod tests {
         assert_eq!(snapshot.last_seal_digest, Some(decision_event.event_digest));
 
         let expected = format!(
-            "head: id=7 digest={}\nruleset: current={} prev={}\ncbv: epoch=5 digest={}\npev_digest: {}\npending_replay_plans: 2\n- replay:sess-1:7:1\n- replay:sess-1:7:2\ncompleteness: {}\nlast_seal: {}\nrecovery: state=R0Captured checks=0/1 id=recovery:test\nunlock_permit: present=true digest={}\nunlock_hint: UNLOCKED_READONLY",
+            "head: id=7 digest={}\nruleset: current={} prev={}\ncbv: epoch=5 digest={}\npev_digest: {}\nmicro_config_lc: version=1 digest={}\nmicro_config_sn: version=2 digest={}\nmicro_config_hpa: version=3 digest={}\npending_replay_plans: 2\n- replay:sess-1:7:1\n- replay:sess-1:7:2\ncompleteness: {}\nlast_seal: {}\nrecovery: state=R0Captured checks=0/1 id=recovery:test\nunlock_permit: present=true digest={}\nunlock_hint: UNLOCKED_READONLY",
             encode(head_digest),
             encode(snapshot.ruleset_digest.unwrap()),
             encode(snapshot.prev_ruleset_digest.unwrap()),
             encode(cbv_digest),
             encode(snapshot.latest_pev_digest.unwrap()),
+            encode(lc_config_digest),
+            encode(sn_config_digest),
+            encode(hpa_config_digest),
             snapshot
                 .completeness_status
                 .clone()

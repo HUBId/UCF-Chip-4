@@ -147,6 +147,18 @@ pub struct PvgsSnapshot {
     pub recovery_case: Option<ProtoRecoveryCase>,
     pub unlock_permit_digest: Option<[u8; 32]>,
     pub unlock_readiness_hint: Option<String>,
+    pub micro_card: MicroCard,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MicroCard {
+    pub lc_config_digest: Option<[u8; 32]>,
+    pub lc_config_version: Option<u32>,
+    pub sn_config_digest: Option<[u8; 32]>,
+    pub sn_config_version: Option<u32>,
+    pub hpa_config_digest: Option<[u8; 32]>,
+    pub hpa_config_version: Option<u32>,
 }
 
 const MAX_MACRO_VECTOR_ITEMS: usize = 64;
@@ -444,7 +456,36 @@ pub fn snapshot(store: &PvgsStore, session_id: Option<&str>) -> PvgsSnapshot {
         unlock_readiness_hint: session_id
             .map(|session| unlock_readiness_hint(store, session))
             .filter(|hint| hint != "NONE"),
+        micro_card: micro_card_from_store(store),
     }
+}
+
+fn micro_card_from_store(store: &PvgsStore) -> MicroCard {
+    let (lc_config_digest, lc_config_version) = latest_micro_config(store, MicroModule::Lc);
+    let (sn_config_digest, sn_config_version) = latest_micro_config(store, MicroModule::Sn);
+    let (hpa_config_digest, hpa_config_version) = latest_micro_config(store, MicroModule::Hpa);
+
+    MicroCard {
+        lc_config_digest,
+        lc_config_version,
+        sn_config_digest,
+        sn_config_version,
+        hpa_config_digest,
+        hpa_config_version,
+    }
+}
+
+fn latest_micro_config(store: &PvgsStore, module: MicroModule) -> (Option<[u8; 32]>, Option<u32>) {
+    store
+        .micro_config_store
+        .latest_for_module(module)
+        .map(|config| {
+            (
+                digest_from_bytes(&config.config_digest),
+                Some(config.config_version),
+            )
+        })
+        .unwrap_or((None, None))
 }
 
 fn recovery_case_to_proto(case: InternalRecoveryCase) -> ProtoRecoveryCase {
@@ -1466,6 +1507,7 @@ mod tests {
         let mut store = minimal_store();
         let lc_digest = compute_config_digest("LC", 1, b"lc-config");
         let sn_digest = compute_config_digest("SN", 2, b"sn-config");
+        let hpa_digest = compute_config_digest("HPA", 3, b"hpa-config");
 
         store
             .micro_config_store
@@ -1489,6 +1531,17 @@ mod tests {
                 signature: None,
             })
             .expect("insert sn");
+        store
+            .micro_config_store
+            .insert(MicrocircuitConfigEvidence {
+                module: MicroModule::Hpa as i32,
+                config_version: 3,
+                config_digest: hpa_digest.to_vec(),
+                created_at_ms: 30,
+                attested_by_key_id: None,
+                signature: None,
+            })
+            .expect("insert hpa");
 
         assert_eq!(
             get_microcircuit_config_digest(&store, MicroModule::Lc),
@@ -1497,6 +1550,10 @@ mod tests {
         assert_eq!(
             get_microcircuit_config_digest(&store, MicroModule::Sn),
             Some(sn_digest)
+        );
+        assert_eq!(
+            get_microcircuit_config_digest(&store, MicroModule::Hpa),
+            Some(hpa_digest)
         );
 
         let configs = list_microcircuit_configs(&store);
@@ -1516,6 +1573,14 @@ mod tests {
                     config_version: 2,
                     config_digest: sn_digest.to_vec(),
                     created_at_ms: 20,
+                    attested_by_key_id: None,
+                    signature: None,
+                },
+                MicrocircuitConfigEvidence {
+                    module: MicroModule::Hpa as i32,
+                    config_version: 3,
+                    config_digest: hpa_digest.to_vec(),
+                    created_at_ms: 30,
                     attested_by_key_id: None,
                     signature: None,
                 },
@@ -1576,6 +1641,62 @@ mod tests {
         assert_eq!(receipt.status, ReceiptStatus::Accepted);
 
         let stored = get_microcircuit_config(&store, MicroModule::Lc);
+        assert_eq!(stored, Some(evidence));
+    }
+
+    #[test]
+    fn microcircuit_config_commit_queries_return_hpa() {
+        let mut store = minimal_store();
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let config_bytes = br#"{\"enabled\":true}"#;
+        let digest = compute_config_digest("HPA", 2, config_bytes);
+        let evidence = MicrocircuitConfigEvidence {
+            module: MicroModule::Hpa as i32,
+            config_version: 2,
+            config_digest: digest.to_vec(),
+            created_at_ms: 42,
+            attested_by_key_id: None,
+            signature: None,
+        };
+
+        let req = PvgsCommitRequest {
+            commit_id: "micro-config-commit".to_string(),
+            commit_type: CommitType::MicrocircuitConfigAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: None,
+            microcircuit_config_payload: Some(evidence.encode_to_vec()),
+        };
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+
+        let stored = get_microcircuit_config(&store, MicroModule::Hpa);
         assert_eq!(stored, Some(evidence));
     }
 

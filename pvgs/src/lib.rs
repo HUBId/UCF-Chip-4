@@ -4373,7 +4373,9 @@ fn verify_microcircuit_config_append(
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
-    if module == MicroModule::Unspecified || !matches!(module, MicroModule::Lc | MicroModule::Sn) {
+    if module == MicroModule::Unspecified
+        || !matches!(module, MicroModule::Lc | MicroModule::Sn | MicroModule::Hpa)
+    {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
@@ -5896,6 +5898,7 @@ mod tests {
         match module {
             MicroModule::Lc => "LC",
             MicroModule::Sn => "SN",
+            MicroModule::Hpa => "HPA",
             MicroModule::Unspecified => "UNSPECIFIED",
         }
     }
@@ -6038,6 +6041,28 @@ mod tests {
             .expect("config stored");
         assert_eq!(stored.config_digest, expected_digest.to_vec());
         assert_eq!(store.micro_config_store.list_all().len(), 1);
+    }
+
+    #[test]
+    fn microcircuit_config_append_accepts_hpa() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let config_bytes = br#"{\"enabled\":true}"#;
+        let expected_digest = compute_config_digest("HPA", 2, config_bytes);
+
+        let req = micro_config_request(&store, MicroModule::Hpa, 2, config_bytes);
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof_receipt.is_some());
+
+        let stored = store
+            .micro_config_store
+            .latest_for_module(MicroModule::Hpa)
+            .expect("config stored");
+        assert_eq!(stored.config_digest, expected_digest.to_vec());
+        assert_eq!(stored.config_version, 2);
     }
 
     #[test]

@@ -66,6 +66,7 @@ dependencies = [
  "clap",
  "hex",
  "keys",
+ "micro_evidence",
  "pev",
  "pvgs",
  "query",
