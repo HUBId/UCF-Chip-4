@@ -465,6 +465,7 @@ pub mod ucf {
             Unspecified = 0,
             Lc = 1,
             Sn = 2,
+            Hpa = 3,
         }
 
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
