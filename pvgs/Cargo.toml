@@ -27,6 +27,7 @@ consistency = { path = "../crates/consistency" }
 limits = { workspace = true }
 recovery = { path = "../crates/recovery" }
 micro_evidence = { path = "../crates/micro_evidence" }
+assets = { path = "../crates/assets" }
 
 [features]
 default = []

@@ -57,6 +57,7 @@ pub mod ucf {
             DlpDecisionAppend,
             ReplayPlanAppend,
             MicrocircuitConfigAppend,
+            AssetManifestAppend,
         }
 
         /// Required receipt classes for PVGS commits.
@@ -353,6 +354,40 @@ pub mod ucf {
             pub pev_epoch: Option<u64>,
         }
 
+        /// Asset catalog manifest of PVGS-aware asset digests.
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum AssetKind {
+            Unspecified = 0,
+            Morphology = 1,
+            Channel = 2,
+            Synapse = 3,
+            Connectivity = 4,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct AssetDigest {
+            #[prost(enumeration = "AssetKind", tag = "1")]
+            pub kind: i32,
+            #[prost(bytes = "vec", tag = "2")]
+            pub digest: Vec<u8>,
+            #[prost(uint32, tag = "3")]
+            pub version: u32,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct AssetManifest {
+            #[prost(bytes = "vec", tag = "1")]
+            pub manifest_digest: Vec<u8>,
+            #[prost(uint64, tag = "2")]
+            pub created_at_ms: u64,
+            #[prost(message, repeated, tag = "3")]
+            pub asset_digests: Vec<AssetDigest>,
+        }
+
         /// Control frame emitted by the engine with overlays and reasons.
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
         #[derive(Clone, Debug, PartialEq, Eq)]
@@ -419,6 +454,7 @@ pub mod ucf {
             pub const GV_GRAPH_TRIMMED: &'static str = "RC.GV.GRAPH.TRIMMED";
             pub const GV_MICROCIRCUIT_CONFIG_APPENDED: &'static str =
                 "RC.GV.MICROCIRCUIT.CONFIG_APPENDED";
+            pub const GV_ASSET_MANIFEST_APPENDED: &'static str = "RC.GV.ASSET.MANIFEST_APPENDED";
             pub const GV_RECOVERY_CREATED: &'static str = "RC.GV.RECOVERY.CREATED";
             pub const GV_RECOVERY_ADVANCED: &'static str = "RC.GV.RECOVERY.ADVANCED";
             pub const GV_RECOVERY_UNLOCK_GRANTED: &'static str = "RC.GV.RECOVERY.UNLOCK_GRANTED";
