@@ -7,7 +7,8 @@ edition.workspace = true
 blake3.workspace = true
 prost.workspace = true
 ucf-protocol = { path = "../../ucf-protocol" }
+serde = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [features]
-serde = ["ucf-protocol/serde"]
+serde = ["dep:serde", "ucf-protocol/serde"]
