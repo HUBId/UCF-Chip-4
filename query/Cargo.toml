@@ -25,4 +25,5 @@ recovery = { path = "../crates/recovery" }
 tool_events = { path = "../crates/tool_events" }
 
 [dev-dependencies]
+assets = { path = "../crates/assets" }
 micro_evidence = { path = "../crates/micro_evidence" }

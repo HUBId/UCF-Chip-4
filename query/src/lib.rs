@@ -16,7 +16,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::convert::TryFrom;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{
-    ConsistencyFeedback, DlpDecisionForm, ExperienceRecord, MicroModule,
+    AssetKind, AssetManifest, ConsistencyFeedback, DlpDecisionForm, ExperienceRecord, MicroModule,
     MicrocircuitConfigEvidence, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes,
     RecoveryCase as ProtoRecoveryCase, RecoveryCheck as ProtoRecoveryCheck,
     RecoveryState as ProtoRecoveryState, ReplayPlan, ToolOnboardingEvent, ToolOnboardingStage,
@@ -148,6 +148,7 @@ pub struct PvgsSnapshot {
     pub unlock_permit_digest: Option<[u8; 32]>,
     pub unlock_readiness_hint: Option<String>,
     pub micro_card: MicroCard,
+    pub assets_card: AssetsCard,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -161,8 +162,19 @@ pub struct MicroCard {
     pub hpa_config_version: Option<u32>,
 }
 
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AssetsCard {
+    pub latest_manifest_digest: Option<[u8; 32]>,
+    pub morphology_digest: Option<[u8; 32]>,
+    pub channel_digest: Option<[u8; 32]>,
+    pub synapse_digest: Option<[u8; 32]>,
+    pub connectivity_digest: Option<[u8; 32]>,
+}
+
 const MAX_MACRO_VECTOR_ITEMS: usize = 64;
 const MAX_CBV_SCAN: usize = 32;
+const MAX_ASSET_MANIFESTS: usize = 128;
 
 pub trait QueryInspector {
     fn fetch(&self, request: QueryRequest) -> Result<QueryResult, QueryError>;
@@ -381,6 +393,35 @@ pub fn list_tool_registry_digests(store: &PvgsStore) -> Vec<[u8; 32]> {
     store.tool_registry_state.history.clone()
 }
 
+/// Return the latest asset manifest if present.
+pub fn get_latest_asset_manifest(store: &PvgsStore) -> Option<AssetManifest> {
+    list_asset_manifests(store).into_iter().last()
+}
+
+/// Return the latest asset manifest digest if present.
+pub fn get_latest_asset_manifest_digest(store: &PvgsStore) -> Option<[u8; 32]> {
+    get_latest_asset_manifest(store)
+        .as_ref()
+        .and_then(|manifest| digest_from_bytes(&manifest.manifest_digest))
+}
+
+/// Retrieve a specific asset manifest by digest.
+pub fn get_asset_manifest(store: &PvgsStore, digest: [u8; 32]) -> Option<AssetManifest> {
+    store.asset_manifest_store.get(digest).cloned()
+}
+
+/// List asset manifests sorted by created_at_ms then manifest digest.
+pub fn list_asset_manifests(store: &PvgsStore) -> Vec<AssetManifest> {
+    let mut manifests: Vec<AssetManifest> = store.asset_manifest_store.list().to_vec();
+    manifests.sort_by(|a, b| {
+        a.created_at_ms
+            .cmp(&b.created_at_ms)
+            .then_with(|| a.manifest_digest.cmp(&b.manifest_digest))
+    });
+    manifests.truncate(MAX_ASSET_MANIFESTS);
+    manifests
+}
+
 /// Build a deterministic snapshot of key PVGS state for operational inspection.
 pub fn snapshot(store: &PvgsStore, session_id: Option<&str>) -> PvgsSnapshot {
     let latest_cbv = store.get_latest_cbv();
@@ -457,6 +498,7 @@ pub fn snapshot(store: &PvgsStore, session_id: Option<&str>) -> PvgsSnapshot {
             .map(|session| unlock_readiness_hint(store, session))
             .filter(|hint| hint != "NONE"),
         micro_card: micro_card_from_store(store),
+        assets_card: assets_card_from_store(store),
     }
 }
 
@@ -475,6 +517,33 @@ fn micro_card_from_store(store: &PvgsStore) -> MicroCard {
     }
 }
 
+fn assets_card_from_store(store: &PvgsStore) -> AssetsCard {
+    let latest_manifest = get_latest_asset_manifest(store);
+    let latest_manifest_digest = latest_manifest
+        .as_ref()
+        .and_then(|manifest| digest_from_bytes(&manifest.manifest_digest));
+    let morphology_digest = latest_manifest
+        .as_ref()
+        .and_then(|manifest| select_asset_digest(manifest, AssetKind::Morphology));
+    let channel_digest = latest_manifest
+        .as_ref()
+        .and_then(|manifest| select_asset_digest(manifest, AssetKind::Channel));
+    let synapse_digest = latest_manifest
+        .as_ref()
+        .and_then(|manifest| select_asset_digest(manifest, AssetKind::Synapse));
+    let connectivity_digest = latest_manifest
+        .as_ref()
+        .and_then(|manifest| select_asset_digest(manifest, AssetKind::Connectivity));
+
+    AssetsCard {
+        latest_manifest_digest,
+        morphology_digest,
+        channel_digest,
+        synapse_digest,
+        connectivity_digest,
+    }
+}
+
 fn latest_micro_config(store: &PvgsStore, module: MicroModule) -> (Option<[u8; 32]>, Option<u32>) {
     store
         .micro_config_store
@@ -486,6 +555,20 @@ fn latest_micro_config(store: &PvgsStore, module: MicroModule) -> (Option<[u8; 3
             )
         })
         .unwrap_or((None, None))
+}
+
+fn select_asset_digest(manifest: &AssetManifest, kind: AssetKind) -> Option<[u8; 32]> {
+    manifest
+        .asset_digests
+        .iter()
+        .filter(|asset| AssetKind::try_from(asset.kind).ok() == Some(kind))
+        .filter_map(|asset| digest_from_bytes(&asset.digest).map(|digest| (asset.version, digest)))
+        .max_by(|(version_a, digest_a), (version_b, digest_b)| {
+            version_a
+                .cmp(version_b)
+                .then_with(|| digest_a.cmp(digest_b))
+        })
+        .map(|(_, digest)| digest)
 }
 
 fn recovery_case_to_proto(case: InternalRecoveryCase) -> ProtoRecoveryCase {
@@ -1408,6 +1491,7 @@ fn is_profile_node(store: &PvgsStore, digest: &NodeKey) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assets::compute_asset_manifest_digest;
     use keys::KeyStore;
     use micro_evidence::compute_config_digest;
     use pev::PolicyEcologyDimension;
@@ -1420,9 +1504,9 @@ mod tests {
     use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
     use ucf_protocol::ucf::v1::{
-        ConsistencyFeedback, Digest32, DlpDecision, GovernanceFrame, MacroMilestone,
-        MacroMilestoneState, MagnitudeClass, MetabolicFrame, MicroModule,
-        MicrocircuitConfigEvidence, ReceiptStatus, RecordType, Ref, ReplayFidelity,
+        AssetDigest, AssetKind, AssetManifest, ConsistencyFeedback, Digest32, DlpDecision,
+        GovernanceFrame, MacroMilestone, MacroMilestoneState, MagnitudeClass, MetabolicFrame,
+        MicroModule, MicrocircuitConfigEvidence, ReceiptStatus, RecordType, Ref, ReplayFidelity,
         ReplayTargetKind, TraitDirection, TraitUpdate,
     };
     use vrf::VrfEngine;
@@ -1635,6 +1719,7 @@ mod tests {
             unlock_permit: None,
             tool_onboarding_event: None,
             microcircuit_config_payload: Some(evidence.encode_to_vec()),
+            asset_manifest_payload: None,
         };
 
         let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -1691,6 +1776,7 @@ mod tests {
             unlock_permit: None,
             tool_onboarding_event: None,
             microcircuit_config_payload: Some(evidence.encode_to_vec()),
+            asset_manifest_payload: None,
         };
 
         let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -1698,6 +1784,72 @@ mod tests {
 
         let stored = get_microcircuit_config(&store, MicroModule::Hpa);
         assert_eq!(stored, Some(evidence));
+    }
+
+    #[test]
+    fn asset_manifest_commit_queries_return_latest() {
+        let mut store = minimal_store();
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let mut manifest = AssetManifest {
+            manifest_digest: Vec::new(),
+            created_at_ms: 42,
+            asset_digests: vec![
+                AssetDigest {
+                    kind: AssetKind::Morphology as i32,
+                    digest: [10u8; 32].to_vec(),
+                    version: 1,
+                },
+                AssetDigest {
+                    kind: AssetKind::Channel as i32,
+                    digest: [11u8; 32].to_vec(),
+                    version: 1,
+                },
+            ],
+        };
+        let manifest_digest = compute_asset_manifest_digest(&manifest);
+        manifest.manifest_digest = manifest_digest.to_vec();
+
+        let req = PvgsCommitRequest {
+            commit_id: "asset-manifest-commit".to_string(),
+            commit_type: CommitType::AssetManifestAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: None,
+            microcircuit_config_payload: None,
+            asset_manifest_payload: Some(manifest.encode_to_vec()),
+        };
+
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof_receipt.is_some());
+
+        let latest = get_latest_asset_manifest(&store).expect("latest manifest");
+        assert_eq!(latest.manifest_digest, manifest_digest.to_vec());
     }
 
     fn dummy_proof_receipt(record_digest: [u8; 32]) -> ProofReceipt {
@@ -2168,6 +2320,7 @@ mod tests {
             unlock_permit: None,
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
+            asset_manifest_payload: None,
         };
 
         let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -2519,6 +2672,7 @@ mod tests {
             unlock_permit: None,
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
+            asset_manifest_payload: None,
         };
 
         let (receipt, _) = verify_and_commit(req, store, keystore, vrf_engine);
@@ -2585,6 +2739,7 @@ mod tests {
             unlock_permit: None,
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
+            asset_manifest_payload: None,
         };
 
         let (receipt, _) = verify_and_commit(req, store, keystore, vrf_engine);

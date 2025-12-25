@@ -88,6 +88,27 @@ fn format_snapshot(snapshot: &PvgsSnapshot) -> String {
     ));
 
     lines.push(format!(
+        "asset_manifest: {}",
+        hex_or_none(snapshot.assets_card.latest_manifest_digest)
+    ));
+    lines.push(format!(
+        "asset_morphology: {}",
+        hex_or_none(snapshot.assets_card.morphology_digest)
+    ));
+    lines.push(format!(
+        "asset_channel: {}",
+        hex_or_none(snapshot.assets_card.channel_digest)
+    ));
+    lines.push(format!(
+        "asset_synapse: {}",
+        hex_or_none(snapshot.assets_card.synapse_digest)
+    ));
+    lines.push(format!(
+        "asset_connectivity: {}",
+        hex_or_none(snapshot.assets_card.connectivity_digest)
+    ));
+
+    lines.push(format!(
         "pending_replay_plans: {}",
         snapshot.pending_replay_ids.len()
     ));
@@ -159,6 +180,7 @@ fn version_or_none(value: Option<u32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assets::compute_asset_manifest_digest;
     use cbv::compute_cbv_digest;
     use cbv::CharacterBaselineVector;
     use micro_evidence::compute_config_digest;
@@ -168,7 +190,8 @@ mod tests {
     use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
     use sep::SepEventType;
     use ucf_protocol::ucf::v1::{
-        MicroModule, MicrocircuitConfigEvidence, ReplayFidelity, ReplayTargetKind,
+        AssetDigest, AssetKind, AssetManifest, MicroModule, MicrocircuitConfigEvidence,
+        ReplayFidelity, ReplayTargetKind,
     };
 
     #[test]
@@ -257,6 +280,36 @@ mod tests {
             })
             .unwrap();
 
+        let mut manifest = AssetManifest {
+            manifest_digest: Vec::new(),
+            created_at_ms: 10,
+            asset_digests: vec![
+                AssetDigest {
+                    kind: AssetKind::Morphology as i32,
+                    digest: [4u8; 32].to_vec(),
+                    version: 1,
+                },
+                AssetDigest {
+                    kind: AssetKind::Channel as i32,
+                    digest: [5u8; 32].to_vec(),
+                    version: 1,
+                },
+                AssetDigest {
+                    kind: AssetKind::Synapse as i32,
+                    digest: [6u8; 32].to_vec(),
+                    version: 1,
+                },
+                AssetDigest {
+                    kind: AssetKind::Connectivity as i32,
+                    digest: [7u8; 32].to_vec(),
+                    version: 1,
+                },
+            ],
+        };
+        let manifest_digest = compute_asset_manifest_digest(&manifest);
+        manifest.manifest_digest = manifest_digest.to_vec();
+        store.asset_manifest_store.insert(manifest).unwrap();
+
         let plan_a = build_replay_plan(BuildReplayPlanArgs {
             session_id: "sess-1".into(),
             head_experience_id: store.experience_store.head_id,
@@ -333,13 +386,21 @@ mod tests {
         );
         assert_eq!(snapshot.micro_card.hpa_config_version, Some(3));
         assert_eq!(
+            snapshot.assets_card.latest_manifest_digest,
+            Some(manifest_digest)
+        );
+        assert_eq!(snapshot.assets_card.morphology_digest, Some([4u8; 32]));
+        assert_eq!(snapshot.assets_card.channel_digest, Some([5u8; 32]));
+        assert_eq!(snapshot.assets_card.synapse_digest, Some([6u8; 32]));
+        assert_eq!(snapshot.assets_card.connectivity_digest, Some([7u8; 32]));
+        assert_eq!(
             snapshot.pending_replay_ids,
             vec![plan_a.replay_id, plan_b.replay_id]
         );
         assert_eq!(snapshot.last_seal_digest, Some(decision_event.event_digest));
 
         let expected = format!(
-            "head: id=7 digest={}\nruleset: current={} prev={}\ncbv: epoch=5 digest={}\npev_digest: {}\nmicro_config_lc: version=1 digest={}\nmicro_config_sn: version=2 digest={}\nmicro_config_hpa: version=3 digest={}\npending_replay_plans: 2\n- replay:sess-1:7:1\n- replay:sess-1:7:2\ncompleteness: {}\nlast_seal: {}\nrecovery: state=R0Captured checks=0/1 id=recovery:test\nunlock_permit: present=true digest={}\nunlock_hint: UNLOCKED_READONLY",
+            "head: id=7 digest={}\nruleset: current={} prev={}\ncbv: epoch=5 digest={}\npev_digest: {}\nmicro_config_lc: version=1 digest={}\nmicro_config_sn: version=2 digest={}\nmicro_config_hpa: version=3 digest={}\nasset_manifest: {}\nasset_morphology: {}\nasset_channel: {}\nasset_synapse: {}\nasset_connectivity: {}\npending_replay_plans: 2\n- replay:sess-1:7:1\n- replay:sess-1:7:2\ncompleteness: {}\nlast_seal: {}\nrecovery: state=R0Captured checks=0/1 id=recovery:test\nunlock_permit: present=true digest={}\nunlock_hint: UNLOCKED_READONLY",
             encode(head_digest),
             encode(snapshot.ruleset_digest.unwrap()),
             encode(snapshot.prev_ruleset_digest.unwrap()),
@@ -348,6 +409,11 @@ mod tests {
             encode(lc_config_digest),
             encode(sn_config_digest),
             encode(hpa_config_digest),
+            encode(manifest_digest),
+            encode([4u8; 32]),
+            encode([5u8; 32]),
+            encode([6u8; 32]),
+            encode([7u8; 32]),
             snapshot
                 .completeness_status
                 .clone()

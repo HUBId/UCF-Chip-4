@@ -601,6 +601,7 @@ mod tests {
             unlock_permit: None,
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
+            asset_manifest_payload: None,
         }
     }
 
@@ -676,6 +677,7 @@ mod tests {
             unlock_permit: None,
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
+            asset_manifest_payload: None,
         }
     }
 

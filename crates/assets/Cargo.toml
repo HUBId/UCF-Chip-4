@@ -1,0 +1,14 @@
+[package]
+name = "assets"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+blake3.workspace = true
+prost.workspace = true
+ucf-protocol = { path = "../../ucf-protocol" }
+serde = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[features]
+serde = ["dep:serde", "ucf-protocol/serde"]
