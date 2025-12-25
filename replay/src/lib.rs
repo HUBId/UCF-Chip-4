@@ -602,6 +602,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         }
     }
 
@@ -678,6 +679,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         }
     }
 

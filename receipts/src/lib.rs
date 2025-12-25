@@ -379,6 +379,7 @@ fn commit_type_label(commit_type: &protocol::CommitType) -> &'static str {
         protocol::CommitType::ConsistencyFeedbackAppend => "ConsistencyFeedbackAppend",
         protocol::CommitType::MicrocircuitConfigAppend => "MicrocircuitConfigAppend",
         protocol::CommitType::AssetManifestAppend => "AssetManifestAppend",
+        protocol::CommitType::AssetBundleAppend => "AssetBundleAppend",
     }
 }
 

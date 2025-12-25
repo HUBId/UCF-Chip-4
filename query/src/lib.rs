@@ -16,10 +16,11 @@ use std::collections::{BTreeSet, VecDeque};
 use std::convert::TryFrom;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{
-    AssetKind, AssetManifest, ConsistencyFeedback, DlpDecisionForm, ExperienceRecord, MicroModule,
-    MicrocircuitConfigEvidence, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes, RecordType,
-    RecoveryCase as ProtoRecoveryCase, RecoveryCheck as ProtoRecoveryCheck,
-    RecoveryState as ProtoRecoveryState, ReplayPlan, ToolOnboardingEvent, ToolOnboardingStage,
+    AssetBundle, AssetChunk, AssetKind, AssetManifest, CompressionMode, ConsistencyFeedback,
+    DlpDecisionForm, ExperienceRecord, MicroModule, MicrocircuitConfigEvidence, PVGSKeyEpoch,
+    PVGSReceipt, ProofReceipt, ReasonCodes, RecordType, RecoveryCase as ProtoRecoveryCase,
+    RecoveryCheck as ProtoRecoveryCheck, RecoveryState as ProtoRecoveryState, ReplayPlan,
+    ToolOnboardingEvent, ToolOnboardingStage,
 };
 use wire::{AuthContext, Envelope};
 
@@ -169,15 +170,21 @@ pub struct MicroCard {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AssetsCard {
     pub latest_manifest_digest: Option<[u8; 32]>,
+    pub latest_bundle_digest: Option<[u8; 32]>,
     pub morphology_digest: Option<[u8; 32]>,
     pub channel_digest: Option<[u8; 32]>,
     pub synapse_digest: Option<[u8; 32]>,
     pub connectivity_digest: Option<[u8; 32]>,
+    pub total_asset_chunks: u64,
+    pub compression_none_count: u64,
+    pub compression_zstd_count: u64,
+    pub asset_digest_mismatch_count: u64,
 }
 
 const MAX_MACRO_VECTOR_ITEMS: usize = 64;
 const MAX_CBV_SCAN: usize = 32;
 const MAX_ASSET_MANIFESTS: usize = 128;
+const MAX_ASSET_BUNDLES: usize = 128;
 const MAX_PLASTICITY_EVIDENCE: usize = 128;
 const MAX_PLASTICITY_SCORECARD_DIGESTS: usize = 128;
 const MAX_PLASTICITY_SCORECARD_LIST: usize = 5;
@@ -429,6 +436,40 @@ pub fn list_asset_manifests(store: &PvgsStore) -> Vec<AssetManifest> {
     manifests
 }
 
+/// Return the latest asset bundle if present.
+pub fn get_latest_asset_bundle(store: &PvgsStore) -> Option<AssetBundle> {
+    list_asset_bundles(store).into_iter().last()
+}
+
+/// Retrieve a specific asset bundle by digest.
+pub fn get_asset_bundle(store: &PvgsStore, digest: [u8; 32]) -> Option<AssetBundle> {
+    store.asset_bundle_store.get(digest).cloned()
+}
+
+/// List asset bundles sorted by created_at_ms then bundle digest.
+pub fn list_asset_bundles(store: &PvgsStore) -> Vec<AssetBundle> {
+    let mut bundles: Vec<AssetBundle> = store.asset_bundle_store.list().to_vec();
+    bundles.sort_by(|a, b| {
+        a.created_at_ms
+            .cmp(&b.created_at_ms)
+            .then_with(|| a.bundle_digest.cmp(&b.bundle_digest))
+    });
+    bundles.truncate(MAX_ASSET_BUNDLES);
+    bundles
+}
+
+/// Retrieve stored chunks for an asset digest, sorted by chunk_index.
+pub fn get_asset_chunks(store: &PvgsStore, asset_digest: [u8; 32]) -> Vec<AssetChunk> {
+    let mut chunks = store
+        .asset_bundle_store
+        .chunks_for_asset(asset_digest)
+        .map(|chunks| chunks.to_vec())
+        .unwrap_or_default();
+    chunks.sort_by_key(|chunk| chunk.chunk_index);
+    chunks.truncate(store.asset_bundle_store.max_chunks_per_asset());
+    chunks
+}
+
 /// Build a deterministic snapshot of key PVGS state for operational inspection.
 pub fn snapshot(store: &PvgsStore, session_id: Option<&str>) -> PvgsSnapshot {
     let latest_cbv = store.get_latest_cbv();
@@ -530,6 +571,10 @@ fn assets_card_from_store(store: &PvgsStore) -> AssetsCard {
     let latest_manifest_digest = latest_manifest
         .as_ref()
         .and_then(|manifest| digest_from_bytes(&manifest.manifest_digest));
+    let latest_bundle_digest = store
+        .asset_bundle_store
+        .latest()
+        .and_then(|bundle| digest_from_bytes(&bundle.bundle_digest));
     let morphology_digest = latest_manifest
         .as_ref()
         .and_then(|manifest| select_asset_digest(manifest, AssetKind::Morphology));
@@ -543,12 +588,43 @@ fn assets_card_from_store(store: &PvgsStore) -> AssetsCard {
         .as_ref()
         .and_then(|manifest| select_asset_digest(manifest, AssetKind::Connectivity));
 
+    let mut compression_none_count = 0u64;
+    let mut compression_zstd_count = 0u64;
+    for bundle in store.asset_bundle_store.list() {
+        for chunk in &bundle.chunks {
+            match CompressionMode::try_from(chunk.compression_mode)
+                .unwrap_or(CompressionMode::Unspecified)
+            {
+                CompressionMode::None => compression_none_count += 1,
+                CompressionMode::Zstd => compression_zstd_count += 1,
+                CompressionMode::Unspecified => {}
+            }
+        }
+    }
+
+    let asset_digest_mismatch_count = store
+        .sep_log
+        .events
+        .iter()
+        .filter(|event| {
+            event
+                .reason_codes
+                .iter()
+                .any(|code| code == ReasonCodes::GV_ASSET_DIGEST_MISMATCH)
+        })
+        .count() as u64;
+
     AssetsCard {
         latest_manifest_digest,
+        latest_bundle_digest,
         morphology_digest,
         channel_digest,
         synapse_digest,
         connectivity_digest,
+        total_asset_chunks: store.asset_bundle_store.total_chunks() as u64,
+        compression_none_count,
+        compression_zstd_count,
+        asset_digest_mismatch_count,
     }
 }
 
@@ -1637,7 +1713,9 @@ fn is_profile_node(store: &PvgsStore, digest: &NodeKey) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use assets::compute_asset_manifest_digest;
+    use assets::{
+        compute_asset_bundle_digest, compute_asset_chunk_digest, compute_asset_manifest_digest,
+    };
     use keys::KeyStore;
     use micro_evidence::compute_config_digest;
     use pev::PolicyEcologyDimension;
@@ -1650,9 +1728,10 @@ mod tests {
     use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
     use ucf_protocol::ucf::v1::{
-        AssetDigest, AssetKind, AssetManifest, ConsistencyFeedback, Digest32, DlpDecision,
-        GovernanceFrame, MacroMilestone, MacroMilestoneState, MagnitudeClass, MetabolicFrame,
-        MicroModule, MicrocircuitConfigEvidence, ReceiptStatus, RecordType, Ref, ReplayFidelity,
+        AssetBundle, AssetChunk, AssetDigest, AssetKind, AssetManifest, CompressionMode,
+        ConsistencyFeedback, Digest32, DlpDecision, GovernanceFrame, MacroMilestone,
+        MacroMilestoneState, MagnitudeClass, MetabolicFrame, MicroModule,
+        MicrocircuitConfigEvidence, ReceiptStatus, RecordType, Ref, ReplayFidelity,
         ReplayTargetKind, TraitDirection, TraitUpdate,
     };
     use vrf::VrfEngine;
@@ -1712,6 +1791,93 @@ mod tests {
             known_policy_versions,
             known_profiles,
         )
+    }
+
+    fn asset_bundle_payload(
+        created_at_ms: u64,
+        asset_seed: u8,
+    ) -> (AssetBundle, [u8; 32], [u8; 32]) {
+        let asset_digest = [asset_seed; 32];
+        let mut manifest = AssetManifest {
+            manifest_digest: Vec::new(),
+            created_at_ms,
+            asset_digests: vec![AssetDigest {
+                kind: AssetKind::Morphology as i32,
+                digest: asset_digest.to_vec(),
+                version: 1,
+            }],
+        };
+        let manifest_digest = compute_asset_manifest_digest(&manifest);
+        manifest.manifest_digest = manifest_digest.to_vec();
+
+        let chunk_payload_one = b"bundle-one".to_vec();
+        let chunk_payload_two = b"bundle-two".to_vec();
+        let chunk_one = AssetChunk {
+            asset_digest: asset_digest.to_vec(),
+            chunk_index: 0,
+            chunk_count: 2,
+            payload: chunk_payload_one.clone(),
+            chunk_digest: compute_asset_chunk_digest(&chunk_payload_one).to_vec(),
+            compression_mode: CompressionMode::None as i32,
+        };
+        let chunk_two = AssetChunk {
+            asset_digest: asset_digest.to_vec(),
+            chunk_index: 1,
+            chunk_count: 2,
+            payload: chunk_payload_two.clone(),
+            chunk_digest: compute_asset_chunk_digest(&chunk_payload_two).to_vec(),
+            compression_mode: CompressionMode::Zstd as i32,
+        };
+
+        let mut bundle = AssetBundle {
+            bundle_digest: Vec::new(),
+            created_at_ms,
+            manifest: Some(manifest),
+            chunks: vec![chunk_one, chunk_two],
+        };
+        let bundle_digest =
+            compute_asset_bundle_digest(bundle.manifest.as_ref().unwrap(), &bundle.chunks)
+                .expect("bundle digest computed");
+        bundle.bundle_digest = bundle_digest.to_vec();
+
+        (bundle, bundle_digest, asset_digest)
+    }
+
+    fn asset_bundle_request(store: &PvgsStore, bundle: &AssetBundle) -> PvgsCommitRequest {
+        PvgsCommitRequest {
+            commit_id: "asset-bundle-commit".to_string(),
+            commit_type: CommitType::AssetBundleAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: Vec::new(),
+            epoch_id: 1,
+            key_epoch: None,
+            experience_record_payload: None,
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: None,
+            microcircuit_config_payload: None,
+            asset_manifest_payload: None,
+            asset_bundle_payload: Some(bundle.encode_to_vec()),
+        }
     }
 
     fn trace_store(profile_digest: [u8; 32]) -> PvgsStore {
@@ -1866,6 +2032,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: Some(evidence.encode_to_vec()),
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -1923,6 +2090,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: Some(evidence.encode_to_vec()),
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -1988,6 +2156,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: Some(manifest.encode_to_vec()),
+            asset_bundle_payload: None,
         };
 
         let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -1996,6 +2165,45 @@ mod tests {
 
         let latest = get_latest_asset_manifest(&store).expect("latest manifest");
         assert_eq!(latest.manifest_digest, manifest_digest.to_vec());
+    }
+
+    #[test]
+    fn asset_bundle_commit_updates_scorecard_and_queries() {
+        let mut store = minimal_store();
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let (bundle, digest, asset_digest) = asset_bundle_payload(55, 9);
+
+        let req = asset_bundle_request(&store, &bundle);
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof_receipt.is_some());
+
+        let latest = get_latest_asset_bundle(&store).expect("latest bundle");
+        assert_eq!(latest.bundle_digest, digest.to_vec());
+        assert_eq!(
+            get_asset_bundle(&store, digest).unwrap().bundle_digest,
+            digest.to_vec()
+        );
+
+        let chunks = get_asset_chunks(&store, asset_digest);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].chunk_index < chunks[1].chunk_index);
+
+        let card = snapshot(&store, None).assets_card;
+        assert_eq!(card.latest_bundle_digest, Some(digest));
+        assert_eq!(card.total_asset_chunks, 2);
+        assert_eq!(card.compression_none_count, 1);
+        assert_eq!(card.compression_zstd_count, 1);
+
+        let mut tampered = bundle.clone();
+        tampered.chunks[0].payload = b"tampered".to_vec();
+        let bad_req = asset_bundle_request(&store, &tampered);
+        let (bad_receipt, _) = verify_and_commit(bad_req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(bad_receipt.status, ReceiptStatus::Rejected);
+
+        let card = snapshot(&store, None).assets_card;
+        assert_eq!(card.asset_digest_mismatch_count, 1);
     }
 
     fn dummy_proof_receipt(record_digest: [u8; 32]) -> ProofReceipt {
@@ -2472,6 +2680,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -3038,6 +3247,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, _) = verify_and_commit(req, store, keystore, vrf_engine);
@@ -3123,6 +3333,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, _) = verify_and_commit(req, store, keystore, vrf_engine);
