@@ -1394,6 +1394,7 @@ impl PvgsStore {
 
         let mut lc_digests = Vec::new();
         let mut sn_digests = Vec::new();
+        let mut plasticity_digests = Vec::new();
         let mut lc_config_digests = Vec::new();
         let mut sn_config_digests = Vec::new();
 
@@ -1403,6 +1404,9 @@ impl PvgsStore {
             }
             if let Some(digest) = micro_digest_from_ref(reference, "mc:sn") {
                 sn_digests.push(digest);
+            }
+            if let Some(digest) = micro_digest_from_ref(reference, "mc_snap:plasticity") {
+                plasticity_digests.push(digest);
             }
             if let Some(digest) = micro_digest_from_ref(reference, "mc_cfg:lc") {
                 lc_config_digests.push(digest);
@@ -1415,6 +1419,7 @@ impl PvgsStore {
         for digest in lc_digests
             .into_iter()
             .chain(sn_digests)
+            .chain(plasticity_digests)
             .chain(lc_config_digests)
             .chain(sn_config_digests)
         {
@@ -6972,6 +6977,41 @@ mod tests {
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
         }
+    }
+
+    #[test]
+    fn experience_record_adds_plasticity_reference_edge() {
+        let prev = [2u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(7);
+        let vrf_engine = VrfEngine::new_dev(7);
+        let plasticity_digest = [11u8; 32];
+        let record = replay_record(
+            vec![Ref {
+                id: format!("mc_snap:plasticity:{}", hex::encode(plasticity_digest)),
+            }],
+            None,
+        );
+        let req = make_experience_request_with_id(
+            &record,
+            &store,
+            keystore.current_epoch(),
+            "exp-plasticity",
+        );
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        let record_digest = store.experience_store.head_record_digest;
+        let has_edge =
+            store
+                .causal_graph
+                .neighbors(record_digest)
+                .iter()
+                .any(|(edge, neighbor)| {
+                    matches!(edge, EdgeType::References) && *neighbor == plasticity_digest
+                });
+        assert!(has_edge);
     }
 
     #[test]

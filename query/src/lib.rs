@@ -17,7 +17,7 @@ use std::convert::TryFrom;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{
     AssetKind, AssetManifest, ConsistencyFeedback, DlpDecisionForm, ExperienceRecord, MicroModule,
-    MicrocircuitConfigEvidence, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes,
+    MicrocircuitConfigEvidence, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes, RecordType,
     RecoveryCase as ProtoRecoveryCase, RecoveryCheck as ProtoRecoveryCheck,
     RecoveryState as ProtoRecoveryState, ReplayPlan, ToolOnboardingEvent, ToolOnboardingStage,
 };
@@ -54,6 +54,7 @@ pub struct TraceResult {
     pub path: Vec<NodeKey>,
     pub micro_snapshots_lc: Vec<[u8; 32]>,
     pub micro_snapshots_sn: Vec<[u8; 32]>,
+    pub plasticity_snapshots: Vec<[u8; 32]>,
     pub micro_configs_lc: Vec<[u8; 32]>,
     pub micro_configs_sn: Vec<[u8; 32]>,
     pub micro_evidence: MicroEvidenceSummary,
@@ -75,6 +76,7 @@ pub struct RecordTrace {
     pub referenced_by: Vec<NodeKey>,
     pub dlp_decisions: Vec<NodeKey>,
     pub micro_evidence: MicroEvidenceSummary,
+    pub plasticity_snapshots: Vec<[u8; 32]>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -148,6 +150,7 @@ pub struct PvgsSnapshot {
     pub unlock_permit_digest: Option<[u8; 32]>,
     pub unlock_readiness_hint: Option<String>,
     pub micro_card: MicroCard,
+    pub plasticity_card: PlasticityCard,
     pub assets_card: AssetsCard,
 }
 
@@ -175,6 +178,10 @@ pub struct AssetsCard {
 const MAX_MACRO_VECTOR_ITEMS: usize = 64;
 const MAX_CBV_SCAN: usize = 32;
 const MAX_ASSET_MANIFESTS: usize = 128;
+const MAX_PLASTICITY_EVIDENCE: usize = 128;
+const MAX_PLASTICITY_SCORECARD_DIGESTS: usize = 128;
+const MAX_PLASTICITY_SCORECARD_LIST: usize = 5;
+const PLASTICITY_SCORECARD_WINDOW: usize = 1000;
 
 pub trait QueryInspector {
     fn fetch(&self, request: QueryRequest) -> Result<QueryResult, QueryError>;
@@ -498,6 +505,7 @@ pub fn snapshot(store: &PvgsStore, session_id: Option<&str>) -> PvgsSnapshot {
             .map(|session| unlock_readiness_hint(store, session))
             .filter(|hint| hint != "NONE"),
         micro_card: micro_card_from_store(store),
+        plasticity_card: plasticity_card_from_store(store),
         assets_card: assets_card_from_store(store),
     }
 }
@@ -541,6 +549,59 @@ fn assets_card_from_store(store: &PvgsStore) -> AssetsCard {
         channel_digest,
         synapse_digest,
         connectivity_digest,
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlasticityCard {
+    pub learning_evidence_record_count: u64,
+    pub latest_plasticity_snapshot_digest: Option<[u8; 32]>,
+    pub unique_plasticity_snapshot_count: u64,
+    pub last_plasticity_digests: Vec<[u8; 32]>,
+}
+
+fn plasticity_card_from_store(store: &PvgsStore) -> PlasticityCard {
+    let start = store
+        .experience_store
+        .records
+        .len()
+        .saturating_sub(PLASTICITY_SCORECARD_WINDOW);
+    let mut evidence_records = 0u64;
+    let mut latest_digest = None;
+    let mut unique_digests = BTreeSet::new();
+
+    for record in store.experience_store.records.iter().skip(start) {
+        let mut record_has_evidence = false;
+        if let Some(gov) = &record.governance_frame {
+            for reference in &gov.policy_decision_refs {
+                if let Some(digest) = digest_from_labeled_ref(reference, "mc_snap:plasticity") {
+                    record_has_evidence = true;
+                    latest_digest = Some(digest);
+                    unique_digests.insert(digest);
+                }
+            }
+        }
+
+        if record_has_evidence {
+            evidence_records = evidence_records.saturating_add(1);
+        }
+    }
+
+    let mut digests: Vec<[u8; 32]> = unique_digests.into_iter().collect();
+    digests.truncate(MAX_PLASTICITY_SCORECARD_DIGESTS);
+    let unique_count = digests.len() as u64;
+    let last_plasticity_digests = digests
+        .iter()
+        .copied()
+        .take(MAX_PLASTICITY_SCORECARD_LIST)
+        .collect();
+
+    PlasticityCard {
+        learning_evidence_record_count: evidence_records,
+        latest_plasticity_snapshot_digest: latest_digest,
+        unique_plasticity_snapshot_count: unique_count,
+        last_plasticity_digests,
     }
 }
 
@@ -998,6 +1059,7 @@ pub fn trace_action(store: &PvgsStore, action_digest: [u8; 32]) -> TraceResult {
     }
 
     let micro_evidence = collect_micro_evidence_from_records(store, &records);
+    let plasticity_snapshots = collect_plasticity_snapshots_from_records(store, &records);
 
     TraceResult {
         receipts: receipts.into_iter().collect(),
@@ -1007,6 +1069,7 @@ pub fn trace_action(store: &PvgsStore, action_digest: [u8; 32]) -> TraceResult {
         path,
         micro_snapshots_lc: micro_evidence.lc_snapshots.clone(),
         micro_snapshots_sn: micro_evidence.sn_snapshots.clone(),
+        plasticity_snapshots,
         micro_configs_lc: micro_evidence.lc_configs.clone(),
         micro_configs_sn: micro_evidence.sn_configs.clone(),
         micro_evidence,
@@ -1019,6 +1082,7 @@ pub fn trace_record(store: &PvgsStore, record_digest: [u8; 32]) -> RecordTrace {
     let mut referenced_by = BTreeSet::new();
     let mut dlp_decisions = BTreeSet::new();
     let mut micro_evidence = MicroEvidenceSummary::default();
+    let mut plasticity_snapshots = Vec::new();
 
     for (edge, neighbor) in sorted_edges(store.causal_graph.neighbors(record_digest)) {
         if matches!(edge, EdgeType::References) {
@@ -1037,6 +1101,7 @@ pub fn trace_record(store: &PvgsStore, record_digest: [u8; 32]) -> RecordTrace {
             dlp_decisions.insert(digest);
         }
         micro_evidence = micro_evidence_from_record(record);
+        plasticity_snapshots = plasticity_snapshots_from_record(record);
     }
 
     RecordTrace {
@@ -1044,6 +1109,7 @@ pub fn trace_record(store: &PvgsStore, record_digest: [u8; 32]) -> RecordTrace {
         referenced_by: referenced_by.into_iter().collect(),
         dlp_decisions: dlp_decisions.into_iter().collect(),
         micro_evidence,
+        plasticity_snapshots,
     }
 }
 
@@ -1088,6 +1154,45 @@ pub fn list_microcircuit_evidence(store: &PvgsStore, session_id: &str) -> MicroE
     }
 
     micro_evidence_from_sets(lc_snapshots, sn_snapshots, lc_configs, sn_configs)
+}
+
+/// List plasticity evidence digests for a session in deterministic order.
+pub fn list_plasticity_evidence(store: &PvgsStore, session_id: &str) -> Vec<[u8; 32]> {
+    let mut record_digests: Vec<[u8; 32]> = store
+        .sep_log
+        .events
+        .iter()
+        .filter(|event| event.session_id == session_id)
+        .filter(|event| matches!(event.event_type, SepEventType::EvAgentStep))
+        .map(|event| event.object_digest)
+        .collect();
+
+    record_digests.sort();
+    record_digests.dedup();
+
+    let mut digests = BTreeSet::new();
+
+    for digest in record_digests {
+        if let Some(record) = find_record(store, digest) {
+            let record_type =
+                RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified);
+            if !matches!(record_type, RecordType::RtReplay | RecordType::RtActionExec) {
+                continue;
+            }
+            if let Some(gov) = &record.governance_frame {
+                for reference in &gov.policy_decision_refs {
+                    if let Some(snapshot) = digest_from_labeled_ref(reference, "mc_snap:plasticity")
+                    {
+                        digests.insert(snapshot);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut snapshots: Vec<[u8; 32]> = digests.into_iter().collect();
+    snapshots.truncate(MAX_PLASTICITY_EVIDENCE);
+    snapshots
 }
 
 /// List export attempts for a session in deterministic order.
@@ -1311,6 +1416,20 @@ fn micro_evidence_from_record(record: &ExperienceRecord) -> MicroEvidenceSummary
     micro_evidence_from_sets(lc_snapshots, sn_snapshots, lc_configs, sn_configs)
 }
 
+fn plasticity_snapshots_from_record(record: &ExperienceRecord) -> Vec<[u8; 32]> {
+    let mut digests = BTreeSet::new();
+
+    if let Some(gov) = &record.governance_frame {
+        for reference in &gov.policy_decision_refs {
+            if let Some(digest) = digest_from_labeled_ref(reference, "mc_snap:plasticity") {
+                digests.insert(digest);
+            }
+        }
+    }
+
+    plasticity_snapshots_from_sets(digests)
+}
+
 fn collect_micro_evidence_from_records(
     store: &PvgsStore,
     records: &BTreeSet<[u8; 32]>,
@@ -1344,6 +1463,27 @@ fn collect_micro_evidence_from_records(
     micro_evidence_from_sets(lc_snapshots, sn_snapshots, lc_configs, sn_configs)
 }
 
+fn collect_plasticity_snapshots_from_records(
+    store: &PvgsStore,
+    records: &BTreeSet<[u8; 32]>,
+) -> Vec<[u8; 32]> {
+    let mut digests = BTreeSet::new();
+
+    for record_digest in records {
+        if let Some(record) = find_record(store, *record_digest) {
+            if let Some(gov) = &record.governance_frame {
+                for reference in &gov.policy_decision_refs {
+                    if let Some(digest) = digest_from_labeled_ref(reference, "mc_snap:plasticity") {
+                        digests.insert(digest);
+                    }
+                }
+            }
+        }
+    }
+
+    plasticity_snapshots_from_sets(digests)
+}
+
 fn micro_evidence_from_sets(
     lc_snapshots: BTreeSet<[u8; 32]>,
     sn_snapshots: BTreeSet<[u8; 32]>,
@@ -1366,6 +1506,12 @@ fn micro_evidence_from_sets(
         lc_configs,
         sn_configs,
     }
+}
+
+fn plasticity_snapshots_from_sets(digests: BTreeSet<[u8; 32]>) -> Vec<[u8; 32]> {
+    let mut snapshots: Vec<[u8; 32]> = digests.into_iter().collect();
+    snapshots.truncate(MAX_PLASTICITY_EVIDENCE);
+    snapshots
 }
 
 fn digest_from_labeled_ref(
@@ -2184,6 +2330,7 @@ mod tests {
             vec![action, receipt, decision, record, profile]
         );
         assert_eq!(result.micro_evidence, MicroEvidenceSummary::default());
+        assert!(result.plasticity_snapshots.is_empty());
     }
 
     #[test]
@@ -2246,6 +2393,10 @@ mod tests {
         assert_eq!(result_one.profiles, result_two.profiles);
         assert_eq!(result_one.path, result_two.path);
         assert_eq!(result_one.micro_evidence, result_two.micro_evidence);
+        assert_eq!(
+            result_one.plasticity_snapshots,
+            result_two.plasticity_snapshots
+        );
     }
 
     #[test]
@@ -2331,6 +2482,7 @@ mod tests {
 
         assert_eq!(trace.dlp_decisions, vec![dlp_digest]);
         assert_eq!(trace.micro_evidence, MicroEvidenceSummary::default());
+        assert!(trace.plasticity_snapshots.is_empty());
     }
 
     #[test]
@@ -2383,6 +2535,35 @@ mod tests {
         assert_eq!(trace.micro_evidence.sn_snapshots, vec![sn_digest]);
         assert_eq!(trace.micro_evidence.lc_configs, vec![lc_config_digest]);
         assert_eq!(trace.micro_evidence.sn_configs, vec![sn_config_digest]);
+        assert!(trace.plasticity_snapshots.is_empty());
+    }
+
+    #[test]
+    fn trace_record_includes_plasticity_snapshot() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+
+        let plasticity_digest = [5u8; 32];
+        let refs = vec![micro_ref("mc_snap:plasticity", plasticity_digest)];
+
+        let record_digest =
+            append_decision_record_with_refs(&mut store, &keystore, &vrf_engine, "session", refs);
+
+        let trace = trace_record(&store, record_digest);
+        assert_eq!(trace.plasticity_snapshots, vec![plasticity_digest]);
     }
 
     #[test]
@@ -2482,6 +2663,84 @@ mod tests {
             trace.micro_evidence.sn_configs,
             vec![sn_config_first, sn_config_second]
         );
+        assert!(trace.plasticity_snapshots.is_empty());
+    }
+
+    #[test]
+    fn trace_action_collects_plasticity_snapshots() {
+        let action = [21u8; 32];
+        let receipt = [22u8; 32];
+        let profile = [23u8; 32];
+        let plasticity_first = [3u8; 32];
+        let plasticity_second = [2u8; 32];
+
+        let mut store = trace_store(profile);
+
+        let record_one = ExperienceRecord {
+            record_type: RecordType::RtActionExec as i32,
+            core_frame: None,
+            metabolic_frame: None,
+            governance_frame: Some(GovernanceFrame {
+                policy_decision_refs: vec![micro_ref("mc_snap:plasticity", plasticity_first)],
+                pvgs_receipt_ref: None,
+                dlp_refs: Vec::new(),
+            }),
+            core_frame_ref: None,
+            metabolic_frame_ref: None,
+            governance_frame_ref: Some(Ref {
+                id: hex::encode([11u8; 32]),
+            }),
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        };
+
+        let record_two = ExperienceRecord {
+            record_type: RecordType::RtActionExec as i32,
+            core_frame: None,
+            metabolic_frame: None,
+            governance_frame: Some(GovernanceFrame {
+                policy_decision_refs: vec![micro_ref("mc_snap:plasticity", plasticity_second)],
+                pvgs_receipt_ref: None,
+                dlp_refs: Vec::new(),
+            }),
+            core_frame_ref: None,
+            metabolic_frame_ref: None,
+            governance_frame_ref: Some(Ref {
+                id: hex::encode([12u8; 32]),
+            }),
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        };
+
+        let record_one_digest = compute_experience_record_digest(&record_one);
+        let record_two_digest = compute_experience_record_digest(&record_two);
+
+        store.experience_store.records.push(record_one);
+        store.experience_store.records.push(record_two);
+        store
+            .experience_store
+            .proof_receipts
+            .insert(record_one_digest, dummy_proof_receipt(record_one_digest));
+        store
+            .experience_store
+            .proof_receipts
+            .insert(record_two_digest, dummy_proof_receipt(record_two_digest));
+
+        store
+            .causal_graph
+            .add_edge(action, EdgeType::Authorizes, receipt, None);
+        store
+            .causal_graph
+            .add_edge(record_one_digest, EdgeType::References, action, None);
+        store
+            .causal_graph
+            .add_edge(record_two_digest, EdgeType::References, action, None);
+
+        let trace = trace_action(&store, action);
+        assert_eq!(
+            trace.plasticity_snapshots,
+            vec![plasticity_second, plasticity_first]
+        );
     }
 
     #[test]
@@ -2523,6 +2782,112 @@ mod tests {
         assert_eq!(summary.lc_configs.last().copied(), Some([31u8; 32]));
         assert!(summary.sn_snapshots.is_empty());
         assert!(summary.sn_configs.is_empty());
+    }
+
+    #[test]
+    fn list_plasticity_evidence_filters_record_types() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+
+        let plasticity_first = [2u8; 32];
+        let plasticity_second = [1u8; 32];
+        let session_id = "session-plasticity";
+
+        append_record_with_refs_and_type(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            session_id,
+            RecordType::RtReplay,
+            vec![micro_ref("mc_snap:plasticity", plasticity_first)],
+        );
+        append_record_with_refs_and_type(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            session_id,
+            RecordType::RtActionExec,
+            vec![micro_ref("mc_snap:plasticity", plasticity_second)],
+        );
+        append_record_with_refs_and_type(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            session_id,
+            RecordType::RtDecision,
+            vec![micro_ref("mc_snap:plasticity", [9u8; 32])],
+        );
+
+        let snapshots = list_plasticity_evidence(&store, session_id);
+        assert_eq!(snapshots, vec![plasticity_second, plasticity_first]);
+    }
+
+    #[test]
+    fn plasticity_scorecard_tracks_latest_digest() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+
+        let first = [4u8; 32];
+        let second = [8u8; 32];
+
+        append_record_with_refs_and_type(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            "plasticity-1",
+            RecordType::RtDecision,
+            vec![micro_ref("mc_snap:plasticity", first)],
+        );
+        append_record_with_refs_and_type(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            "plasticity-2",
+            RecordType::RtReplay,
+            Vec::new(),
+        );
+        append_record_with_refs_and_type(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            "plasticity-3",
+            RecordType::RtDecision,
+            vec![micro_ref("mc_snap:plasticity", second)],
+        );
+
+        let snapshot = snapshot(&store, Some("plasticity-3"));
+        let card = snapshot.plasticity_card;
+
+        assert_eq!(card.learning_evidence_record_count, 2);
+        assert_eq!(card.latest_plasticity_snapshot_digest, Some(second));
+        assert_eq!(card.unique_plasticity_snapshot_count, 2);
+        assert_eq!(card.last_plasticity_digests, vec![first, second]);
     }
 
     #[test]
@@ -2688,6 +3053,24 @@ mod tests {
         commit_id: &str,
         related_refs: Vec<Ref>,
     ) -> [u8; 32] {
+        append_record_with_refs_and_type(
+            store,
+            keystore,
+            vrf_engine,
+            commit_id,
+            RecordType::RtDecision,
+            related_refs,
+        )
+    }
+
+    fn append_record_with_refs_and_type(
+        store: &mut PvgsStore,
+        keystore: &KeyStore,
+        vrf_engine: &VrfEngine,
+        commit_id: &str,
+        record_type: RecordType,
+        related_refs: Vec<Ref>,
+    ) -> [u8; 32] {
         let governance_frame = GovernanceFrame {
             policy_decision_refs: related_refs,
             pvgs_receipt_ref: None,
@@ -2695,7 +3078,7 @@ mod tests {
         };
 
         let record = ExperienceRecord {
-            record_type: RecordType::RtDecision as i32,
+            record_type: record_type as i32,
             core_frame: None,
             metabolic_frame: None,
             governance_frame: Some(governance_frame),
