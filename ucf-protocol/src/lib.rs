@@ -58,6 +58,7 @@ pub mod ucf {
             ReplayPlanAppend,
             MicrocircuitConfigAppend,
             AssetManifestAppend,
+            AssetBundleAppend,
         }
 
         /// Required receipt classes for PVGS commits.
@@ -388,6 +389,45 @@ pub mod ucf {
             pub asset_digests: Vec<AssetDigest>,
         }
 
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum CompressionMode {
+            Unspecified = 0,
+            None = 1,
+            Zstd = 2,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct AssetChunk {
+            #[prost(bytes = "vec", tag = "1")]
+            pub asset_digest: Vec<u8>,
+            #[prost(uint32, tag = "2")]
+            pub chunk_index: u32,
+            #[prost(uint32, tag = "3")]
+            pub chunk_count: u32,
+            #[prost(bytes = "vec", tag = "4")]
+            pub payload: Vec<u8>,
+            #[prost(bytes = "vec", tag = "5")]
+            pub chunk_digest: Vec<u8>,
+            #[prost(enumeration = "CompressionMode", tag = "6")]
+            pub compression_mode: i32,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct AssetBundle {
+            #[prost(bytes = "vec", tag = "1")]
+            pub bundle_digest: Vec<u8>,
+            #[prost(uint64, tag = "2")]
+            pub created_at_ms: u64,
+            #[prost(message, optional, tag = "3")]
+            pub manifest: Option<AssetManifest>,
+            #[prost(message, repeated, tag = "4")]
+            pub chunks: Vec<AssetChunk>,
+        }
+
         /// Control frame emitted by the engine with overlays and reasons.
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
         #[derive(Clone, Debug, PartialEq, Eq)]
@@ -455,6 +495,8 @@ pub mod ucf {
             pub const GV_MICROCIRCUIT_CONFIG_APPENDED: &'static str =
                 "RC.GV.MICROCIRCUIT.CONFIG_APPENDED";
             pub const GV_ASSET_MANIFEST_APPENDED: &'static str = "RC.GV.ASSET.MANIFEST_APPENDED";
+            pub const GV_ASSET_BUNDLE_APPENDED: &'static str = "RC.GV.ASSET.BUNDLE_APPENDED";
+            pub const GV_ASSET_DIGEST_MISMATCH: &'static str = "RC.GV.ASSET.DIGEST_MISMATCH";
             pub const GV_RECOVERY_CREATED: &'static str = "RC.GV.RECOVERY.CREATED";
             pub const GV_RECOVERY_ADVANCED: &'static str = "RC.GV.RECOVERY.ADVANCED";
             pub const GV_RECOVERY_UNLOCK_GRANTED: &'static str = "RC.GV.RECOVERY.UNLOCK_GRANTED";

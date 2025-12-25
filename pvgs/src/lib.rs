@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use assets::{compute_asset_manifest_digest, validate_manifest, AssetManifestStore};
+use assets::{
+    compute_asset_bundle_digest, compute_asset_chunk_digest, compute_asset_manifest_digest,
+    validate_manifest, AssetBundleStore, AssetBundleStoreError, AssetManifestStore,
+};
 use blake3::Hasher;
 use cbv::{
     cbv_attestation_preimage, compute_cbv_digest, compute_cbv_verified_fields_digest,
@@ -36,11 +39,12 @@ use tool_events::{
 };
 use tool_registry_state::{ToolRegistryError, ToolRegistryState};
 use ucf_protocol::ucf::v1::{
-    self as protocol, AssetManifest, CharacterBaselineVector, ConsistencyFeedback, Digest32,
-    DlpDecision, DlpDecisionForm, ExperienceRecord, FinalizationHeader, MacroMilestone,
-    MacroMilestoneState, MicroModule, MicrocircuitConfigEvidence, PVGSKeyEpoch, PVGSReceipt,
-    ProofReceipt, ReasonCodes, ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayPlan,
-    ReplayTargetKind, ToolOnboardingEvent, ToolOnboardingStage, ToolRegistryContainer,
+    self as protocol, AssetBundle, AssetKind, AssetManifest, CharacterBaselineVector,
+    ConsistencyFeedback, Digest32, DlpDecision, DlpDecisionForm, ExperienceRecord,
+    FinalizationHeader, MacroMilestone, MacroMilestoneState, MicroModule,
+    MicrocircuitConfigEvidence, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes,
+    ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayPlan, ReplayTargetKind,
+    ToolOnboardingEvent, ToolOnboardingStage, ToolRegistryContainer,
 };
 use vrf::VrfEngine;
 
@@ -77,6 +81,7 @@ pub enum CommitType {
     ReplayPlanAppend,
     MicrocircuitConfigAppend,
     AssetManifestAppend,
+    AssetBundleAppend,
 }
 
 /// Required checks requested by the caller.
@@ -316,6 +321,7 @@ pub struct PvgsCommitRequest {
     pub tool_onboarding_event: Option<Vec<u8>>,
     pub microcircuit_config_payload: Option<Vec<u8>>,
     pub asset_manifest_payload: Option<Vec<u8>>,
+    pub asset_bundle_payload: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -614,6 +620,7 @@ pub struct PvgsStore {
     pub tool_registry_state: ToolRegistryState,
     pub micro_config_store: MicroConfigStore,
     pub asset_manifest_store: AssetManifestStore,
+    pub asset_bundle_store: AssetBundleStore,
     pub micro_milestones: MicroMilestoneStore,
     pub meso_milestones: MesoMilestoneStore,
     pub meso_deriver: MesoDeriver,
@@ -740,6 +747,7 @@ impl<'a> PvgsPlanner<'a> {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, _) = verify_and_commit(req, self.store, self.keystore, self.vrf_engine);
@@ -838,6 +846,7 @@ impl PvgsStore {
             tool_registry_state: ToolRegistryState::default(),
             micro_config_store: MicroConfigStore::default(),
             asset_manifest_store: AssetManifestStore::default(),
+            asset_bundle_store: AssetBundleStore::default(),
             micro_milestones: MicroMilestoneStore::default(),
             meso_milestones: MesoMilestoneStore::default(),
             meso_deriver: MesoDeriver::new_beta(),
@@ -1636,6 +1645,7 @@ impl PvgsStore {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, _proof) = verify_meso_milestone_append(req, self, keystore, vrf_engine);
@@ -1696,6 +1706,7 @@ impl PvgsStore {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (proposal_receipt, _) =
@@ -1773,6 +1784,7 @@ impl PvgsStore {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, _) =
@@ -2249,6 +2261,7 @@ fn event_type_for_commit(
         CommitType::MacroMilestoneFinalize => SepEventType::EvRecoveryGov,
         CommitType::MicrocircuitConfigAppend => SepEventType::EvRecoveryGov,
         CommitType::AssetManifestAppend => SepEventType::EvRecoveryGov,
+        CommitType::AssetBundleAppend => SepEventType::EvRecoveryGov,
         CommitType::FrameEvidenceAppend => match frame_kind {
             Some(FrameEventKind::ControlFrame) => SepEventType::EvControlFrame,
             Some(FrameEventKind::SignalFrame) => SepEventType::EvSignalFrame,
@@ -2480,6 +2493,10 @@ pub fn verify_and_commit(
 
     if req.commit_type == CommitType::AssetManifestAppend {
         return verify_asset_manifest_append(req, store, keystore);
+    }
+
+    if req.commit_type == CommitType::AssetBundleAppend {
+        return verify_asset_bundle_append(req, store, keystore);
     }
 
     if req.commit_type == CommitType::RecoveryCaseCreate {
@@ -4624,6 +4641,251 @@ fn verify_asset_manifest_append(
     (receipt, Some(proof_receipt))
 }
 
+fn verify_asset_bundle_append(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let payload = match req.asset_bundle_payload.take() {
+        Some(payload) => payload,
+        None => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let bundle = match AssetBundle::decode(payload.as_slice()) {
+        Ok(bundle) => bundle,
+        Err(_) => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let bundle_digest = digest_from_bytes(&bundle.bundle_digest);
+    if req.payload_digests.is_empty() {
+        if let Some(digest) = bundle_digest {
+            req.payload_digests = vec![digest];
+        }
+    }
+
+    let receipt_input = to_receipt_input(&req);
+    let mut reject_reason_codes = Vec::new();
+    let mut integrity_failed = false;
+    let mut schema_failed = false;
+
+    if bundle_digest.is_none() {
+        schema_failed = true;
+    }
+
+    let manifest = bundle.manifest.as_ref();
+    if manifest.is_none() {
+        schema_failed = true;
+    }
+
+    if let Some(manifest) = manifest {
+        if !manifest.manifest_digest.is_empty() {
+            if let Some(manifest_digest) = digest_from_bytes(&manifest.manifest_digest) {
+                if compute_asset_manifest_digest(manifest) != manifest_digest {
+                    integrity_failed = true;
+                }
+            } else {
+                schema_failed = true;
+            }
+            if validate_manifest(manifest).is_err() {
+                schema_failed = true;
+            }
+        } else {
+            for asset in &manifest.asset_digests {
+                let kind = AssetKind::try_from(asset.kind).unwrap_or(AssetKind::Unspecified);
+                if kind == AssetKind::Unspecified || asset.digest.len() != 32 || asset.version == 0
+                {
+                    schema_failed = true;
+                }
+            }
+        }
+    }
+
+    let mut chunk_counts: HashMap<[u8; 32], u32> = HashMap::new();
+    for chunk in &bundle.chunks {
+        let asset_digest = match digest_from_bytes(&chunk.asset_digest) {
+            Some(digest) => digest,
+            None => {
+                schema_failed = true;
+                continue;
+            }
+        };
+        let chunk_digest = match digest_from_bytes(&chunk.chunk_digest) {
+            Some(digest) => digest,
+            None => {
+                schema_failed = true;
+                continue;
+            }
+        };
+        let recomputed_chunk_digest = compute_asset_chunk_digest(&chunk.payload);
+        if chunk_digest != recomputed_chunk_digest {
+            integrity_failed = true;
+        }
+        if chunk.chunk_count == 0 || chunk.chunk_index >= chunk.chunk_count {
+            integrity_failed = true;
+        }
+        if let Some(existing) = chunk_counts.insert(asset_digest, chunk.chunk_count) {
+            if existing != chunk.chunk_count {
+                integrity_failed = true;
+            }
+        }
+    }
+
+    let recomputed_bundle_digest =
+        manifest.and_then(|manifest| compute_asset_bundle_digest(manifest, &bundle.chunks));
+    if let Some(digest) = bundle_digest {
+        if recomputed_bundle_digest != Some(digest) {
+            integrity_failed = true;
+        }
+
+        if req.payload_digests.len() != 1 || req.payload_digests[0] != digest {
+            schema_failed = true;
+        }
+    } else {
+        integrity_failed = true;
+    }
+
+    if req.epoch_id != keystore.current_epoch() {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+    }
+
+    if req.bindings.prev_record_digest != store.current_head_record_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+    }
+
+    if !req
+        .required_checks
+        .iter()
+        .any(|check| matches!(check, RequiredCheck::SchemaOk))
+    {
+        schema_failed = true;
+    }
+
+    if !store
+        .known_charter_versions
+        .contains(&req.bindings.charter_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_CHARTER_SCOPE.to_string());
+    }
+
+    if !store
+        .known_policy_versions
+        .contains(&req.bindings.policy_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_INTEGRITY_REQUIRED.to_string());
+    }
+
+    if schema_failed {
+        let schema_code = protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string();
+        if !reject_reason_codes.contains(&schema_code) {
+            reject_reason_codes.push(schema_code);
+        }
+    }
+
+    if integrity_failed {
+        let integrity_code = protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string();
+        if !reject_reason_codes.contains(&integrity_code) {
+            reject_reason_codes.push(integrity_code);
+        }
+        reject_reason_codes.push(protocol::ReasonCodes::GV_ASSET_DIGEST_MISMATCH.to_string());
+    }
+
+    if !reject_reason_codes.is_empty() {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: bundle_digest,
+            event_reason_codes: None,
+        });
+    }
+
+    let payload_digest = bundle_digest.expect("validated bundle digest");
+    if let Err(err) = store.asset_bundle_store.insert(bundle) {
+        let reject_reason_codes = match err {
+            AssetBundleStoreError::TooManyBundles | AssetBundleStoreError::TooManyChunks => {
+                vec![protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()]
+            }
+            AssetBundleStoreError::InvalidBundleDigest
+            | AssetBundleStoreError::InvalidAssetDigest => {
+                vec![protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()]
+            }
+        };
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(payload_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    let verified_fields_digest =
+        compute_verified_fields_digest(&req.bindings, req.required_receipt_kind);
+    let mut proof_receipt = issue_proof_receipt(
+        store.ruleset_state.ruleset_digest,
+        verified_fields_digest,
+        [0u8; 32],
+        keystore,
+    );
+    let receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        Vec::new(),
+        keystore,
+    );
+    proof_receipt.receipt_digest = receipt.receipt_digest.clone();
+
+    store.add_receipt_edges(&receipt);
+    store.committed_payload_digests.insert(payload_digest);
+
+    let _ = store.record_sep_event(
+        &req.commit_id,
+        SepEventType::EvRecoveryGov,
+        payload_digest,
+        vec![protocol::ReasonCodes::GV_ASSET_BUNDLE_APPENDED.to_string()],
+    );
+
+    (receipt, Some(proof_receipt))
+}
+
 fn verify_tool_event_append(
     mut req: PvgsCommitRequest,
     store: &mut PvgsStore,
@@ -5694,6 +5956,7 @@ impl From<CommitType> for protocol::CommitType {
             CommitType::ReplayPlanAppend => protocol::CommitType::ReplayPlanAppend,
             CommitType::MicrocircuitConfigAppend => protocol::CommitType::MicrocircuitConfigAppend,
             CommitType::AssetManifestAppend => protocol::CommitType::AssetManifestAppend,
+            CommitType::AssetBundleAppend => protocol::CommitType::AssetBundleAppend,
         }
     }
 }
@@ -5729,7 +5992,9 @@ impl From<&CommitBindings> for protocol::CommitBindings {
 mod tests {
     use super::UnlockPermit;
     use super::*;
-    use assets::compute_asset_manifest_digest;
+    use assets::{
+        compute_asset_bundle_digest, compute_asset_chunk_digest, compute_asset_manifest_digest,
+    };
     use micro_evidence::compute_config_digest;
     use milestones::{
         derive_micro_from_experience_window, ExperienceRange, MicroMilestone, MicroMilestoneState,
@@ -5741,10 +6006,11 @@ mod tests {
     use recovery::{RecoveryCase, RecoveryCheck, RecoveryState};
     use sep::{EdgeType, SepEventType};
     use ucf_protocol::ucf::v1::{
-        AssetDigest, AssetKind, AssetManifest, ConsistencyFeedback, CoreFrame, GovernanceFrame,
-        MacroMilestone, MacroMilestoneState, MagnitudeClass, MetabolicFrame, MicroModule,
-        MicrocircuitConfigEvidence, PolicyEcologyDimension, PolicyEcologyVector, RecordType, Ref,
-        ReplayTargetKind, ToolOnboardingEvent, ToolOnboardingStage, TraitDirection, TraitUpdate,
+        AssetBundle, AssetChunk, AssetDigest, AssetKind, AssetManifest, CompressionMode,
+        ConsistencyFeedback, CoreFrame, GovernanceFrame, MacroMilestone, MacroMilestoneState,
+        MagnitudeClass, MetabolicFrame, MicroModule, MicrocircuitConfigEvidence,
+        PolicyEcologyDimension, PolicyEcologyVector, RecordType, Ref, ReplayTargetKind,
+        ToolOnboardingEvent, ToolOnboardingStage, TraitDirection, TraitUpdate,
     };
     use vrf::VrfEngine;
 
@@ -5799,6 +6065,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         }
     }
 
@@ -5856,6 +6123,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         }
     }
 
@@ -5907,6 +6175,7 @@ mod tests {
                 tool_onboarding_event: None,
                 microcircuit_config_payload: None,
                 asset_manifest_payload: None,
+                asset_bundle_payload: None,
             },
             epoch,
         )
@@ -6067,6 +6336,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         }
     }
 
@@ -6155,6 +6425,95 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: Some(payload),
+            asset_bundle_payload: None,
+        }
+    }
+
+    fn asset_bundle_payload(
+        created_at_ms: u64,
+        asset_seed: u8,
+    ) -> (AssetBundle, [u8; 32], [u8; 32]) {
+        let asset_digest = [asset_seed; 32];
+        let mut manifest = AssetManifest {
+            manifest_digest: Vec::new(),
+            created_at_ms,
+            asset_digests: vec![AssetDigest {
+                kind: AssetKind::Morphology as i32,
+                digest: asset_digest.to_vec(),
+                version: 1,
+            }],
+        };
+        let manifest_digest = compute_asset_manifest_digest(&manifest);
+        manifest.manifest_digest = manifest_digest.to_vec();
+
+        let chunk_payload_one = b"chunk-one".to_vec();
+        let chunk_payload_two = b"chunk-two".to_vec();
+        let chunk_one = AssetChunk {
+            asset_digest: asset_digest.to_vec(),
+            chunk_index: 0,
+            chunk_count: 2,
+            payload: chunk_payload_one.clone(),
+            chunk_digest: compute_asset_chunk_digest(&chunk_payload_one).to_vec(),
+            compression_mode: CompressionMode::None as i32,
+        };
+        let chunk_two = AssetChunk {
+            asset_digest: asset_digest.to_vec(),
+            chunk_index: 1,
+            chunk_count: 2,
+            payload: chunk_payload_two.clone(),
+            chunk_digest: compute_asset_chunk_digest(&chunk_payload_two).to_vec(),
+            compression_mode: CompressionMode::Zstd as i32,
+        };
+
+        let mut bundle = AssetBundle {
+            bundle_digest: Vec::new(),
+            created_at_ms,
+            manifest: Some(manifest),
+            chunks: vec![chunk_one, chunk_two],
+        };
+        let bundle_digest =
+            compute_asset_bundle_digest(bundle.manifest.as_ref().unwrap(), &bundle.chunks)
+                .expect("bundle digest computed");
+        bundle.bundle_digest = bundle_digest.to_vec();
+
+        (bundle, bundle_digest, asset_digest)
+    }
+
+    fn asset_bundle_request(store: &PvgsStore, bundle: &AssetBundle) -> PvgsCommitRequest {
+        let payload = bundle.encode_to_vec();
+        PvgsCommitRequest {
+            commit_id: "asset-bundle-commit".to_string(),
+            commit_type: CommitType::AssetBundleAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+            payload_digests: Vec::new(),
+            epoch_id: 1,
+            key_epoch: None,
+            experience_record_payload: None,
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: None,
+            microcircuit_config_payload: None,
+            asset_manifest_payload: None,
+            asset_bundle_payload: Some(payload),
         }
     }
 
@@ -6198,6 +6557,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: Some(payload),
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         }
     }
 
@@ -6367,6 +6727,131 @@ mod tests {
         assert!(second_proof.is_some());
         assert_eq!(store.asset_manifest_store.list().len(), 1);
         assert!(store.asset_manifest_store.get(digest).is_some());
+    }
+
+    #[test]
+    fn asset_bundle_append_accepts_and_logs() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let (bundle, digest, asset_digest) = asset_bundle_payload(55, 12);
+
+        let req = asset_bundle_request(&store, &bundle);
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof_receipt.is_some());
+
+        let stored = store.asset_bundle_store.get(digest).expect("bundle stored");
+        assert_eq!(stored.bundle_digest, bundle.bundle_digest);
+        assert_eq!(
+            store
+                .asset_bundle_store
+                .chunks_for_asset(asset_digest)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let has_event = store.sep_log.events.iter().any(|event| {
+            event.event_type == SepEventType::EvRecoveryGov
+                && event.object_digest == digest
+                && event
+                    .reason_codes
+                    .contains(&ReasonCodes::GV_ASSET_BUNDLE_APPENDED.to_string())
+        });
+        assert!(has_event);
+    }
+
+    #[test]
+    fn asset_bundle_append_rejects_digest_mismatch() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let (mut bundle, _digest, _asset_digest) = asset_bundle_payload(55, 12);
+        bundle.chunks[0].payload = b"tampered".to_vec();
+
+        let req = asset_bundle_request(&store, &bundle);
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert!(proof_receipt.is_none());
+        assert!(receipt
+            .reject_reason_codes
+            .contains(&ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()));
+        assert!(receipt
+            .reject_reason_codes
+            .contains(&ReasonCodes::GV_ASSET_DIGEST_MISMATCH.to_string()));
+        assert!(store.asset_bundle_store.list().is_empty());
+    }
+
+    #[test]
+    fn asset_bundle_append_sorts_chunks_for_digest() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let (mut bundle, _digest, _asset_digest) = asset_bundle_payload(55, 12);
+        bundle.chunks.reverse();
+
+        let req = asset_bundle_request(&store, &bundle);
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof_receipt.is_some());
+    }
+
+    #[test]
+    fn asset_bundle_append_rejects_over_max_chunks() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let max_chunks = store.asset_bundle_store.max_chunks_per_asset() as u32;
+        let asset_digest = [42u8; 32];
+        let mut manifest = AssetManifest {
+            manifest_digest: Vec::new(),
+            created_at_ms: 99,
+            asset_digests: vec![AssetDigest {
+                kind: AssetKind::Morphology as i32,
+                digest: asset_digest.to_vec(),
+                version: 1,
+            }],
+        };
+        let manifest_digest = compute_asset_manifest_digest(&manifest);
+        manifest.manifest_digest = manifest_digest.to_vec();
+
+        let mut chunks = Vec::new();
+        for idx in 0..=max_chunks {
+            let payload = vec![idx as u8; 4];
+            chunks.push(AssetChunk {
+                asset_digest: asset_digest.to_vec(),
+                chunk_index: idx,
+                chunk_count: max_chunks + 1,
+                payload: payload.clone(),
+                chunk_digest: compute_asset_chunk_digest(&payload).to_vec(),
+                compression_mode: CompressionMode::None as i32,
+            });
+        }
+
+        let mut bundle = AssetBundle {
+            bundle_digest: Vec::new(),
+            created_at_ms: 99,
+            manifest: Some(manifest),
+            chunks,
+        };
+        let bundle_digest =
+            compute_asset_bundle_digest(bundle.manifest.as_ref().unwrap(), &bundle.chunks)
+                .expect("bundle digest computed");
+        bundle.bundle_digest = bundle_digest.to_vec();
+
+        let req = asset_bundle_request(&store, &bundle);
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert!(proof_receipt.is_none());
+        assert!(receipt
+            .reject_reason_codes
+            .contains(&ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()));
+        assert!(store.asset_bundle_store.list().is_empty());
     }
 
     #[test]
@@ -6652,6 +7137,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -6720,6 +7206,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -6976,6 +7463,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         }
     }
 
@@ -7796,6 +8284,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(backward_req, &mut store, &keystore, &vrf_engine);
@@ -7867,6 +8356,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(dup_req, &mut store, &keystore, &vrf_engine);
@@ -7914,6 +8404,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let keystore = KeyStore::new_dev_keystore(1);
@@ -7977,6 +8468,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -8040,6 +8532,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -8128,6 +8621,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (_, pev_proof) = verify_and_commit(pev_req, &mut store, &keystore, &vrf_engine);
@@ -8210,6 +8704,7 @@ mod tests {
             tool_onboarding_event: None,
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -8291,6 +8786,7 @@ mod tests {
             tool_onboarding_event: Some(event.encode_to_vec()),
             microcircuit_config_payload: None,
             asset_manifest_payload: None,
+            asset_bundle_payload: None,
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
