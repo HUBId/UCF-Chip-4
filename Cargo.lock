@@ -615,6 +615,7 @@ dependencies = [
  "receipts",
  "recovery",
  "replay_plan",
+ "replay_runs",
  "sep",
  "serde",
  "serde_yaml",
@@ -650,6 +651,7 @@ dependencies = [
  "receipts",
  "recovery",
  "replay_plan",
+ "replay_runs",
  "sep",
  "serde",
  "serde_yaml",
@@ -745,6 +747,15 @@ dependencies = [
  "hex",
  "limits",
  "prost",
+ "serde",
+ "thiserror",
+ "ucf-protocol",
+]
+
+[[package]]
+name = "replay_runs"
+version = "0.1.0"
+dependencies = [
  "serde",
  "thiserror",
  "ucf-protocol",

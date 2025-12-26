@@ -27,6 +27,7 @@ members = [
     "crates/recovery",
     "crates/tool_events", "crates/common",
     "crates/micro_evidence",
+    "crates/replay_runs",
     "crates/assets",
 ]
 resolver = "2"
@@ -46,3 +47,4 @@ hex = "0.4"
 limits = { path = "crates/limits" }
 ucf-protocol = { path = "ucf-protocol" }
 recovery = { path = "crates/recovery" }
+replay_runs = { path = "crates/replay_runs" }

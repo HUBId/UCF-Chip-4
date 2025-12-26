@@ -56,6 +56,7 @@ pub mod ucf {
             FrameEvidenceAppend,
             DlpDecisionAppend,
             ReplayPlanAppend,
+            ReplayRunEvidenceAppend,
             MicrocircuitConfigAppend,
             AssetManifestAppend,
             AssetBundleAppend,
@@ -557,6 +558,8 @@ pub mod ucf {
             pub const GV_REPLAY_PLANNED: &'static str = "RC.GV.REPLAY.PLANNED";
             pub const GV_REPLAY_DENY_CLUSTER: &'static str = "RC.GV.REPLAY.DENY_CLUSTER";
             pub const GV_REPLAY_SPOTCHECK: &'static str = "RC.GV.REPLAY.SPOTCHECK";
+            pub const GV_REPLAY_RUN_EVIDENCE_APPENDED: &'static str =
+                "RC.GV.REPLAY.RUN_EVIDENCE_APPENDED";
             pub const GV_PEV_UPDATED: &'static str = "RC.GV.PEV.UPDATED";
             pub const GV_TOOL_REGISTRY_UPDATED: &'static str = "RC.GV.TOOL_REGISTRY.UPDATED";
             pub const GV_TOOL_ONBOARDING_EVENT_APPENDED: &'static str =
@@ -775,6 +778,27 @@ pub mod ucf {
             pub trigger_reason_codes: Vec<String>,
             #[prost(message, optional, tag = "15")]
             pub asset_manifest_ref: Option<Ref>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct ReplayRunEvidence {
+            #[prost(bytes = "vec", tag = "1")]
+            pub run_digest: Vec<u8>,
+            #[prost(message, optional, tag = "2")]
+            pub replay_plan_ref: Option<Ref>,
+            #[prost(message, optional, tag = "3")]
+            pub asset_manifest_ref: Option<Ref>,
+            #[prost(uint64, tag = "4")]
+            pub steps: u64,
+            #[prost(uint64, tag = "5")]
+            pub dt_us: u64,
+            #[prost(uint64, tag = "6")]
+            pub created_at_ms: u64,
+            #[prost(message, repeated, tag = "7")]
+            pub micro_config_refs: Vec<Ref>,
+            #[prost(bytes = "vec", repeated, tag = "8")]
+            pub summary_digests: Vec<Vec<u8>>,
         }
 
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

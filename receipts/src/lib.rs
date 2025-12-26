@@ -376,6 +376,7 @@ fn commit_type_label(commit_type: &protocol::CommitType) -> &'static str {
         protocol::CommitType::FrameEvidenceAppend => "FrameEvidenceAppend",
         protocol::CommitType::DlpDecisionAppend => "DlpDecisionAppend",
         protocol::CommitType::ReplayPlanAppend => "ReplayPlanAppend",
+        protocol::CommitType::ReplayRunEvidenceAppend => "ReplayRunEvidenceAppend",
         protocol::CommitType::ConsistencyFeedbackAppend => "ConsistencyFeedbackAppend",
         protocol::CommitType::MicrocircuitConfigAppend => "MicrocircuitConfigAppend",
         protocol::CommitType::AssetManifestAppend => "AssetManifestAppend",

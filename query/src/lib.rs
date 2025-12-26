@@ -22,7 +22,7 @@ use ucf_protocol::ucf::v1::{
     MicrocircuitConfigEvidence, MorphologySetPayload, PVGSKeyEpoch, PVGSReceipt, ProofReceipt,
     ReasonCodes, RecordType, RecoveryCase as ProtoRecoveryCase,
     RecoveryCheck as ProtoRecoveryCheck, RecoveryState as ProtoRecoveryState, ReplayPlan,
-    SynapseParamsSetPayload, ToolOnboardingEvent, ToolOnboardingStage,
+    ReplayRunEvidence, SynapseParamsSetPayload, ToolOnboardingEvent, ToolOnboardingStage,
 };
 use wire::{AuthContext, Envelope};
 
@@ -204,6 +204,30 @@ pub struct ReplayCard {
     pub latest_replay_run_digest: Option<[u8; 32]>,
     pub unique_replay_run_count_last_n: u64,
     pub last_replay_run_digests: Vec<[u8; 32]>,
+    pub replay_run_evidence_count_last_n: u64,
+    pub latest_replay_run_evidence_digest: Option<[u8; 32]>,
+    pub asset_bound_run_count: u64,
+    pub top_micro_modules_in_runs: Vec<MicroModuleCount>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicroModuleCount {
+    pub module: MicroModule,
+    pub count: u64,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayRunSummary {
+    pub run_digest: [u8; 32],
+    pub replay_plan_digest: Option<[u8; 32]>,
+    pub asset_manifest_digest: Option<[u8; 32]>,
+    pub steps: u64,
+    pub dt_us: u64,
+    pub created_at_ms: u64,
+    pub micro_config_digests: Vec<[u8; 32]>,
+    pub summary_digests: Vec<[u8; 32]>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -231,6 +255,7 @@ const MAX_REPLAY_RUN_DIGESTS: usize = 64;
 const MAX_REPLAY_SCORECARD_DIGESTS: usize = 128;
 const MAX_REPLAY_SCORECARD_LIST: usize = 5;
 const REPLAY_SCORECARD_WINDOW: usize = 1000;
+const REPLAY_RUN_EVIDENCE_WINDOW: usize = 1000;
 const MAX_PLASTICITY_EVIDENCE: usize = 128;
 const MAX_PLASTICITY_SCORECARD_DIGESTS: usize = 128;
 const MAX_PLASTICITY_SCORECARD_LIST: usize = 5;
@@ -761,6 +786,59 @@ fn replay_card_from_store(store: &PvgsStore, session_id: Option<&str>) -> Replay
     unique_replay_run_digests.truncate(MAX_REPLAY_SCORECARD_DIGESTS);
     let unique_replay_run_count = unique_replay_run_digests.len() as u64;
 
+    let run_start = store
+        .replay_run_store
+        .runs
+        .len()
+        .saturating_sub(REPLAY_RUN_EVIDENCE_WINDOW);
+    let recent_runs = store.replay_run_store.runs.iter().skip(run_start);
+    let mut replay_run_evidence_count_last_n = 0u64;
+    let mut latest_replay_run_evidence_digest = None;
+    let mut latest_replay_run_created_at = 0u64;
+    let mut asset_bound_run_count = 0u64;
+    let mut module_count_map = std::collections::BTreeMap::new();
+
+    for run in recent_runs {
+        replay_run_evidence_count_last_n = replay_run_evidence_count_last_n.saturating_add(1);
+        if let Some(digest) = digest_from_bytes(&run.run_digest) {
+            let is_newer = match latest_replay_run_evidence_digest {
+                Some(latest_digest) => {
+                    run.created_at_ms > latest_replay_run_created_at
+                        || (run.created_at_ms == latest_replay_run_created_at
+                            && digest > latest_digest)
+                }
+                None => true,
+            };
+            if is_newer {
+                latest_replay_run_created_at = run.created_at_ms;
+                latest_replay_run_evidence_digest = Some(digest);
+            }
+        }
+
+        if run
+            .asset_manifest_ref
+            .as_ref()
+            .and_then(digest_from_ref)
+            .is_some()
+        {
+            asset_bound_run_count = asset_bound_run_count.saturating_add(1);
+        }
+
+        for reference in &run.micro_config_refs {
+            if let Some(module) = micro_module_from_config_ref(reference) {
+                let entry = module_count_map.entry(module).or_insert(0u64);
+                *entry = (*entry).saturating_add(1);
+            }
+        }
+    }
+
+    let mut top_micro_modules_in_runs: Vec<MicroModuleCount> = module_count_map
+        .into_iter()
+        .map(|(module, count)| MicroModuleCount { module, count })
+        .collect();
+    top_micro_modules_in_runs
+        .sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.module.cmp(&b.module)));
+
     ReplayCard {
         pending_replay_plans_asset_bound_count: asset_bound,
         pending_replay_plans_asset_missing_count: asset_missing,
@@ -769,6 +847,10 @@ fn replay_card_from_store(store: &PvgsStore, session_id: Option<&str>) -> Replay
         latest_replay_run_digest,
         unique_replay_run_count_last_n: unique_replay_run_count,
         last_replay_run_digests: last_replay_run_digests.into_iter().collect(),
+        replay_run_evidence_count_last_n,
+        latest_replay_run_evidence_digest,
+        asset_bound_run_count,
+        top_micro_modules_in_runs,
     }
 }
 
@@ -1562,7 +1644,7 @@ pub fn list_plasticity_evidence(store: &PvgsStore, session_id: &str) -> Vec<[u8;
 }
 
 /// List replay run digests for a session in deterministic order.
-pub fn list_replay_runs(store: &PvgsStore, session_id: &str) -> Vec<[u8; 32]> {
+pub fn list_replay_run_digests(store: &PvgsStore, session_id: &str) -> Vec<[u8; 32]> {
     let mut record_digests: Vec<[u8; 32]> = store
         .sep_log
         .events
@@ -1594,6 +1676,84 @@ pub fn list_replay_runs(store: &PvgsStore, session_id: &str) -> Vec<[u8; 32]> {
     let mut replay_runs: Vec<[u8; 32]> = digests.into_iter().collect();
     replay_runs.truncate(MAX_REPLAY_RUN_DIGESTS);
     replay_runs
+}
+
+/// Fetch a replay run evidence record by digest.
+pub fn get_replay_run(store: &PvgsStore, run_digest: [u8; 32]) -> Option<ReplayRunEvidence> {
+    store.replay_run_store.get(run_digest).cloned()
+}
+
+/// List replay run evidence entries in deterministic order.
+pub fn list_replay_runs(store: &PvgsStore, limit: usize) -> Vec<ReplayRunEvidence> {
+    let mut runs: Vec<ReplayRunEvidence> = store.replay_run_store.runs.clone();
+    runs.sort_by(|a, b| {
+        let digest_a = digest_from_bytes(&a.run_digest).unwrap_or([0u8; 32]);
+        let digest_b = digest_from_bytes(&b.run_digest).unwrap_or([0u8; 32]);
+        a.created_at_ms
+            .cmp(&b.created_at_ms)
+            .then_with(|| digest_a.cmp(&digest_b))
+    });
+    runs.truncate(limit);
+    runs
+}
+
+/// Return the latest replay run digest by created time.
+pub fn latest_replay_run_digest(store: &PvgsStore) -> Option<[u8; 32]> {
+    store
+        .replay_run_store
+        .runs
+        .iter()
+        .filter_map(|run| digest_from_bytes(&run.run_digest).map(|digest| (digest, run)))
+        .max_by(|(digest_a, run_a), (digest_b, run_b)| {
+            run_a
+                .created_at_ms
+                .cmp(&run_b.created_at_ms)
+                .then_with(|| digest_a.cmp(digest_b))
+        })
+        .map(|(digest, _)| digest)
+}
+
+pub fn replay_run_summary(store: &PvgsStore, run_digest: [u8; 32]) -> ReplayRunSummary {
+    let Some(run) = store.replay_run_store.get(run_digest) else {
+        return ReplayRunSummary {
+            run_digest,
+            replay_plan_digest: None,
+            asset_manifest_digest: None,
+            steps: 0,
+            dt_us: 0,
+            created_at_ms: 0,
+            micro_config_digests: Vec::new(),
+            summary_digests: Vec::new(),
+        };
+    };
+
+    let replay_plan_digest = run.replay_plan_ref.as_ref().and_then(digest_from_ref);
+    let asset_manifest_digest = run.asset_manifest_ref.as_ref().and_then(digest_from_ref);
+    let mut micro_config_digests: Vec<[u8; 32]> = run
+        .micro_config_refs
+        .iter()
+        .filter_map(digest_from_ref)
+        .collect();
+    micro_config_digests.sort();
+    micro_config_digests.dedup();
+    let mut summary_digests: Vec<[u8; 32]> = run
+        .summary_digests
+        .iter()
+        .filter_map(|digest| digest_from_bytes(digest))
+        .collect();
+    summary_digests.sort();
+    summary_digests.dedup();
+
+    ReplayRunSummary {
+        run_digest,
+        replay_plan_digest,
+        asset_manifest_digest,
+        steps: run.steps,
+        dt_us: run.dt_us,
+        created_at_ms: run.created_at_ms,
+        micro_config_digests,
+        summary_digests,
+    }
 }
 
 /// List export attempts for a session in deterministic order.
@@ -1832,7 +1992,11 @@ fn plasticity_snapshots_from_record(record: &ExperienceRecord) -> Vec<[u8; 32]> 
 }
 
 fn replay_run_digest_from_ref(reference: &ucf_protocol::ucf::v1::Ref) -> Option<[u8; 32]> {
-    if reference.id == "replay_run" || reference.id.starts_with("replay_run:") {
+    if reference.id == "replay_run"
+        || reference.id.starts_with("replay_run:")
+        || reference.id == "replay_run_evidence"
+        || reference.id.starts_with("replay_run_evidence:")
+    {
         return digest_from_ref(reference);
     }
 
@@ -1966,6 +2130,22 @@ fn digest_from_labeled_ref(
 
     if let Some(value) = reference.id.strip_prefix(&prefix) {
         return digest_from_labeled_value(value);
+    }
+
+    None
+}
+
+fn micro_module_from_config_ref(reference: &ucf_protocol::ucf::v1::Ref) -> Option<MicroModule> {
+    digest_from_ref(reference)?;
+
+    if reference.id == "mc_cfg:lc" || reference.id.starts_with("mc_cfg:lc:") {
+        return Some(MicroModule::Lc);
+    }
+    if reference.id == "mc_cfg:sn" || reference.id.starts_with("mc_cfg:sn:") {
+        return Some(MicroModule::Sn);
+    }
+    if reference.id == "mc_cfg:hpa" || reference.id.starts_with("mc_cfg:hpa:") {
+        return Some(MicroModule::Hpa);
     }
 
     None
@@ -2106,8 +2286,8 @@ mod tests {
         ConnectivityEdge, ConnectivityGraphPayload, ConsistencyFeedback, Digest32, DlpDecision,
         GovernanceFrame, MacroMilestone, MacroMilestoneState, MagnitudeClass, MetabolicFrame,
         MicroModule, MicrocircuitConfigEvidence, MorphologyEntry, MorphologySetPayload,
-        ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayTargetKind, TraitDirection,
-        TraitUpdate,
+        ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayRunEvidence, ReplayTargetKind,
+        TraitDirection, TraitUpdate,
     };
     use vrf::VrfEngine;
 
@@ -2299,6 +2479,7 @@ mod tests {
             epoch_id: 1,
             key_epoch: None,
             experience_record_payload: None,
+            replay_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -2455,6 +2636,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
+            replay_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -2513,6 +2695,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
+            replay_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -2579,6 +2762,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: None,
+            replay_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -3196,6 +3380,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
+            replay_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -3609,7 +3794,7 @@ mod tests {
     }
 
     #[test]
-    fn list_replay_runs_returns_sorted_unique_digests() {
+    fn list_replay_run_digests_returns_sorted_unique_digests() {
         let mut known_charter_versions = HashSet::new();
         known_charter_versions.insert("charter".to_string());
         let mut known_policy_versions = HashSet::new();
@@ -3655,8 +3840,73 @@ mod tests {
             vec![replay_run_ref(replay_run_first)],
         );
 
-        let replay_runs = list_replay_runs(&store, session_id);
+        let replay_runs = list_replay_run_digests(&store, session_id);
         assert_eq!(replay_runs, vec![replay_run_second, replay_run_first]);
+    }
+
+    #[test]
+    fn list_replay_runs_returns_sorted_evidence() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+
+        let first_digest = [2u8; 32];
+        let second_digest = [1u8; 32];
+        let asset_digest = [3u8; 32];
+
+        store
+            .replay_run_store
+            .insert(ReplayRunEvidence {
+                run_digest: first_digest.to_vec(),
+                replay_plan_ref: None,
+                asset_manifest_ref: Some(Ref {
+                    id: "asset_manifest".to_string(),
+                    digest: Some(asset_digest.to_vec()),
+                }),
+                steps: 10,
+                dt_us: 5,
+                created_at_ms: 20,
+                micro_config_refs: Vec::new(),
+                summary_digests: vec![vec![5u8; 32]],
+            })
+            .expect("valid run evidence");
+        store
+            .replay_run_store
+            .insert(ReplayRunEvidence {
+                run_digest: second_digest.to_vec(),
+                replay_plan_ref: None,
+                asset_manifest_ref: Some(Ref {
+                    id: "asset_manifest".to_string(),
+                    digest: Some(asset_digest.to_vec()),
+                }),
+                steps: 12,
+                dt_us: 6,
+                created_at_ms: 10,
+                micro_config_refs: Vec::new(),
+                summary_digests: vec![vec![6u8; 32]],
+            })
+            .expect("valid run evidence");
+
+        let runs = list_replay_runs(&store, 10);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].run_digest, second_digest.to_vec());
+        assert_eq!(runs[1].run_digest, first_digest.to_vec());
+
+        let fetched = get_replay_run(&store, first_digest);
+        assert!(fetched.is_some());
+        let summary = replay_run_summary(&store, first_digest);
+        assert_eq!(summary.run_digest, first_digest);
+        assert_eq!(summary.asset_manifest_digest, Some(asset_digest));
     }
 
     #[test]
@@ -3734,6 +3984,10 @@ mod tests {
 
         let first = [4u8; 32];
         let second = [8u8; 32];
+        let asset_manifest_first = [5u8; 32];
+        let asset_manifest_second = [6u8; 32];
+        let micro_config_lc = [7u8; 32];
+        let micro_config_sn = [9u8; 32];
 
         append_record_with_refs_and_type(
             &mut store,
@@ -3752,6 +4006,45 @@ mod tests {
             vec![replay_run_ref(second)],
         );
 
+        store
+            .replay_run_store
+            .insert(ReplayRunEvidence {
+                run_digest: first.to_vec(),
+                replay_plan_ref: None,
+                asset_manifest_ref: Some(Ref {
+                    id: "asset_manifest".to_string(),
+                    digest: Some(asset_manifest_first.to_vec()),
+                }),
+                steps: 12,
+                dt_us: 5,
+                created_at_ms: 10,
+                micro_config_refs: vec![Ref {
+                    id: "mc_cfg:lc".to_string(),
+                    digest: Some(micro_config_lc.to_vec()),
+                }],
+                summary_digests: vec![vec![1u8; 32]],
+            })
+            .expect("valid replay run evidence");
+        store
+            .replay_run_store
+            .insert(ReplayRunEvidence {
+                run_digest: second.to_vec(),
+                replay_plan_ref: None,
+                asset_manifest_ref: Some(Ref {
+                    id: "asset_manifest".to_string(),
+                    digest: Some(asset_manifest_second.to_vec()),
+                }),
+                steps: 14,
+                dt_us: 6,
+                created_at_ms: 12,
+                micro_config_refs: vec![Ref {
+                    id: "mc_cfg:sn".to_string(),
+                    digest: Some(micro_config_sn.to_vec()),
+                }],
+                summary_digests: vec![vec![2u8; 32]],
+            })
+            .expect("valid replay run evidence");
+
         let snapshot = snapshot(&store, Some("replay-2"));
         let card = snapshot.replay_card;
 
@@ -3759,6 +4052,22 @@ mod tests {
         assert_eq!(card.latest_replay_run_digest, Some(second));
         assert_eq!(card.unique_replay_run_count_last_n, 2);
         assert_eq!(card.last_replay_run_digests, vec![first, second]);
+        assert_eq!(card.replay_run_evidence_count_last_n, 2);
+        assert_eq!(card.latest_replay_run_evidence_digest, Some(second));
+        assert_eq!(card.asset_bound_run_count, 2);
+        assert_eq!(
+            card.top_micro_modules_in_runs,
+            vec![
+                MicroModuleCount {
+                    module: MicroModule::Lc,
+                    count: 1
+                },
+                MicroModuleCount {
+                    module: MicroModule::Sn,
+                    count: 1
+                },
+            ]
+        );
     }
 
     #[test]
@@ -3899,6 +4208,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
+            replay_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -3986,6 +4296,7 @@ mod tests {
             epoch_id: keystore.current_epoch(),
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
+            replay_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
