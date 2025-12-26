@@ -6,6 +6,7 @@ use cbv::{
 use dlp_store::DlpDecisionStore;
 use milestones::{MesoMilestone, MicroMilestone};
 use pev::{pev_digest, PolicyEcologyVector};
+use prost::Message;
 use pvgs::{compute_experience_record_digest, CompletenessStatus, PvgsCommitRequest, PvgsStore};
 use recovery::{
     RecoveryCase as InternalRecoveryCase, RecoveryCheck as InternalRecoveryCheck,
@@ -16,11 +17,12 @@ use std::collections::{BTreeSet, VecDeque};
 use std::convert::TryFrom;
 use thiserror::Error;
 use ucf_protocol::ucf::v1::{
-    AssetBundle, AssetChunk, AssetKind, AssetManifest, CompressionMode, ConsistencyFeedback,
-    DlpDecisionForm, ExperienceRecord, MicroModule, MicrocircuitConfigEvidence, PVGSKeyEpoch,
-    PVGSReceipt, ProofReceipt, ReasonCodes, RecordType, RecoveryCase as ProtoRecoveryCase,
+    AssetBundle, AssetChunk, AssetKind, AssetManifest, ChannelParamsSetPayload, CompressionMode,
+    ConnectivityGraphPayload, ConsistencyFeedback, DlpDecisionForm, ExperienceRecord, MicroModule,
+    MicrocircuitConfigEvidence, MorphologySetPayload, PVGSKeyEpoch, PVGSReceipt, ProofReceipt,
+    ReasonCodes, RecordType, RecoveryCase as ProtoRecoveryCase,
     RecoveryCheck as ProtoRecoveryCheck, RecoveryState as ProtoRecoveryState, ReplayPlan,
-    ToolOnboardingEvent, ToolOnboardingStage,
+    SynapseParamsSetPayload, ToolOnboardingEvent, ToolOnboardingStage,
 };
 use wire::{AuthContext, Envelope};
 
@@ -179,12 +181,30 @@ pub struct AssetsCard {
     pub compression_none_count: u64,
     pub compression_zstd_count: u64,
     pub asset_digest_mismatch_count: u64,
+    pub asset_payload_summaries: Vec<AssetPayloadSummary>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetPayloadSummary {
+    pub kind: AssetKind,
+    pub version: u32,
+    pub digest: [u8; 32],
+    pub bytes_len: u32,
+    pub neuron_count: Option<u32>,
+    pub edge_count: Option<u32>,
+    pub syn_param_count: Option<u32>,
+    pub channel_param_count: Option<u32>,
+    pub has_pool_labels: bool,
+    pub has_role_labels: bool,
 }
 
 const MAX_MACRO_VECTOR_ITEMS: usize = 64;
 const MAX_CBV_SCAN: usize = 32;
 const MAX_ASSET_MANIFESTS: usize = 128;
 const MAX_ASSET_BUNDLES: usize = 128;
+const MAX_ASSET_PAYLOAD_SUMMARIES: usize = 4;
+const MAX_ASSET_PAYLOAD_DECODE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PLASTICITY_EVIDENCE: usize = 128;
 const MAX_PLASTICITY_SCORECARD_DIGESTS: usize = 128;
 const MAX_PLASTICITY_SCORECARD_LIST: usize = 5;
@@ -614,6 +634,9 @@ fn assets_card_from_store(store: &PvgsStore) -> AssetsCard {
         })
         .count() as u64;
 
+    let mut asset_payload_summaries = get_latest_asset_payload_summaries(store);
+    asset_payload_summaries.truncate(MAX_ASSET_PAYLOAD_SUMMARIES);
+
     AssetsCard {
         latest_manifest_digest,
         latest_bundle_digest,
@@ -625,6 +648,7 @@ fn assets_card_from_store(store: &PvgsStore) -> AssetsCard {
         compression_none_count,
         compression_zstd_count,
         asset_digest_mismatch_count,
+        asset_payload_summaries,
     }
 }
 
@@ -706,6 +730,134 @@ fn select_asset_digest(manifest: &AssetManifest, kind: AssetKind) -> Option<[u8;
                 .then_with(|| digest_a.cmp(digest_b))
         })
         .map(|(_, digest)| digest)
+}
+
+fn select_asset_digest_with_version(
+    manifest: &AssetManifest,
+    kind: AssetKind,
+) -> Option<(u32, [u8; 32])> {
+    manifest
+        .asset_digests
+        .iter()
+        .filter(|asset| AssetKind::try_from(asset.kind).ok() == Some(kind))
+        .filter_map(|asset| digest_from_bytes(&asset.digest).map(|digest| (asset.version, digest)))
+        .max_by(|(version_a, digest_a), (version_b, digest_b)| {
+            version_a
+                .cmp(version_b)
+                .then_with(|| digest_a.cmp(digest_b))
+        })
+}
+
+fn reassemble_asset_payload(chunks: &[AssetChunk]) -> Option<Vec<u8>> {
+    if chunks.is_empty() {
+        return None;
+    }
+    let mut ordered = chunks.to_vec();
+    ordered.sort_by_key(|chunk| chunk.chunk_index);
+    let expected_count = ordered[0].chunk_count;
+    if expected_count as usize != ordered.len() {
+        return None;
+    }
+    for (idx, chunk) in ordered.iter().enumerate() {
+        if chunk.chunk_index != idx as u32 || chunk.chunk_count != expected_count {
+            return None;
+        }
+    }
+    let mut payload = Vec::new();
+    for chunk in ordered {
+        payload.extend_from_slice(&chunk.payload);
+    }
+    Some(payload)
+}
+
+pub fn get_latest_asset_payload_summaries(store: &PvgsStore) -> Vec<AssetPayloadSummary> {
+    let manifest = get_latest_asset_manifest(store).or_else(|| {
+        store
+            .asset_bundle_store
+            .latest()
+            .and_then(|bundle| bundle.manifest.clone())
+    });
+    let Some(manifest) = manifest else {
+        return Vec::new();
+    };
+
+    let mut summaries = Vec::new();
+    for kind in [
+        AssetKind::Morphology,
+        AssetKind::Channel,
+        AssetKind::Synapse,
+        AssetKind::Connectivity,
+    ] {
+        let Some((version, digest)) = select_asset_digest_with_version(&manifest, kind) else {
+            continue;
+        };
+        let Some(chunks) = store.asset_bundle_store.chunks_for_asset(digest) else {
+            continue;
+        };
+        let Some(payload) = reassemble_asset_payload(chunks) else {
+            continue;
+        };
+        let bytes_len = payload.len() as u32;
+
+        let mut summary = AssetPayloadSummary {
+            kind,
+            version,
+            digest,
+            bytes_len,
+            neuron_count: None,
+            edge_count: None,
+            syn_param_count: None,
+            channel_param_count: None,
+            has_pool_labels: false,
+            has_role_labels: false,
+        };
+
+        if payload.len() <= MAX_ASSET_PAYLOAD_DECODE_BYTES {
+            match kind {
+                AssetKind::Morphology => {
+                    if let Ok(decoded) = MorphologySetPayload::decode(payload.as_slice()) {
+                        summary.neuron_count = Some(decoded.morphologies.len() as u32);
+                        summary.has_pool_labels = decoded
+                            .morphologies
+                            .iter()
+                            .any(|entry| !entry.pool_label.is_empty());
+                        summary.has_role_labels = decoded
+                            .morphologies
+                            .iter()
+                            .any(|entry| !entry.role_label.is_empty());
+                    }
+                }
+                AssetKind::Channel => {
+                    if let Ok(decoded) = ChannelParamsSetPayload::decode(payload.as_slice()) {
+                        summary.channel_param_count = Some(decoded.channel_params.len() as u32);
+                    }
+                }
+                AssetKind::Synapse => {
+                    if let Ok(decoded) = SynapseParamsSetPayload::decode(payload.as_slice()) {
+                        summary.syn_param_count = Some(decoded.synapse_params.len() as u32);
+                    }
+                }
+                AssetKind::Connectivity => {
+                    if let Ok(decoded) = ConnectivityGraphPayload::decode(payload.as_slice()) {
+                        summary.edge_count = Some(decoded.edges.len() as u32);
+                        summary.has_pool_labels = decoded
+                            .edges
+                            .iter()
+                            .any(|entry| !entry.pool_label.is_empty());
+                        summary.has_role_labels = decoded
+                            .edges
+                            .iter()
+                            .any(|entry| !entry.role_label.is_empty());
+                    }
+                }
+                AssetKind::Unspecified => {}
+            }
+        }
+
+        summaries.push(summary);
+    }
+
+    summaries
 }
 
 fn recovery_case_to_proto(case: InternalRecoveryCase) -> ProtoRecoveryCase {
@@ -1729,10 +1881,11 @@ mod tests {
     use std::collections::HashSet;
     use ucf_protocol::ucf::v1::{
         AssetBundle, AssetChunk, AssetDigest, AssetKind, AssetManifest, CompressionMode,
-        ConsistencyFeedback, Digest32, DlpDecision, GovernanceFrame, MacroMilestone,
-        MacroMilestoneState, MagnitudeClass, MetabolicFrame, MicroModule,
-        MicrocircuitConfigEvidence, ReceiptStatus, RecordType, Ref, ReplayFidelity,
-        ReplayTargetKind, TraitDirection, TraitUpdate,
+        ConnectivityEdge, ConnectivityGraphPayload, ConsistencyFeedback, Digest32, DlpDecision,
+        GovernanceFrame, MacroMilestone, MacroMilestoneState, MagnitudeClass, MetabolicFrame,
+        MicroModule, MicrocircuitConfigEvidence, MorphologyEntry, MorphologySetPayload,
+        ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayTargetKind, TraitDirection,
+        TraitUpdate,
     };
     use vrf::VrfEngine;
 
@@ -1841,6 +1994,66 @@ mod tests {
         bundle.bundle_digest = bundle_digest.to_vec();
 
         (bundle, bundle_digest, asset_digest)
+    }
+
+    fn asset_bundle_payload_with_assets(
+        created_at_ms: u64,
+        asset_seed: u8,
+        morph_payload: Vec<u8>,
+        connectivity_payload: Vec<u8>,
+    ) -> (AssetBundle, [u8; 32], [u8; 32], [u8; 32]) {
+        let morph_digest = [asset_seed; 32];
+        let connectivity_digest = [asset_seed.wrapping_add(1); 32];
+        let mut manifest = AssetManifest {
+            manifest_digest: Vec::new(),
+            created_at_ms,
+            asset_digests: vec![
+                AssetDigest {
+                    kind: AssetKind::Morphology as i32,
+                    digest: morph_digest.to_vec(),
+                    version: 1,
+                },
+                AssetDigest {
+                    kind: AssetKind::Connectivity as i32,
+                    digest: connectivity_digest.to_vec(),
+                    version: 2,
+                },
+            ],
+        };
+        let manifest_digest = compute_asset_manifest_digest(&manifest);
+        manifest.manifest_digest = manifest_digest.to_vec();
+
+        let chunks = vec![
+            AssetChunk {
+                asset_digest: morph_digest.to_vec(),
+                chunk_index: 0,
+                chunk_count: 1,
+                payload: morph_payload.clone(),
+                chunk_digest: compute_asset_chunk_digest(&morph_payload).to_vec(),
+                compression_mode: CompressionMode::None as i32,
+            },
+            AssetChunk {
+                asset_digest: connectivity_digest.to_vec(),
+                chunk_index: 0,
+                chunk_count: 1,
+                payload: connectivity_payload.clone(),
+                chunk_digest: compute_asset_chunk_digest(&connectivity_payload).to_vec(),
+                compression_mode: CompressionMode::None as i32,
+            },
+        ];
+
+        let mut bundle = AssetBundle {
+            bundle_digest: Vec::new(),
+            created_at_ms,
+            manifest: Some(manifest),
+            chunks,
+        };
+        let bundle_digest =
+            compute_asset_bundle_digest(bundle.manifest.as_ref().unwrap(), &bundle.chunks)
+                .expect("bundle digest computed");
+        bundle.bundle_digest = bundle_digest.to_vec();
+
+        (bundle, bundle_digest, morph_digest, connectivity_digest)
     }
 
     fn asset_bundle_request(store: &PvgsStore, bundle: &AssetBundle) -> PvgsCommitRequest {
@@ -2195,6 +2408,18 @@ mod tests {
         assert_eq!(card.total_asset_chunks, 2);
         assert_eq!(card.compression_none_count, 1);
         assert_eq!(card.compression_zstd_count, 1);
+        assert_eq!(card.asset_payload_summaries.len(), 1);
+        let summary = &card.asset_payload_summaries[0];
+        assert_eq!(summary.kind, AssetKind::Morphology);
+        assert_eq!(summary.version, 1);
+        assert_eq!(summary.digest, asset_digest);
+        assert_eq!(summary.bytes_len, 20);
+        assert_eq!(summary.neuron_count, None);
+        assert_eq!(summary.edge_count, None);
+        assert_eq!(summary.syn_param_count, None);
+        assert_eq!(summary.channel_param_count, None);
+        assert!(!summary.has_pool_labels);
+        assert!(!summary.has_role_labels);
 
         let mut tampered = bundle.clone();
         tampered.chunks[0].payload = b"tampered".to_vec();
@@ -2204,6 +2429,76 @@ mod tests {
 
         let card = snapshot(&store, None).assets_card;
         assert_eq!(card.asset_digest_mismatch_count, 1);
+    }
+
+    #[test]
+    fn asset_payload_summaries_include_counts_and_labels() {
+        let mut store = minimal_store();
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let morph_payload = MorphologySetPayload {
+            morphologies: vec![
+                MorphologyEntry {
+                    neuron_id: 1,
+                    pool_label: "pool-a".to_string(),
+                    role_label: "".to_string(),
+                    payload: vec![1u8],
+                },
+                MorphologyEntry {
+                    neuron_id: 2,
+                    pool_label: "".to_string(),
+                    role_label: "role-b".to_string(),
+                    payload: vec![2u8],
+                },
+            ],
+        }
+        .encode_to_vec();
+        let connectivity_payload = ConnectivityGraphPayload {
+            edges: vec![ConnectivityEdge {
+                source_id: 1,
+                target_id: 2,
+                pool_label: "pool-c".to_string(),
+                role_label: "role-c".to_string(),
+            }],
+        }
+        .encode_to_vec();
+
+        let (bundle, _digest, morph_digest, connectivity_digest) = asset_bundle_payload_with_assets(
+            55,
+            9,
+            morph_payload.clone(),
+            connectivity_payload.clone(),
+        );
+
+        let req = asset_bundle_request(&store, &bundle);
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof_receipt.is_some());
+
+        let card = snapshot(&store, None).assets_card;
+        assert_eq!(card.asset_payload_summaries.len(), 2);
+        assert_eq!(card.asset_payload_summaries[0].kind, AssetKind::Morphology);
+        assert_eq!(card.asset_payload_summaries[0].digest, morph_digest);
+        assert_eq!(
+            card.asset_payload_summaries[0].bytes_len,
+            morph_payload.len() as u32
+        );
+        assert_eq!(card.asset_payload_summaries[0].neuron_count, Some(2));
+        assert!(card.asset_payload_summaries[0].has_pool_labels);
+        assert!(card.asset_payload_summaries[0].has_role_labels);
+
+        assert_eq!(
+            card.asset_payload_summaries[1].kind,
+            AssetKind::Connectivity
+        );
+        assert_eq!(card.asset_payload_summaries[1].digest, connectivity_digest);
+        assert_eq!(
+            card.asset_payload_summaries[1].bytes_len,
+            connectivity_payload.len() as u32
+        );
+        assert_eq!(card.asset_payload_summaries[1].edge_count, Some(1));
+        assert!(card.asset_payload_summaries[1].has_pool_labels);
+        assert!(card.asset_payload_summaries[1].has_role_labels);
     }
 
     fn dummy_proof_receipt(record_digest: [u8; 32]) -> ProofReceipt {

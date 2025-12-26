@@ -39,12 +39,13 @@ use tool_events::{
 };
 use tool_registry_state::{ToolRegistryError, ToolRegistryState};
 use ucf_protocol::ucf::v1::{
-    self as protocol, AssetBundle, AssetKind, AssetManifest, CharacterBaselineVector,
-    ConsistencyFeedback, Digest32, DlpDecision, DlpDecisionForm, ExperienceRecord,
-    FinalizationHeader, MacroMilestone, MacroMilestoneState, MicroModule,
-    MicrocircuitConfigEvidence, PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes,
-    ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayPlan, ReplayTargetKind,
-    ToolOnboardingEvent, ToolOnboardingStage, ToolRegistryContainer,
+    self as protocol, AssetBundle, AssetChunk, AssetKind, AssetManifest, ChannelParamsSetPayload,
+    CharacterBaselineVector, ConnectivityGraphPayload, ConsistencyFeedback, Digest32, DlpDecision,
+    DlpDecisionForm, ExperienceRecord, FinalizationHeader, MacroMilestone, MacroMilestoneState,
+    MicroModule, MicrocircuitConfigEvidence, MorphologySetPayload, PVGSKeyEpoch, PVGSReceipt,
+    ProofReceipt, ReasonCodes, ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayPlan,
+    ReplayTargetKind, SynapseParamsSetPayload, ToolOnboardingEvent, ToolOnboardingStage,
+    ToolRegistryContainer,
 };
 use vrf::VrfEngine;
 
@@ -54,6 +55,7 @@ use serde::{Deserialize, Serialize};
 const CONSISTENCY_SIGNAL_WINDOW: usize = DEFAULT_LIMITS.consistency_signal_window;
 const CONSISTENCY_HISTORY_MAX: usize = DEFAULT_LIMITS.consistency_history_max;
 const GRAPH_TRIM_SESSION_ID: &str = "graph-trim";
+const MAX_ASSET_PAYLOAD_DECODE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Commit type supported by PVGS.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -4641,6 +4643,63 @@ fn verify_asset_manifest_append(
     (receipt, Some(proof_receipt))
 }
 
+fn reassemble_asset_payload(chunks: &[&AssetChunk]) -> Option<Vec<u8>> {
+    if chunks.is_empty() {
+        return None;
+    }
+    let mut ordered: Vec<&AssetChunk> = chunks.to_vec();
+    ordered.sort_by_key(|chunk| chunk.chunk_index);
+    let expected_count = ordered[0].chunk_count;
+    if expected_count as usize != ordered.len() {
+        return None;
+    }
+    for (idx, chunk) in ordered.iter().enumerate() {
+        if chunk.chunk_index != idx as u32 || chunk.chunk_count != expected_count {
+            return None;
+        }
+    }
+    let mut payload = Vec::new();
+    for chunk in ordered {
+        payload.extend_from_slice(&chunk.payload);
+    }
+    Some(payload)
+}
+
+fn canonicalize_asset_payload_bytes(
+    kind: AssetKind,
+    payload_bytes: &[u8],
+) -> Result<Vec<u8>, prost::DecodeError> {
+    match kind {
+        AssetKind::Morphology => {
+            let mut payload = MorphologySetPayload::decode(payload_bytes)?;
+            payload
+                .morphologies
+                .sort_by_key(|entry| entry.encode_to_vec());
+            Ok(payload.encode_to_vec())
+        }
+        AssetKind::Channel => {
+            let mut payload = ChannelParamsSetPayload::decode(payload_bytes)?;
+            payload
+                .channel_params
+                .sort_by_key(|entry| entry.encode_to_vec());
+            Ok(payload.encode_to_vec())
+        }
+        AssetKind::Synapse => {
+            let mut payload = SynapseParamsSetPayload::decode(payload_bytes)?;
+            payload
+                .synapse_params
+                .sort_by_key(|entry| entry.encode_to_vec());
+            Ok(payload.encode_to_vec())
+        }
+        AssetKind::Connectivity => {
+            let mut payload = ConnectivityGraphPayload::decode(payload_bytes)?;
+            payload.edges.sort_by_key(|entry| entry.encode_to_vec());
+            Ok(payload.encode_to_vec())
+        }
+        AssetKind::Unspecified => Ok(payload_bytes.to_vec()),
+    }
+}
+
 fn verify_asset_bundle_append(
     mut req: PvgsCommitRequest,
     store: &mut PvgsStore,
@@ -4760,6 +4819,54 @@ fn verify_asset_bundle_append(
         }
     }
 
+    let mut decode_skipped_due_to_size = false;
+    let mut canonical_mismatch = false;
+    if let Some(manifest) = manifest {
+        let mut chunks_by_digest: HashMap<[u8; 32], Vec<&AssetChunk>> = HashMap::new();
+        for chunk in &bundle.chunks {
+            if let Some(asset_digest) = digest_from_bytes(&chunk.asset_digest) {
+                chunks_by_digest
+                    .entry(asset_digest)
+                    .or_default()
+                    .push(chunk);
+            }
+        }
+
+        for kind in [
+            AssetKind::Morphology,
+            AssetKind::Channel,
+            AssetKind::Synapse,
+            AssetKind::Connectivity,
+        ] {
+            let asset_digest = manifest
+                .asset_digests
+                .iter()
+                .find(|asset| AssetKind::try_from(asset.kind).ok() == Some(kind))
+                .and_then(|asset| digest_from_bytes(&asset.digest));
+            let Some(asset_digest) = asset_digest else {
+                continue;
+            };
+            let Some(chunks) = chunks_by_digest.get(&asset_digest) else {
+                continue;
+            };
+            let Some(payload_bytes) = reassemble_asset_payload(chunks) else {
+                continue;
+            };
+            if payload_bytes.len() > MAX_ASSET_PAYLOAD_DECODE_BYTES {
+                decode_skipped_due_to_size = true;
+                continue;
+            }
+            match canonicalize_asset_payload_bytes(kind, &payload_bytes) {
+                Ok(canonical_bytes) => {
+                    if canonical_bytes != payload_bytes {
+                        canonical_mismatch = true;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
     let recomputed_bundle_digest =
         manifest.and_then(|manifest| compute_asset_bundle_digest(manifest, &bundle.chunks));
     if let Some(digest) = bundle_digest {
@@ -4819,6 +4926,10 @@ fn verify_asset_bundle_append(
         reject_reason_codes.push(protocol::ReasonCodes::GV_ASSET_DIGEST_MISMATCH.to_string());
     }
 
+    if canonical_mismatch {
+        reject_reason_codes.push(protocol::ReasonCodes::GV_ASSET_CANONICAL_MISMATCH.to_string());
+    }
+
     if !reject_reason_codes.is_empty() {
         return finalize_receipt(FinalizeReceiptArgs {
             req: &req,
@@ -4876,11 +4987,17 @@ fn verify_asset_bundle_append(
     store.add_receipt_edges(&receipt);
     store.committed_payload_digests.insert(payload_digest);
 
+    let mut event_reason_codes = vec![protocol::ReasonCodes::GV_ASSET_BUNDLE_APPENDED.to_string()];
+    if decode_skipped_due_to_size {
+        event_reason_codes
+            .push(protocol::ReasonCodes::GV_ASSET_DECODE_SKIPPED_DUE_TO_SIZE.to_string());
+    }
+
     let _ = store.record_sep_event(
         &req.commit_id,
         SepEventType::EvRecoveryGov,
         payload_digest,
-        vec![protocol::ReasonCodes::GV_ASSET_BUNDLE_APPENDED.to_string()],
+        event_reason_codes,
     );
 
     (receipt, Some(proof_receipt))
@@ -6008,9 +6125,9 @@ mod tests {
     use ucf_protocol::ucf::v1::{
         AssetBundle, AssetChunk, AssetDigest, AssetKind, AssetManifest, CompressionMode,
         ConsistencyFeedback, CoreFrame, GovernanceFrame, MacroMilestone, MacroMilestoneState,
-        MagnitudeClass, MetabolicFrame, MicroModule, MicrocircuitConfigEvidence,
-        PolicyEcologyDimension, PolicyEcologyVector, RecordType, Ref, ReplayTargetKind,
-        ToolOnboardingEvent, ToolOnboardingStage, TraitDirection, TraitUpdate,
+        MagnitudeClass, MetabolicFrame, MicroModule, MicrocircuitConfigEvidence, MorphologyEntry,
+        MorphologySetPayload, PolicyEcologyDimension, PolicyEcologyVector, RecordType, Ref,
+        ReplayTargetKind, ToolOnboardingEvent, ToolOnboardingStage, TraitDirection, TraitUpdate,
     };
     use vrf::VrfEngine;
 
@@ -6479,6 +6596,48 @@ mod tests {
         (bundle, bundle_digest, asset_digest)
     }
 
+    fn asset_bundle_with_payload(
+        created_at_ms: u64,
+        asset_seed: u8,
+        kind: AssetKind,
+        payload: Vec<u8>,
+    ) -> (AssetBundle, [u8; 32], [u8; 32]) {
+        let asset_digest = [asset_seed; 32];
+        let mut manifest = AssetManifest {
+            manifest_digest: Vec::new(),
+            created_at_ms,
+            asset_digests: vec![AssetDigest {
+                kind: kind as i32,
+                digest: asset_digest.to_vec(),
+                version: 1,
+            }],
+        };
+        let manifest_digest = compute_asset_manifest_digest(&manifest);
+        manifest.manifest_digest = manifest_digest.to_vec();
+
+        let chunk = AssetChunk {
+            asset_digest: asset_digest.to_vec(),
+            chunk_index: 0,
+            chunk_count: 1,
+            payload: payload.clone(),
+            chunk_digest: compute_asset_chunk_digest(&payload).to_vec(),
+            compression_mode: CompressionMode::None as i32,
+        };
+
+        let mut bundle = AssetBundle {
+            bundle_digest: Vec::new(),
+            created_at_ms,
+            manifest: Some(manifest),
+            chunks: vec![chunk],
+        };
+        let bundle_digest =
+            compute_asset_bundle_digest(bundle.manifest.as_ref().unwrap(), &bundle.chunks)
+                .expect("bundle digest computed");
+        bundle.bundle_digest = bundle_digest.to_vec();
+
+        (bundle, bundle_digest, asset_digest)
+    }
+
     fn asset_bundle_request(store: &PvgsStore, bundle: &AssetBundle) -> PvgsCommitRequest {
         let payload = bundle.encode_to_vec();
         PvgsCommitRequest {
@@ -6759,6 +6918,95 @@ mod tests {
                 && event
                     .reason_codes
                     .contains(&ReasonCodes::GV_ASSET_BUNDLE_APPENDED.to_string())
+        });
+        assert!(has_event);
+    }
+
+    #[test]
+    fn asset_bundle_append_accepts_canonical_payload() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let payload = MorphologySetPayload {
+            morphologies: vec![
+                MorphologyEntry {
+                    neuron_id: 1,
+                    pool_label: "pool-a".to_string(),
+                    role_label: "role-a".to_string(),
+                    payload: vec![1u8],
+                },
+                MorphologyEntry {
+                    neuron_id: 2,
+                    pool_label: "pool-b".to_string(),
+                    role_label: "role-b".to_string(),
+                    payload: vec![2u8],
+                },
+            ],
+        };
+        let (bundle, _, _) =
+            asset_bundle_with_payload(55, 12, AssetKind::Morphology, payload.encode_to_vec());
+
+        let req = asset_bundle_request(&store, &bundle);
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof_receipt.is_some());
+    }
+
+    #[test]
+    fn asset_bundle_append_rejects_noncanonical_payload() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let payload = MorphologySetPayload {
+            morphologies: vec![
+                MorphologyEntry {
+                    neuron_id: 2,
+                    pool_label: "pool-b".to_string(),
+                    role_label: "role-b".to_string(),
+                    payload: vec![2u8],
+                },
+                MorphologyEntry {
+                    neuron_id: 1,
+                    pool_label: "pool-a".to_string(),
+                    role_label: "role-a".to_string(),
+                    payload: vec![1u8],
+                },
+            ],
+        };
+        let (bundle, _, _) =
+            asset_bundle_with_payload(55, 12, AssetKind::Morphology, payload.encode_to_vec());
+
+        let req = asset_bundle_request(&store, &bundle);
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert!(proof_receipt.is_none());
+        assert!(receipt
+            .reject_reason_codes
+            .contains(&ReasonCodes::GV_ASSET_CANONICAL_MISMATCH.to_string()));
+    }
+
+    #[test]
+    fn asset_bundle_append_logs_decode_skipped_due_to_size() {
+        let mut store = base_store([7u8; 32]);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+        let payload = vec![0u8; MAX_ASSET_PAYLOAD_DECODE_BYTES + 1];
+        let (bundle, digest, _) = asset_bundle_with_payload(55, 12, AssetKind::Morphology, payload);
+
+        let req = asset_bundle_request(&store, &bundle);
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof_receipt.is_some());
+
+        let has_event = store.sep_log.events.iter().any(|event| {
+            event.event_type == SepEventType::EvRecoveryGov
+                && event.object_digest == digest
+                && event
+                    .reason_codes
+                    .contains(&ReasonCodes::GV_ASSET_DECODE_SKIPPED_DUE_TO_SIZE.to_string())
         });
         assert!(has_event);
     }
