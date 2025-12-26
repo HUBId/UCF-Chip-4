@@ -442,10 +442,12 @@ mod tests {
             target_kind: ReplayTargetKind::Macro,
             target_refs: vec![Ref {
                 id: "target-a".to_string(),
+                digest: None,
             }],
             fidelity: ReplayFidelity::Low,
             counter: 0,
             trigger_reason_codes: vec![],
+            asset_manifest_ref: None,
         });
         base_plan.replay_digest.clear();
 
