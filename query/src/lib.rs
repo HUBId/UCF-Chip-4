@@ -60,6 +60,7 @@ pub struct TraceResult {
     pub plasticity_snapshots: Vec<[u8; 32]>,
     pub micro_configs_lc: Vec<[u8; 32]>,
     pub micro_configs_sn: Vec<[u8; 32]>,
+    pub replay_run_digests: Vec<[u8; 32]>,
     pub micro_evidence: MicroEvidenceSummary,
 }
 
@@ -80,6 +81,7 @@ pub struct RecordTrace {
     pub dlp_decisions: Vec<NodeKey>,
     pub micro_evidence: MicroEvidenceSummary,
     pub plasticity_snapshots: Vec<[u8; 32]>,
+    pub replay_run_digests: Vec<[u8; 32]>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -198,6 +200,10 @@ pub struct ReplayCard {
     pub pending_replay_plans_asset_bound_count: u64,
     pub pending_replay_plans_asset_missing_count: u64,
     pub pending_replay_plans_asset_missing_ids: Vec<String>,
+    pub replay_run_count_last_n: u64,
+    pub latest_replay_run_digest: Option<[u8; 32]>,
+    pub unique_replay_run_count_last_n: u64,
+    pub last_replay_run_digests: Vec<[u8; 32]>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -221,6 +227,10 @@ const MAX_ASSET_MANIFESTS: usize = 128;
 const MAX_ASSET_BUNDLES: usize = 128;
 const MAX_ASSET_PAYLOAD_SUMMARIES: usize = 4;
 const MAX_ASSET_PAYLOAD_DECODE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_REPLAY_RUN_DIGESTS: usize = 64;
+const MAX_REPLAY_SCORECARD_DIGESTS: usize = 128;
+const MAX_REPLAY_SCORECARD_LIST: usize = 5;
+const REPLAY_SCORECARD_WINDOW: usize = 1000;
 const MAX_PLASTICITY_EVIDENCE: usize = 128;
 const MAX_PLASTICITY_SCORECARD_DIGESTS: usize = 128;
 const MAX_PLASTICITY_SCORECARD_LIST: usize = 5;
@@ -706,10 +716,59 @@ fn replay_card_from_store(store: &PvgsStore, session_id: Option<&str>) -> Replay
         }
     }
 
+    let start = store
+        .experience_store
+        .records
+        .len()
+        .saturating_sub(REPLAY_SCORECARD_WINDOW);
+    let mut replay_run_count = 0u64;
+    let mut latest_replay_run_digest = None;
+    let mut unique_replay_runs = BTreeSet::new();
+    let mut last_replay_run_digests = VecDeque::new();
+
+    for record in store.experience_store.records.iter().skip(start) {
+        let record_type =
+            RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified);
+        if !matches!(record_type, RecordType::RtReplay) {
+            continue;
+        }
+
+        let digests = replay_run_digests_from_record(record);
+        if digests.is_empty() {
+            continue;
+        }
+
+        replay_run_count = replay_run_count.saturating_add(1);
+
+        for digest in digests {
+            latest_replay_run_digest = Some(digest);
+            unique_replay_runs.insert(digest);
+
+            if let Some(pos) = last_replay_run_digests
+                .iter()
+                .position(|existing| existing == &digest)
+            {
+                last_replay_run_digests.remove(pos);
+            }
+            last_replay_run_digests.push_back(digest);
+            if last_replay_run_digests.len() > MAX_REPLAY_SCORECARD_LIST {
+                last_replay_run_digests.pop_front();
+            }
+        }
+    }
+
+    let mut unique_replay_run_digests: Vec<[u8; 32]> = unique_replay_runs.into_iter().collect();
+    unique_replay_run_digests.truncate(MAX_REPLAY_SCORECARD_DIGESTS);
+    let unique_replay_run_count = unique_replay_run_digests.len() as u64;
+
     ReplayCard {
         pending_replay_plans_asset_bound_count: asset_bound,
         pending_replay_plans_asset_missing_count: asset_missing,
         pending_replay_plans_asset_missing_ids: missing_ids,
+        replay_run_count_last_n: replay_run_count,
+        latest_replay_run_digest,
+        unique_replay_run_count_last_n: unique_replay_run_count,
+        last_replay_run_digests: last_replay_run_digests.into_iter().collect(),
     }
 }
 
@@ -1362,6 +1421,7 @@ pub fn trace_action(store: &PvgsStore, action_digest: [u8; 32]) -> TraceResult {
 
     let micro_evidence = collect_micro_evidence_from_records(store, &records);
     let plasticity_snapshots = collect_plasticity_snapshots_from_records(store, &records);
+    let replay_run_digests = collect_replay_run_digests_from_records(store, &records);
 
     TraceResult {
         receipts: receipts.into_iter().collect(),
@@ -1374,6 +1434,7 @@ pub fn trace_action(store: &PvgsStore, action_digest: [u8; 32]) -> TraceResult {
         plasticity_snapshots,
         micro_configs_lc: micro_evidence.lc_configs.clone(),
         micro_configs_sn: micro_evidence.sn_configs.clone(),
+        replay_run_digests,
         micro_evidence,
     }
 }
@@ -1385,6 +1446,7 @@ pub fn trace_record(store: &PvgsStore, record_digest: [u8; 32]) -> RecordTrace {
     let mut dlp_decisions = BTreeSet::new();
     let mut micro_evidence = MicroEvidenceSummary::default();
     let mut plasticity_snapshots = Vec::new();
+    let mut replay_run_digests = Vec::new();
 
     for (edge, neighbor) in sorted_edges(store.causal_graph.neighbors(record_digest)) {
         if matches!(edge, EdgeType::References) {
@@ -1404,6 +1466,7 @@ pub fn trace_record(store: &PvgsStore, record_digest: [u8; 32]) -> RecordTrace {
         }
         micro_evidence = micro_evidence_from_record(record);
         plasticity_snapshots = plasticity_snapshots_from_record(record);
+        replay_run_digests = replay_run_digests_from_record(record);
     }
 
     RecordTrace {
@@ -1412,6 +1475,7 @@ pub fn trace_record(store: &PvgsStore, record_digest: [u8; 32]) -> RecordTrace {
         dlp_decisions: dlp_decisions.into_iter().collect(),
         micro_evidence,
         plasticity_snapshots,
+        replay_run_digests,
     }
 }
 
@@ -1495,6 +1559,41 @@ pub fn list_plasticity_evidence(store: &PvgsStore, session_id: &str) -> Vec<[u8;
     let mut snapshots: Vec<[u8; 32]> = digests.into_iter().collect();
     snapshots.truncate(MAX_PLASTICITY_EVIDENCE);
     snapshots
+}
+
+/// List replay run digests for a session in deterministic order.
+pub fn list_replay_runs(store: &PvgsStore, session_id: &str) -> Vec<[u8; 32]> {
+    let mut record_digests: Vec<[u8; 32]> = store
+        .sep_log
+        .events
+        .iter()
+        .filter(|event| {
+            event.session_id == session_id && matches!(event.event_type, SepEventType::EvAgentStep)
+        })
+        .map(|event| event.object_digest)
+        .collect();
+
+    record_digests.sort();
+    record_digests.dedup();
+
+    let mut digests = BTreeSet::new();
+
+    for digest in record_digests {
+        if let Some(record) = find_record(store, digest) {
+            let record_type =
+                RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified);
+            if !matches!(record_type, RecordType::RtReplay) {
+                continue;
+            }
+            for replay_run_digest in replay_run_digests_from_record(record) {
+                digests.insert(replay_run_digest);
+            }
+        }
+    }
+
+    let mut replay_runs: Vec<[u8; 32]> = digests.into_iter().collect();
+    replay_runs.truncate(MAX_REPLAY_RUN_DIGESTS);
+    replay_runs
 }
 
 /// List export attempts for a session in deterministic order.
@@ -1732,6 +1831,30 @@ fn plasticity_snapshots_from_record(record: &ExperienceRecord) -> Vec<[u8; 32]> 
     plasticity_snapshots_from_sets(digests)
 }
 
+fn replay_run_digest_from_ref(reference: &ucf_protocol::ucf::v1::Ref) -> Option<[u8; 32]> {
+    if reference.id == "replay_run" || reference.id.starts_with("replay_run:") {
+        return digest_from_ref(reference);
+    }
+
+    None
+}
+
+fn replay_run_digests_from_record(record: &ExperienceRecord) -> Vec<[u8; 32]> {
+    let mut digests = BTreeSet::new();
+
+    if let Some(gov) = &record.governance_frame {
+        for reference in &gov.policy_decision_refs {
+            if let Some(digest) = replay_run_digest_from_ref(reference) {
+                digests.insert(digest);
+            }
+        }
+    }
+
+    let mut replay_runs: Vec<[u8; 32]> = digests.into_iter().collect();
+    replay_runs.truncate(MAX_REPLAY_RUN_DIGESTS);
+    replay_runs
+}
+
 fn collect_micro_evidence_from_records(
     store: &PvgsStore,
     records: &BTreeSet<[u8; 32]>,
@@ -1784,6 +1907,25 @@ fn collect_plasticity_snapshots_from_records(
     }
 
     plasticity_snapshots_from_sets(digests)
+}
+
+fn collect_replay_run_digests_from_records(
+    store: &PvgsStore,
+    records: &BTreeSet<[u8; 32]>,
+) -> Vec<[u8; 32]> {
+    let mut digests = BTreeSet::new();
+
+    for record_digest in records {
+        if let Some(record) = find_record(store, *record_digest) {
+            for digest in replay_run_digests_from_record(record) {
+                digests.insert(digest);
+            }
+        }
+    }
+
+    let mut replay_runs: Vec<[u8; 32]> = digests.into_iter().collect();
+    replay_runs.truncate(MAX_REPLAY_RUN_DIGESTS);
+    replay_runs
 }
 
 fn micro_evidence_from_sets(
@@ -2603,6 +2745,13 @@ mod tests {
         }
     }
 
+    fn replay_run_ref(digest: [u8; 32]) -> Ref {
+        Ref {
+            id: "replay_run".to_string(),
+            digest: Some(digest.to_vec()),
+        }
+    }
+
     fn macro_proposal(id: &str, digest: [u8; 32]) -> MacroMilestone {
         MacroMilestone {
             macro_id: id.to_string(),
@@ -3155,6 +3304,38 @@ mod tests {
     }
 
     #[test]
+    fn trace_record_includes_replay_run_digest() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+
+        let replay_run_digest = [6u8; 32];
+        let record_digest = append_record_with_refs_and_type(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            "session-replay-run",
+            RecordType::RtReplay,
+            vec![replay_run_ref(replay_run_digest)],
+        );
+
+        let trace = trace_record(&store, record_digest);
+        assert_eq!(trace.replay_run_digests, vec![replay_run_digest]);
+    }
+
+    #[test]
     fn trace_action_collects_micro_evidence() {
         let action = [11u8; 32];
         let receipt = [12u8; 32];
@@ -3428,6 +3609,57 @@ mod tests {
     }
 
     #[test]
+    fn list_replay_runs_returns_sorted_unique_digests() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+        let session_id = "session-replay-list";
+
+        let replay_run_first = [3u8; 32];
+        let replay_run_second = [1u8; 32];
+
+        append_record_with_refs_and_type(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            session_id,
+            RecordType::RtReplay,
+            vec![replay_run_ref(replay_run_first)],
+        );
+        append_record_with_refs_and_type(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            session_id,
+            RecordType::RtReplay,
+            vec![replay_run_ref(replay_run_second)],
+        );
+        append_record_with_refs_and_type(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            session_id,
+            RecordType::RtReplay,
+            vec![replay_run_ref(replay_run_first)],
+        );
+
+        let replay_runs = list_replay_runs(&store, session_id);
+        assert_eq!(replay_runs, vec![replay_run_second, replay_run_first]);
+    }
+
+    #[test]
     fn plasticity_scorecard_tracks_latest_digest() {
         let mut known_charter_versions = HashSet::new();
         known_charter_versions.insert("charter".to_string());
@@ -3480,6 +3712,53 @@ mod tests {
         assert_eq!(card.latest_plasticity_snapshot_digest, Some(second));
         assert_eq!(card.unique_plasticity_snapshot_count, 2);
         assert_eq!(card.last_plasticity_digests, vec![first, second]);
+    }
+
+    #[test]
+    fn replay_scorecard_tracks_latest_replay_run_digest() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+
+        let mut store = PvgsStore::new(
+            [0u8; 32],
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            HashSet::new(),
+        );
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+
+        let first = [4u8; 32];
+        let second = [8u8; 32];
+
+        append_record_with_refs_and_type(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            "replay-1",
+            RecordType::RtReplay,
+            vec![replay_run_ref(first)],
+        );
+        append_record_with_refs_and_type(
+            &mut store,
+            &keystore,
+            &vrf_engine,
+            "replay-2",
+            RecordType::RtReplay,
+            vec![replay_run_ref(second)],
+        );
+
+        let snapshot = snapshot(&store, Some("replay-2"));
+        let card = snapshot.replay_card;
+
+        assert_eq!(card.replay_run_count_last_n, 2);
+        assert_eq!(card.latest_replay_run_digest, Some(second));
+        assert_eq!(card.unique_replay_run_count_last_n, 2);
+        assert_eq!(card.last_replay_run_digests, vec![first, second]);
     }
 
     #[test]

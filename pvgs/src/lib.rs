@@ -1296,15 +1296,24 @@ impl PvgsStore {
             );
         }
 
-        self.add_frame_reference_edges(session_id, record_digest, record);
-        self.add_micro_reference_edges(session_id, record_digest, record);
+        let record_type =
+            RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified);
 
-        match RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified) {
+        if matches!(record_type, RecordType::RtReplay) {
+            self.add_replay_reference_edges(session_id, record_digest, record);
+            self.add_frame_reference_edges(session_id, record_digest, record);
+            self.add_micro_reference_edges(session_id, record_digest, record);
+        } else {
+            self.add_frame_reference_edges(session_id, record_digest, record);
+            self.add_micro_reference_edges(session_id, record_digest, record);
+        }
+
+        match record_type {
             RecordType::RtActionExec => {
                 self.add_action_exec_edges(session_id, record_digest, record)
             }
             RecordType::RtOutput => self.add_output_edges(session_id, record_digest, record),
-            RecordType::RtDecision => {}
+            RecordType::RtDecision | RecordType::RtReplay => {}
             _ => {}
         }
     }
@@ -1445,6 +1454,32 @@ impl PvgsStore {
             .chain(lc_config_digests)
             .chain(sn_config_digests)
         {
+            self.add_graph_edge(
+                record_digest,
+                EdgeType::References,
+                digest,
+                Some(session_id),
+            );
+        }
+    }
+
+    fn add_replay_reference_edges(
+        &mut self,
+        session_id: &str,
+        record_digest: NodeKey,
+        record: &ExperienceRecord,
+    ) {
+        let (replay_plan_digest, _) = replay_plan_digest_from_record(record);
+        if let Some(digest) = replay_plan_digest {
+            self.add_graph_edge(
+                record_digest,
+                EdgeType::References,
+                digest,
+                Some(session_id),
+            );
+        }
+
+        if let Some(digest) = replay_run_digest_from_record(record) {
             self.add_graph_edge(
                 record_digest,
                 EdgeType::References,
@@ -5964,6 +5999,22 @@ fn replay_plan_digest_from_record(record: &ExperienceRecord) -> (Option<[u8; 32]
     (replay_plan_digest, has_embedded_action)
 }
 
+fn replay_run_digest_from_record(record: &ExperienceRecord) -> Option<[u8; 32]> {
+    let Some(gov) = &record.governance_frame else {
+        return None;
+    };
+
+    for reference in &gov.policy_decision_refs {
+        if reference.id == "replay_run" || reference.id.starts_with("replay_run:") {
+            if let Some(digest) = digest_from_ref(reference) {
+                return Some(digest);
+            }
+        }
+    }
+
+    None
+}
+
 fn key_epoch_payload_digest(req: &PvgsCommitRequest) -> Option<[u8; 32]> {
     req.payload_digests.first().copied()
 }
@@ -8189,6 +8240,36 @@ mod tests {
 
         let prev_edges = store.causal_graph.neighbors(prev);
         assert!(prev_edges.contains(&(EdgeType::Causes, record_digest)));
+    }
+
+    #[test]
+    fn graph_updates_on_replay_run_record_append() {
+        let prev = [11u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let replay_run_digest = [9u8; 32];
+        let record = replay_record(
+            vec![Ref {
+                id: "replay_run".to_string(),
+                digest: Some(replay_run_digest.to_vec()),
+            }],
+            None,
+        );
+
+        let req = make_experience_request_with_id(
+            &record,
+            &store,
+            keystore.current_epoch(),
+            "exp-replay",
+        );
+        let (record_receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(record_receipt.status, ReceiptStatus::Accepted);
+
+        let record_digest = store.experience_store.head_record_digest;
+        let neighbors = store.causal_graph.neighbors(record_digest);
+        assert!(neighbors.contains(&(EdgeType::References, replay_run_digest)));
     }
 
     #[test]
