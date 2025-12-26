@@ -19,6 +19,7 @@ ucf-protocol = { path = "../ucf-protocol" }
 dlp_store = { path = "../dlp_store" }
 milestones = { path = "../milestones" }
 replay_plan = { path = "../replay_plan" }
+replay_runs = { path = "../crates/replay_runs" }
 hex = "0.4"
 prost = { workspace = true }
 recovery = { path = "../crates/recovery" }

@@ -1,0 +1,13 @@
+[package]
+name = "replay_runs"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+ucf-protocol = { path = "../../ucf-protocol" }
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "ucf-protocol/serde"]

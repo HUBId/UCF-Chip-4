@@ -10,6 +10,7 @@ serde_yaml = { workspace = true, optional = true }
 sep = { path = "../sep" }
 ucf-protocol = { path = "../ucf-protocol" }
 replay_plan = { path = "../replay_plan" }
+replay_runs = { path = "../crates/replay_runs" }
 dlp_store = { path = "../dlp_store" }
 pev = { path = "../pev" }
 receipts = { path = "../receipts" }
@@ -37,4 +38,5 @@ serde = [
     "ucf-protocol/serde",
     "milestones/serde",
     "replay_plan/serde",
+    "replay_runs/serde",
 ]
