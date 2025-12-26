@@ -2136,9 +2136,7 @@ fn digest_from_labeled_ref(
 }
 
 fn micro_module_from_config_ref(reference: &ucf_protocol::ucf::v1::Ref) -> Option<MicroModule> {
-    if digest_from_ref(reference).is_none() {
-        return None;
-    }
+    digest_from_ref(reference)?;
 
     if reference.id == "mc_cfg:lc" || reference.id.starts_with("mc_cfg:lc:") {
         return Some(MicroModule::Lc);
