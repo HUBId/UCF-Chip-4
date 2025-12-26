@@ -201,6 +201,7 @@ pub struct BuildReplayPlanArgs {
     pub fidelity: ReplayFidelity,
     pub counter: usize,
     pub trigger_reason_codes: Vec<String>,
+    pub asset_manifest_ref: Option<Ref>,
 }
 
 pub fn build_replay_plan(args: BuildReplayPlanArgs) -> ReplayPlan {
@@ -222,6 +223,7 @@ pub fn build_replay_plan(args: BuildReplayPlanArgs) -> ReplayPlan {
         proof_receipt_ref: None,
         consumed: false,
         trigger_reason_codes: args.trigger_reason_codes,
+        asset_manifest_ref: args.asset_manifest_ref,
     };
 
     sort_plan_components(&mut plan);
@@ -256,7 +258,10 @@ fn sort_plan_components(plan: &mut ReplayPlan) {
 }
 
 pub fn ref_from_digest(digest: [u8; 32]) -> Ref {
-    Ref { id: encode(digest) }
+    Ref {
+        id: encode(digest),
+        digest: Some(digest.to_vec()),
+    }
 }
 
 #[cfg(test)]
@@ -273,9 +278,11 @@ mod tests {
             target_refs: vec![
                 Ref {
                     id: "target-b".to_string(),
+                    digest: None,
                 },
                 Ref {
                     id: "target-a".to_string(),
+                    digest: None,
                 },
             ],
             fidelity: ReplayFidelity::Low,
@@ -284,6 +291,7 @@ mod tests {
                 ReasonCodes::GV_CONSISTENCY_MED_CLUSTER.to_string(),
                 ReasonCodes::GV_CONSISTENCY_LOW.to_string(),
             ],
+            asset_manifest_ref: None,
         });
 
         let plan_two = build_replay_plan(BuildReplayPlanArgs {
@@ -294,9 +302,11 @@ mod tests {
             target_refs: vec![
                 Ref {
                     id: "target-a".to_string(),
+                    digest: None,
                 },
                 Ref {
                     id: "target-b".to_string(),
+                    digest: None,
                 },
             ],
             fidelity: ReplayFidelity::Low,
@@ -305,6 +315,7 @@ mod tests {
                 ReasonCodes::GV_CONSISTENCY_LOW.to_string(),
                 ReasonCodes::GV_CONSISTENCY_MED_CLUSTER.to_string(),
             ],
+            asset_manifest_ref: None,
         });
 
         assert_eq!(plan_one.replay_digest, plan_two.replay_digest);
@@ -324,10 +335,12 @@ mod tests {
             target_kind: ReplayTargetKind::Macro,
             target_refs: vec![Ref {
                 id: "target-a".to_string(),
+                digest: None,
             }],
             fidelity: ReplayFidelity::Low,
             counter: 0,
             trigger_reason_codes: vec![],
+            asset_manifest_ref: None,
         });
         plan_a.replay_id = "a".to_string();
         plan_a.consumed = true;
@@ -362,10 +375,12 @@ mod tests {
             target_kind: ReplayTargetKind::Macro,
             target_refs: vec![Ref {
                 id: "target-a".to_string(),
+                digest: None,
             }],
             fidelity: ReplayFidelity::Low,
             counter: 0,
             trigger_reason_codes: vec![],
+            asset_manifest_ref: None,
         });
         base_plan.replay_digest.clear();
 
@@ -394,10 +409,12 @@ mod tests {
             target_kind: ReplayTargetKind::Macro,
             target_refs: vec![Ref {
                 id: "target-a".to_string(),
+                digest: None,
             }],
             fidelity: ReplayFidelity::Low,
             counter: 0,
             trigger_reason_codes: vec![],
+            asset_manifest_ref: None,
         });
         base_plan.replay_digest.clear();
 

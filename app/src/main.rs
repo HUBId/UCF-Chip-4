@@ -112,6 +112,25 @@ fn format_snapshot(snapshot: &PvgsSnapshot) -> String {
         "asset_payload_summaries: {}",
         snapshot.assets_card.asset_payload_summaries.len()
     ));
+    lines.push(format!(
+        "replay_assets: bound={} missing={} missing_ids={}",
+        snapshot.replay_card.pending_replay_plans_asset_bound_count,
+        snapshot
+            .replay_card
+            .pending_replay_plans_asset_missing_count,
+        if snapshot
+            .replay_card
+            .pending_replay_plans_asset_missing_ids
+            .is_empty()
+        {
+            "NONE".to_string()
+        } else {
+            snapshot
+                .replay_card
+                .pending_replay_plans_asset_missing_ids
+                .join(",")
+        }
+    ));
     for summary in &snapshot.assets_card.asset_payload_summaries {
         lines.push(format!(
             "- asset_summary:{} version={} digest={} bytes_len={} neuron_count={} edge_count={} syn_param_count={} channel_param_count={} labels:pool={} role={}",
@@ -353,10 +372,12 @@ mod tests {
             target_kind: ReplayTargetKind::Micro,
             target_refs: vec![ucf_protocol::ucf::v1::Ref {
                 id: "micro:a".into(),
+                digest: None,
             }],
             fidelity: ReplayFidelity::Low,
             counter: 1,
             trigger_reason_codes: vec!["reason-a".into()],
+            asset_manifest_ref: None,
         });
         let plan_b = build_replay_plan(BuildReplayPlanArgs {
             session_id: "sess-1".into(),
@@ -365,10 +386,12 @@ mod tests {
             target_kind: ReplayTargetKind::Micro,
             target_refs: vec![ucf_protocol::ucf::v1::Ref {
                 id: "micro:b".into(),
+                digest: None,
             }],
             fidelity: ReplayFidelity::Low,
             counter: 2,
             trigger_reason_codes: vec!["reason-b".into()],
+            asset_manifest_ref: None,
         });
 
         store.replay_plans.push(plan_a.clone()).unwrap();

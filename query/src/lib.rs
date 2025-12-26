@@ -155,6 +155,14 @@ pub struct PvgsSnapshot {
     pub micro_card: MicroCard,
     pub plasticity_card: PlasticityCard,
     pub assets_card: AssetsCard,
+    pub replay_card: ReplayCard,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingReplayPlanView {
+    pub replay_id: String,
+    pub asset_manifest_digest: Option<[u8; 32]>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -182,6 +190,14 @@ pub struct AssetsCard {
     pub compression_zstd_count: u64,
     pub asset_digest_mismatch_count: u64,
     pub asset_payload_summaries: Vec<AssetPayloadSummary>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReplayCard {
+    pub pending_replay_plans_asset_bound_count: u64,
+    pub pending_replay_plans_asset_missing_count: u64,
+    pub pending_replay_plans_asset_missing_ids: Vec<String>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -444,6 +460,16 @@ pub fn get_asset_manifest(store: &PvgsStore, digest: [u8; 32]) -> Option<AssetMa
     store.asset_manifest_store.get(digest).cloned()
 }
 
+pub fn get_asset_manifest_for_replay(store: &PvgsStore, replay_id: &str) -> Option<AssetManifest> {
+    let plan = store
+        .replay_plans
+        .plans
+        .iter()
+        .find(|plan| plan.replay_id == replay_id)?;
+    let digest = plan.asset_manifest_ref.as_ref().and_then(digest_from_ref)?;
+    get_asset_manifest(store, digest)
+}
+
 /// List asset manifests sorted by created_at_ms then manifest digest.
 pub fn list_asset_manifests(store: &PvgsStore) -> Vec<AssetManifest> {
     let mut manifests: Vec<AssetManifest> = store.asset_manifest_store.list().to_vec();
@@ -568,6 +594,7 @@ pub fn snapshot(store: &PvgsStore, session_id: Option<&str>) -> PvgsSnapshot {
         micro_card: micro_card_from_store(store),
         plasticity_card: plasticity_card_from_store(store),
         assets_card: assets_card_from_store(store),
+        replay_card: replay_card_from_store(store, session_id),
     }
 }
 
@@ -649,6 +676,40 @@ fn assets_card_from_store(store: &PvgsStore) -> AssetsCard {
         compression_zstd_count,
         asset_digest_mismatch_count,
         asset_payload_summaries,
+    }
+}
+
+fn replay_card_from_store(store: &PvgsStore, session_id: Option<&str>) -> ReplayCard {
+    let mut pending_plans = match session_id {
+        Some(session) => get_pending_replay_plans(store, session),
+        None => store.replay_plans.list_pending(),
+    };
+    pending_plans.sort_by(|a, b| a.replay_id.cmp(&b.replay_id));
+
+    let mut asset_bound = 0u64;
+    let mut asset_missing = 0u64;
+    let mut missing_ids = Vec::new();
+
+    for plan in pending_plans {
+        let manifest_digest = plan.asset_manifest_ref.as_ref().and_then(digest_from_ref);
+        let manifest_exists = manifest_digest
+            .and_then(|digest| get_asset_manifest(store, digest))
+            .is_some();
+
+        if manifest_exists {
+            asset_bound += 1;
+        } else {
+            asset_missing += 1;
+            if missing_ids.len() < 3 {
+                missing_ids.push(plan.replay_id.clone());
+            }
+        }
+    }
+
+    ReplayCard {
+        pending_replay_plans_asset_bound_count: asset_bound,
+        pending_replay_plans_asset_missing_count: asset_missing,
+        pending_replay_plans_asset_missing_ids: missing_ids,
     }
 }
 
@@ -1061,6 +1122,19 @@ pub fn get_pending_replay_plans(store: &PvgsStore, session_id: &str) -> Vec<Repl
     plans.sort_by(|a, b| a.replay_id.cmp(&b.replay_id));
     plans.truncate(64);
     plans
+}
+
+pub fn get_pending_replay_plan_views(
+    store: &PvgsStore,
+    session_id: &str,
+) -> Vec<PendingReplayPlanView> {
+    get_pending_replay_plans(store, session_id)
+        .into_iter()
+        .map(|plan| PendingReplayPlanView {
+            replay_id: plan.replay_id,
+            asset_manifest_digest: plan.asset_manifest_ref.as_ref().and_then(digest_from_ref),
+        })
+        .collect()
 }
 
 pub fn consume_replay_plan(store: &mut PvgsStore, replay_id: &str) -> Result<(), QueryError> {
@@ -1765,12 +1839,18 @@ fn digest_from_labeled_value(value: &str) -> Option<[u8; 32]> {
 }
 
 fn digest_from_ref(reference: &ucf_protocol::ucf::v1::Ref) -> Option<[u8; 32]> {
-    if reference.id.len() == 64 {
-        let bytes = hex::decode(&reference.id).ok()?;
-        return digest_from_bytes(&bytes);
-    }
+    reference
+        .digest
+        .as_ref()
+        .and_then(|digest| digest_from_bytes(digest))
+        .or_else(|| {
+            if reference.id.len() == 64 {
+                let bytes = hex::decode(&reference.id).ok()?;
+                return digest_from_bytes(&bytes);
+            }
 
-    digest_from_bytes(reference.id.as_bytes())
+            digest_from_bytes(reference.id.as_bytes())
+        })
 }
 
 fn digest_from_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
@@ -2519,6 +2599,7 @@ mod tests {
     fn micro_ref(prefix: &str, digest: [u8; 32]) -> Ref {
         Ref {
             id: format!("{prefix}:{}", hex::encode(digest)),
+            digest: None,
         }
     }
 
@@ -2534,6 +2615,7 @@ mod tests {
             }],
             meso_refs: vec![Ref {
                 id: hex::encode(digest),
+                digest: None,
             }],
             consistency_class: String::new(),
             identity_anchor_flag: false,
@@ -2926,6 +3008,7 @@ mod tests {
             pvgs_receipt_ref: None,
             dlp_refs: vec![Ref {
                 id: hex::encode(dlp_digest),
+                digest: None,
             }],
         };
 
@@ -2938,6 +3021,7 @@ mod tests {
             metabolic_frame_ref: None,
             governance_frame_ref: Some(Ref {
                 id: hex::encode([3u8; 32]),
+                digest: None,
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
@@ -3104,6 +3188,7 @@ mod tests {
             metabolic_frame_ref: None,
             governance_frame_ref: Some(Ref {
                 id: hex::encode([8u8; 32]),
+                digest: None,
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
@@ -3127,6 +3212,7 @@ mod tests {
             metabolic_frame_ref: None,
             governance_frame_ref: Some(Ref {
                 id: hex::encode([9u8; 32]),
+                digest: None,
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
@@ -3193,6 +3279,7 @@ mod tests {
             metabolic_frame_ref: None,
             governance_frame_ref: Some(Ref {
                 id: hex::encode([11u8; 32]),
+                digest: None,
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
@@ -3211,6 +3298,7 @@ mod tests {
             metabolic_frame_ref: None,
             governance_frame_ref: Some(Ref {
                 id: hex::encode([12u8; 32]),
+                digest: None,
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
@@ -3484,6 +3572,7 @@ mod tests {
             pvgs_receipt_ref: None,
             dlp_refs: vec![Ref {
                 id: hex::encode(dlp_digest),
+                digest: None,
             }],
         };
 
@@ -3505,6 +3594,7 @@ mod tests {
             metabolic_frame_ref: None,
             governance_frame_ref: Some(Ref {
                 id: hex::encode([9u8; 32]),
+                digest: None,
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
@@ -3591,6 +3681,7 @@ mod tests {
             metabolic_frame_ref: None,
             governance_frame_ref: Some(Ref {
                 id: hex::encode([9u8; 32]),
+                digest: None,
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
@@ -3852,12 +3943,15 @@ mod tests {
             vec![
                 Ref {
                     id: format!("output_artifact:{}", hex::encode(output_artifact_digest)),
+                    digest: None,
                 },
                 Ref {
                     id: format!("ruleset:{}", hex::encode(ruleset_digest)),
+                    digest: None,
                 },
                 Ref {
                     id: format!("decision:{}", hex::encode(policy_decision_digest)),
+                    digest: None,
                 },
             ],
             Vec::new(),
@@ -4199,6 +4293,7 @@ mod tests {
         let mut store = minimal_store();
         let target_ref = Ref {
             id: "target".to_string(),
+            digest: None,
         };
 
         let plan_two = build_replay_plan(BuildReplayPlanArgs {
@@ -4210,6 +4305,7 @@ mod tests {
             fidelity: ReplayFidelity::Low,
             counter: 2,
             trigger_reason_codes: Vec::new(),
+            asset_manifest_ref: None,
         });
         let plan_one = build_replay_plan(BuildReplayPlanArgs {
             session_id: "sess".to_string(),
@@ -4220,6 +4316,7 @@ mod tests {
             fidelity: ReplayFidelity::Low,
             counter: 1,
             trigger_reason_codes: Vec::new(),
+            asset_manifest_ref: None,
         });
 
         store.replay_plans.push(plan_two).unwrap();
@@ -4233,5 +4330,74 @@ mod tests {
         let remaining = get_pending_replay_plans(&store, "sess");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].replay_id, plans[1].replay_id);
+    }
+
+    #[test]
+    fn replay_card_tracks_pending_asset_bindings() {
+        let mut store = minimal_store();
+        let mut manifest = AssetManifest {
+            manifest_digest: Vec::new(),
+            created_at_ms: 1,
+            asset_digests: vec![AssetDigest {
+                kind: AssetKind::Morphology as i32,
+                digest: [0x11u8; 32].to_vec(),
+                version: 1,
+            }],
+        };
+        let digest = compute_asset_manifest_digest(&manifest);
+        manifest.manifest_digest = digest.to_vec();
+        store.asset_manifest_store.insert(manifest).unwrap();
+
+        let target_ref = Ref {
+            id: "target".to_string(),
+            digest: None,
+        };
+        let plan_bound = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "sess".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![target_ref.clone()],
+            fidelity: ReplayFidelity::Low,
+            counter: 1,
+            trigger_reason_codes: Vec::new(),
+            asset_manifest_ref: Some(Ref {
+                id: "asset_manifest".to_string(),
+                digest: Some(digest.to_vec()),
+            }),
+        });
+        let plan_missing = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "sess".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![target_ref],
+            fidelity: ReplayFidelity::Low,
+            counter: 2,
+            trigger_reason_codes: Vec::new(),
+            asset_manifest_ref: Some(Ref {
+                id: "asset_manifest".to_string(),
+                digest: Some([0x22u8; 32].to_vec()),
+            }),
+        });
+
+        store.replay_plans.push(plan_bound).unwrap();
+        store.replay_plans.push(plan_missing.clone()).unwrap();
+
+        let snapshot = snapshot(&store, Some("sess"));
+        assert_eq!(
+            snapshot.replay_card.pending_replay_plans_asset_bound_count,
+            1
+        );
+        assert_eq!(
+            snapshot
+                .replay_card
+                .pending_replay_plans_asset_missing_count,
+            1
+        );
+        assert_eq!(
+            snapshot.replay_card.pending_replay_plans_asset_missing_ids,
+            vec![plan_missing.replay_id]
+        );
     }
 }

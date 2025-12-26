@@ -323,6 +323,7 @@ fn macro_source_ref(macro_milestone: &MacroMilestone) -> Ref {
         .collect();
     Ref {
         id: format!("{}:{}", macro_milestone.macro_id, digest_hex),
+        digest: None,
     }
 }
 

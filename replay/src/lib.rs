@@ -510,6 +510,14 @@ fn lookup_record<'a>(
 }
 
 fn digest_from_ref(reference: &Ref) -> Option<[u8; 32]> {
+    if let Some(digest) = reference
+        .digest
+        .as_ref()
+        .and_then(|digest| <[u8; 32]>::try_from(digest.as_slice()).ok())
+    {
+        return Some(digest);
+    }
+
     if reference.id.len() == 64 {
         if let Ok(decoded) = hex::decode(&reference.id) {
             if let Ok(array) = <[u8; 32]>::try_from(decoded.as_slice()) {
@@ -616,24 +624,29 @@ mod tests {
             core_frame: Some(CoreFrame {
                 evidence_refs: vec![Ref {
                     id: hex::encode(action),
+                    digest: None,
                 }],
             }),
             metabolic_frame: None,
             governance_frame: Some(GovernanceFrame {
                 policy_decision_refs: vec![Ref {
                     id: hex::encode(decision),
+                    digest: None,
                 }],
                 pvgs_receipt_ref: Some(Ref {
                     id: hex::encode(receipt),
+                    digest: None,
                 }),
                 dlp_refs: Vec::new(),
             }),
             core_frame_ref: Some(Ref {
                 id: hex::encode(action),
+                digest: None,
             }),
             metabolic_frame_ref: None,
             governance_frame_ref: Some(Ref {
                 id: hex::encode([9u8; 32]),
+                digest: None,
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
