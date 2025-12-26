@@ -85,15 +85,18 @@ pub fn build_decision_record(decision: &PolicyDecision, ctx: &DecisionContext) -
     let mut related_refs = vec![
         Ref {
             id: encode(decision.policy_query_digest),
+            digest: None,
         },
         Ref {
             id: encode(decision.decision_digest),
+            digest: None,
         },
     ];
 
     if let Some(ruleset) = decision.ruleset_digest {
         related_refs.push(Ref {
             id: encode(ruleset),
+            digest: None,
         });
     }
 
@@ -108,10 +111,12 @@ pub fn build_decision_record(decision: &PolicyDecision, ctx: &DecisionContext) -
         }),
         core_frame_ref: Some(Ref {
             id: format!("{}:{}", ctx.session_id, ctx.step_id),
+            digest: None,
         }),
         metabolic_frame_ref: None,
         governance_frame_ref: Some(Ref {
             id: encode(decision.decision_digest),
+            digest: None,
         }),
         dlp_refs: Vec::new(),
         finalization_header: None,

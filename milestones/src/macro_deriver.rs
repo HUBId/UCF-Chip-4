@@ -121,6 +121,7 @@ pub fn propose_macro_for_chunk(
             let digest: [u8; 32] = meso.meso_digest.clone().try_into().ok()?;
             Some(Ref {
                 id: hex::encode(digest),
+                digest: None,
             })
         })
         .collect();

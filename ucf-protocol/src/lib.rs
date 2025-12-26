@@ -572,6 +572,7 @@ pub mod ucf {
             pub const GV_ASSET_CANONICAL_MISMATCH: &'static str = "RC.GV.ASSET.CANONICAL_MISMATCH";
             pub const GV_ASSET_DECODE_SKIPPED_DUE_TO_SIZE: &'static str =
                 "RC.GV.ASSET.DECODE_SKIPPED_DUE_TO_SIZE";
+            pub const GV_ASSET_MISSING: &'static str = "RC.GV.ASSET.MISSING";
             pub const GV_RECOVERY_CREATED: &'static str = "RC.GV.RECOVERY.CREATED";
             pub const GV_RECOVERY_ADVANCED: &'static str = "RC.GV.RECOVERY.ADVANCED";
             pub const GV_RECOVERY_UNLOCK_GRANTED: &'static str = "RC.GV.RECOVERY.UNLOCK_GRANTED";
@@ -579,6 +580,9 @@ pub mod ucf {
             pub const GV_RECOVERY_INVALID_CHECKS: &'static str = "RC.GV.RECOVERY.INVALID_CHECKS";
             pub const GV_RECOVERY_UNKNOWN_CASE: &'static str = "RC.GV.RECOVERY.UNKNOWN_CASE";
             pub const RE_REPLAY_MISMATCH: &'static str = "RC.RE.REPLAY.MISMATCH";
+            pub const RE_REPLAY_ASSET_MISSING: &'static str = "RC.RE.REPLAY.ASSET_MISSING";
+            pub const RE_REPLAY_ASSET_BUNDLE_MISSING: &'static str =
+                "RC.RE.REPLAY.ASSET_BUNDLE_MISSING";
             pub const RE_REPLAY_PLAN_REF_MISSING: &'static str = "RC.RE.REPLAY.PLAN_REF_MISSING";
             pub const RE_REPLAY_PLAN_MISSING: &'static str = "RC.RE.REPLAY.PLAN_MISSING";
             pub const RE_REPLAY_INVALID_EMBEDDED_ACTION: &'static str =
@@ -644,6 +648,8 @@ pub mod ucf {
         pub struct Ref {
             #[prost(string, tag = "1")]
             pub id: String,
+            #[prost(bytes = "vec", optional, tag = "2")]
+            pub digest: Option<Vec<u8>>,
         }
 
         /// Integrity classifications for RSV state.
@@ -767,6 +773,8 @@ pub mod ucf {
             pub consumed: bool,
             #[prost(string, repeated, tag = "14")]
             pub trigger_reason_codes: Vec<String>,
+            #[prost(message, optional, tag = "15")]
+            pub asset_manifest_ref: Option<Ref>,
         }
 
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

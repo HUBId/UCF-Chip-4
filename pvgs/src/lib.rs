@@ -970,7 +970,7 @@ impl PvgsStore {
             return Ok(None);
         }
 
-        let trigger_reason_codes = replay_trigger_reasons(&signals);
+        let mut trigger_reason_codes = replay_trigger_reasons(&signals);
 
         if trigger_reason_codes.is_empty() {
             return Ok(None);
@@ -994,6 +994,14 @@ impl PvgsStore {
             return Ok(None);
         }
 
+        let asset_manifest_ref = latest_asset_manifest_digest(self).map(|digest| Ref {
+            id: "asset_manifest".to_string(),
+            digest: Some(digest.to_vec()),
+        });
+        if asset_manifest_ref.is_none() {
+            trigger_reason_codes.push(protocol::ReasonCodes::GV_ASSET_MISSING.to_string());
+        }
+
         let fidelity = if signals.integrity_degraded_present {
             ReplayFidelity::Med
         } else {
@@ -1010,6 +1018,7 @@ impl PvgsStore {
             fidelity,
             counter,
             trigger_reason_codes: trigger_reason_codes.clone(),
+            asset_manifest_ref,
         });
 
         if self.replay_plans.push(plan.clone()).is_err() {
@@ -1212,6 +1221,8 @@ impl PvgsStore {
                 &mut self.sep_log,
                 &self.dlp_store,
                 &self.replay_plans,
+                &self.asset_manifest_store,
+                &self.asset_bundle_store,
                 &self.experience_store.records,
             );
             checker.check_actions(session_id, action_digests)
@@ -1568,6 +1579,7 @@ impl PvgsStore {
 
         cbv.proof_receipt_ref = Some(Ref {
             id: proof_receipt.proof_receipt_id.clone(),
+            digest: None,
         });
         cbv.pvgs_attestation_key_id = keystore.current_key_id().to_string();
         let signature = keystore.signing_key().sign(&cbv_attestation_preimage(&cbv));
@@ -2307,6 +2319,18 @@ fn select_replay_targets(store: &PvgsStore, prefer_macro: bool) -> (ReplayTarget
     (ReplayTargetKind::Unspecified, Vec::new())
 }
 
+fn latest_asset_manifest_digest(store: &PvgsStore) -> Option<[u8; 32]> {
+    let mut manifests: Vec<AssetManifest> = store.asset_manifest_store.list().to_vec();
+    manifests.sort_by(|a, b| {
+        a.created_at_ms
+            .cmp(&b.created_at_ms)
+            .then_with(|| a.manifest_digest.cmp(&b.manifest_digest))
+    });
+    manifests
+        .pop()
+        .and_then(|manifest| digest_from_bytes(&manifest.manifest_digest))
+}
+
 fn latest_micro_refs(store: &PvgsStore) -> Vec<Ref> {
     let mut micro_refs: Vec<Ref> = store
         .micro_milestones
@@ -2941,6 +2965,7 @@ fn verify_macro_milestone_proposal(
 
     macro_milestone.proof_receipt_ref = Some(Ref {
         id: proof_receipt.proof_receipt_id.clone(),
+        digest: None,
     });
 
     let receipt = issue_receipt(
@@ -3130,6 +3155,7 @@ fn verify_macro_milestone_finalization(
         macro_milestone.consistency_feedback_ref.or_else(|| {
             Some(Ref {
                 id: hex::encode(consistency_digest),
+                digest: None,
             })
         });
     macro_milestone
@@ -3185,6 +3211,7 @@ fn verify_macro_milestone_finalization(
 
     macro_milestone.proof_receipt_ref = Some(Ref {
         id: proof_receipt.proof_receipt_id.clone(),
+        digest: None,
     });
 
     let receipt = issue_receipt(
@@ -3385,6 +3412,7 @@ fn verify_meso_milestone_append(
 
     meso_milestone.proof_receipt_ref = Some(Ref {
         id: proof_receipt.proof_receipt_id.clone(),
+        digest: None,
     });
 
     let receipt = issue_receipt(
@@ -4002,6 +4030,7 @@ fn verify_experience_record_append(
 
     finalization_header.proof_receipt_ref = Some(Ref {
         id: proof_receipt.proof_receipt_id.clone(),
+        digest: None,
     });
     finalization_header.prev_record_digest = digest_to_vec(store.current_head_record_digest);
     finalization_header.record_digest = digest_to_vec(record_digest);
@@ -5402,7 +5431,11 @@ fn optional_proto_digest(value: &Option<Digest32>) -> Option<[u8; 32]> {
 }
 
 fn digest_from_ref(reference: &Ref) -> Option<[u8; 32]> {
-    digest_from_hex_str(&reference.id)
+    reference
+        .digest
+        .as_ref()
+        .and_then(|digest| digest_from_bytes(digest))
+        .or_else(|| digest_from_hex_str(&reference.id))
         .or_else(|| {
             reference
                 .id
@@ -5485,6 +5518,8 @@ pub struct CompletenessChecker<'a> {
     sep_log: &'a mut SepLog,
     dlp_store: &'a DlpDecisionStore,
     replay_plans: &'a ReplayPlanStore,
+    asset_manifest_store: &'a AssetManifestStore,
+    asset_bundle_store: &'a AssetBundleStore,
     records: &'a [ExperienceRecord],
 }
 
@@ -5494,6 +5529,8 @@ impl<'a> CompletenessChecker<'a> {
         sep_log: &'a mut SepLog,
         dlp_store: &'a DlpDecisionStore,
         replay_plans: &'a ReplayPlanStore,
+        asset_manifest_store: &'a AssetManifestStore,
+        asset_bundle_store: &'a AssetBundleStore,
         records: &'a [ExperienceRecord],
     ) -> Self {
         Self {
@@ -5501,6 +5538,8 @@ impl<'a> CompletenessChecker<'a> {
             sep_log,
             dlp_store,
             replay_plans,
+            asset_manifest_store,
+            asset_bundle_store,
             records,
         }
     }
@@ -5735,7 +5774,7 @@ impl<'a> CompletenessChecker<'a> {
                 continue;
             };
 
-            if !self.replay_plan_exists(plan_digest) {
+            let Some(plan) = self.replay_plan_by_digest(plan_digest) else {
                 if !matches!(status, CompletenessStatus::Fail) {
                     status = CompletenessStatus::Degraded;
                 }
@@ -5749,6 +5788,61 @@ impl<'a> CompletenessChecker<'a> {
                 }
                 reason_codes.insert(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
                 reason_codes.insert(RC_RE_REPLAY_PLAN_MISSING.to_string());
+                continue;
+            };
+
+            if let Some(asset_ref) = &plan.asset_manifest_ref {
+                let manifest_digest = digest_from_ref(asset_ref);
+                let manifest_exists = manifest_digest
+                    .and_then(|digest| self.asset_manifest_store.get(digest).map(|_| digest))
+                    .is_some();
+
+                if !manifest_exists {
+                    status = CompletenessStatus::Fail;
+                    reason_codes.insert(protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string());
+                    reason_codes.insert(protocol::ReasonCodes::RE_REPLAY_MISMATCH.to_string());
+                    reason_codes.insert(protocol::ReasonCodes::RE_REPLAY_ASSET_MISSING.to_string());
+
+                    if let Some(missing_digest) = manifest_digest {
+                        missing_nodes.insert(missing_digest);
+                    }
+
+                    record_append_result(self.sep_log.append_event(
+                        session_id.to_string(),
+                        SepEventType::EvReplay,
+                        plan_digest,
+                        vec![
+                            protocol::ReasonCodes::RE_REPLAY_MISMATCH.to_string(),
+                            protocol::ReasonCodes::RE_REPLAY_ASSET_MISSING.to_string(),
+                        ],
+                    ));
+                    continue;
+                }
+
+                let bundle_exists = manifest_digest.is_some_and(|digest| {
+                    self.asset_bundle_store.list().iter().any(|bundle| {
+                        bundle
+                            .manifest
+                            .as_ref()
+                            .and_then(|manifest| digest_from_bytes(&manifest.manifest_digest))
+                            .is_some_and(|bundle_digest| bundle_digest == digest)
+                    })
+                });
+
+                if !bundle_exists {
+                    if !matches!(status, CompletenessStatus::Fail) {
+                        status = CompletenessStatus::Degraded;
+                    }
+                    reason_codes.insert(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+                    reason_codes
+                        .insert(protocol::ReasonCodes::RE_REPLAY_ASSET_BUNDLE_MISSING.to_string());
+                    record_append_result(self.sep_log.append_event(
+                        session_id.to_string(),
+                        SepEventType::EvReplay,
+                        plan_digest,
+                        vec![protocol::ReasonCodes::RE_REPLAY_ASSET_BUNDLE_MISSING.to_string()],
+                    ));
+                }
             }
         }
 
@@ -5815,12 +5909,11 @@ impl<'a> CompletenessChecker<'a> {
             .collect()
     }
 
-    fn replay_plan_exists(&self, digest: [u8; 32]) -> bool {
+    fn replay_plan_by_digest(&self, digest: [u8; 32]) -> Option<&ReplayPlan> {
         self.replay_plans
             .plans
             .iter()
-            .filter_map(|plan| digest_from_bytes(&plan.replay_digest))
-            .any(|candidate| candidate == digest)
+            .find(|plan| digest_from_bytes(&plan.replay_digest) == Some(digest))
     }
 
     fn find_record(&self, record_digest: [u8; 32]) -> Option<&ExperienceRecord> {
@@ -6144,6 +6237,10 @@ mod tests {
             known_policy_versions,
             known_profiles,
         )
+    }
+
+    fn empty_asset_stores() -> (AssetManifestStore, AssetBundleStore) {
+        (AssetManifestStore::default(), AssetBundleStore::default())
     }
 
     fn make_request(prev: [u8; 32]) -> PvgsCommitRequest {
@@ -7620,9 +7717,11 @@ mod tests {
             governance_frame: None,
             core_frame_ref: Some(Ref {
                 id: "core-ref".to_string(),
+                digest: None,
             }),
             metabolic_frame_ref: Some(Ref {
                 id: "met-ref".to_string(),
+                digest: None,
             }),
             governance_frame_ref: None,
             dlp_refs: Vec::new(),
@@ -7640,12 +7739,14 @@ mod tests {
                 pvgs_receipt_ref: None,
                 dlp_refs: vec![Ref {
                     id: hex::encode(dlp_digest),
+                    digest: None,
                 }],
             }),
             core_frame_ref: None,
             metabolic_frame_ref: None,
             governance_frame_ref: Some(Ref {
                 id: hex::encode([7u8; 32]),
+                digest: None,
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
@@ -7722,6 +7823,7 @@ mod tests {
         let record = replay_record(
             vec![Ref {
                 id: format!("mc_snap:plasticity:{}", hex::encode(plasticity_digest)),
+                digest: None,
             }],
             None,
         );
@@ -7904,6 +8006,7 @@ mod tests {
         let meso_digest = [0x42u8; 32];
         let meso_ref = Ref {
             id: hex::encode(meso_digest),
+            digest: None,
         };
 
         store_consistency_feedback(&mut store, consistency_digest, "CONSISTENCY_HIGH");
@@ -8045,24 +8148,29 @@ mod tests {
             core_frame: Some(CoreFrame {
                 evidence_refs: vec![Ref {
                     id: hex::encode(action_digest),
+                    digest: None,
                 }],
             }),
             metabolic_frame: None,
             governance_frame: Some(GovernanceFrame {
                 policy_decision_refs: vec![Ref {
                     id: hex::encode(decision_digest),
+                    digest: None,
                 }],
                 pvgs_receipt_ref: Some(Ref {
                     id: hex::encode(receipt_digest),
+                    digest: None,
                 }),
                 dlp_refs: Vec::new(),
             }),
             core_frame_ref: Some(Ref {
                 id: hex::encode(action_digest),
+                digest: None,
             }),
             metabolic_frame_ref: None,
             governance_frame_ref: Some(Ref {
                 id: hex::encode(frame_digest),
+                digest: None,
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
@@ -9358,8 +9466,16 @@ mod tests {
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
         let records = Vec::new();
-        let mut checker =
-            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let (asset_manifest_store, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
         let report = checker.check_actions("sess-ok", vec![action]);
 
         assert!(report.missing_edges.is_empty());
@@ -9374,8 +9490,16 @@ mod tests {
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
         let records = Vec::new();
-        let mut checker =
-            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let (asset_manifest_store, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
 
         let report = checker.check_actions("sess-missing", vec![[9u8; 32]]);
 
@@ -9440,8 +9564,16 @@ mod tests {
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
         let records = Vec::new();
-        let mut checker =
-            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let (asset_manifest_store, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
         let report = checker.check_actions("sess-degraded", vec![action]);
 
         assert_eq!(report.status, CompletenessStatus::Degraded);
@@ -9539,8 +9671,16 @@ mod tests {
 
         let records = vec![record];
         let replay_plans = ReplayPlanStore::default();
-        let mut checker =
-            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let (asset_manifest_store, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
         let report = checker.check_actions("sess-o-c1-ok", vec![]);
 
         assert_eq!(report.status, CompletenessStatus::Ok);
@@ -9570,8 +9710,16 @@ mod tests {
         let dlp_store = DlpDecisionStore::default();
         let records = vec![record];
         let replay_plans = ReplayPlanStore::default();
-        let mut checker =
-            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let (asset_manifest_store, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
         let report = checker.check_actions("sess-o-c1-missing", vec![]);
 
         assert_eq!(report.status, CompletenessStatus::Degraded);
@@ -9616,8 +9764,16 @@ mod tests {
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
         let records = Vec::new();
-        let mut checker =
-            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let (asset_manifest_store, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
         let report_one = checker.check_actions("sess-deterministic", vec![action]);
         let report_two = checker.check_actions("sess-deterministic", vec![action]);
 
@@ -9654,8 +9810,16 @@ mod tests {
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
         let records = Vec::new();
-        let mut checker =
-            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let (asset_manifest_store, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
         let report = checker.check_actions("sess-cf", vec![action]);
 
         assert_eq!(report.status, CompletenessStatus::Degraded);
@@ -9673,10 +9837,12 @@ mod tests {
             target_kind: ReplayTargetKind::Macro,
             target_refs: vec![Ref {
                 id: "target".to_string(),
+                digest: None,
             }],
             fidelity: ReplayFidelity::Low,
             counter: 1,
             trigger_reason_codes: Vec::new(),
+            asset_manifest_ref: None,
         });
 
         let mut replay_plans = ReplayPlanStore::default();
@@ -9686,6 +9852,7 @@ mod tests {
         let record = replay_record(
             vec![Ref {
                 id: format!("replay_plan:{}", hex::encode(plan_digest)),
+                digest: None,
             }],
             None,
         );
@@ -9701,8 +9868,16 @@ mod tests {
 
         let dlp_store = DlpDecisionStore::default();
         let records = vec![record];
-        let mut checker =
-            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let (asset_manifest_store, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
         let report = checker.check_actions("sess-replay-present", vec![]);
 
         assert_eq!(report.status, CompletenessStatus::Ok);
@@ -9720,6 +9895,7 @@ mod tests {
         let record = replay_record(
             vec![Ref {
                 id: format!("replay_plan:{}", hex::encode(plan_digest)),
+                digest: None,
             }],
             None,
         );
@@ -9736,8 +9912,16 @@ mod tests {
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
         let records = vec![record];
-        let mut checker =
-            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let (asset_manifest_store, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
         let report = checker.check_actions("sess-replay-missing-plan", vec![]);
 
         assert_eq!(report.status, CompletenessStatus::Degraded);
@@ -9761,6 +9945,149 @@ mod tests {
     }
 
     #[test]
+    fn completeness_fails_when_replay_asset_manifest_missing() {
+        let graph = CausalGraph::default();
+        let mut sep_log = SepLog::default();
+        let missing_digest = [0x44u8; 32];
+        let plan = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "sess-replay-asset-missing".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![Ref {
+                id: "target".to_string(),
+                digest: None,
+            }],
+            fidelity: ReplayFidelity::Low,
+            counter: 1,
+            trigger_reason_codes: Vec::new(),
+            asset_manifest_ref: Some(Ref {
+                id: "asset_manifest".to_string(),
+                digest: Some(missing_digest.to_vec()),
+            }),
+        });
+
+        let mut replay_plans = ReplayPlanStore::default();
+        replay_plans.push(plan.clone()).unwrap();
+        let plan_digest = digest_from_bytes(&plan.replay_digest).unwrap();
+
+        let record = replay_record(
+            vec![Ref {
+                id: format!("replay_plan:{}", hex::encode(plan_digest)),
+                digest: None,
+            }],
+            None,
+        );
+        let record_digest = compute_experience_record_digest(&record);
+        sep_log
+            .append_event(
+                "sess-replay-asset-missing".to_string(),
+                SepEventType::EvAgentStep,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
+
+        let dlp_store = DlpDecisionStore::default();
+        let records = vec![record];
+        let (asset_manifest_store, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
+        let report = checker.check_actions("sess-replay-asset-missing", vec![]);
+
+        assert_eq!(report.status, CompletenessStatus::Fail);
+        assert!(report
+            .reason_codes
+            .contains(&ReasonCodes::RE_REPLAY_MISMATCH.to_string()));
+        assert!(report
+            .reason_codes
+            .contains(&ReasonCodes::RE_REPLAY_ASSET_MISSING.to_string()));
+
+        let has_sep_event = sep_log.events.iter().any(|event| {
+            event.session_id == "sess-replay-asset-missing"
+                && event.event_type == SepEventType::EvReplay
+                && event.object_digest == plan_digest
+                && event
+                    .reason_codes
+                    .contains(&ReasonCodes::RE_REPLAY_ASSET_MISSING.to_string())
+        });
+        assert!(has_sep_event);
+    }
+
+    #[test]
+    fn completeness_degrades_when_replay_asset_bundle_missing() {
+        let graph = CausalGraph::default();
+        let mut sep_log = SepLog::default();
+        let (manifest, digest) = asset_manifest_payload(21, 4);
+        let plan = build_replay_plan(BuildReplayPlanArgs {
+            session_id: "sess-replay-bundle-missing".to_string(),
+            head_experience_id: 1,
+            head_record_digest: [1u8; 32],
+            target_kind: ReplayTargetKind::Macro,
+            target_refs: vec![Ref {
+                id: "target".to_string(),
+                digest: None,
+            }],
+            fidelity: ReplayFidelity::Low,
+            counter: 1,
+            trigger_reason_codes: Vec::new(),
+            asset_manifest_ref: Some(Ref {
+                id: "asset_manifest".to_string(),
+                digest: Some(digest.to_vec()),
+            }),
+        });
+
+        let mut replay_plans = ReplayPlanStore::default();
+        replay_plans.push(plan.clone()).unwrap();
+        let plan_digest = digest_from_bytes(&plan.replay_digest).unwrap();
+
+        let record = replay_record(
+            vec![Ref {
+                id: format!("replay_plan:{}", hex::encode(plan_digest)),
+                digest: None,
+            }],
+            None,
+        );
+        let record_digest = compute_experience_record_digest(&record);
+        sep_log
+            .append_event(
+                "sess-replay-bundle-missing".to_string(),
+                SepEventType::EvAgentStep,
+                record_digest,
+                Vec::new(),
+            )
+            .unwrap();
+
+        let dlp_store = DlpDecisionStore::default();
+        let records = vec![record];
+        let mut asset_manifest_store = AssetManifestStore::default();
+        asset_manifest_store.insert(manifest).unwrap();
+        let (_, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
+        let report = checker.check_actions("sess-replay-bundle-missing", vec![]);
+
+        assert_eq!(report.status, CompletenessStatus::Degraded);
+        assert!(report
+            .reason_codes
+            .contains(&ReasonCodes::RE_REPLAY_ASSET_BUNDLE_MISSING.to_string()));
+    }
+
+    #[test]
     fn completeness_degrades_when_replay_plan_ref_missing() {
         let graph = CausalGraph::default();
         let mut sep_log = SepLog::default();
@@ -9778,8 +10105,16 @@ mod tests {
         let dlp_store = DlpDecisionStore::default();
         let replay_plans = ReplayPlanStore::default();
         let records = vec![record];
-        let mut checker =
-            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let (asset_manifest_store, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
         let report = checker.check_actions("sess-replay-missing-ref", vec![]);
 
         assert_eq!(report.status, CompletenessStatus::Degraded);
@@ -9802,10 +10137,12 @@ mod tests {
             target_kind: ReplayTargetKind::Macro,
             target_refs: vec![Ref {
                 id: "target".to_string(),
+                digest: None,
             }],
             fidelity: ReplayFidelity::Low,
             counter: 1,
             trigger_reason_codes: Vec::new(),
+            asset_manifest_ref: None,
         });
 
         let mut replay_plans = ReplayPlanStore::default();
@@ -9816,9 +10153,11 @@ mod tests {
             vec![
                 Ref {
                     id: format!("replay_plan:{}", hex::encode(plan_digest)),
+                    digest: None,
                 },
                 Ref {
                     id: format!("action:{}", hex::encode([2u8; 32])),
+                    digest: None,
                 },
             ],
             None,
@@ -9835,8 +10174,16 @@ mod tests {
 
         let dlp_store = DlpDecisionStore::default();
         let records = vec![record];
-        let mut checker =
-            CompletenessChecker::new(&graph, &mut sep_log, &dlp_store, &replay_plans, &records);
+        let (asset_manifest_store, asset_bundle_store) = empty_asset_stores();
+        let mut checker = CompletenessChecker::new(
+            &graph,
+            &mut sep_log,
+            &dlp_store,
+            &replay_plans,
+            &asset_manifest_store,
+            &asset_bundle_store,
+            &records,
+        );
         let report = checker.check_actions("sess-replay-invalid-action", vec![]);
 
         assert_eq!(report.status, CompletenessStatus::Fail);
@@ -10036,16 +10383,19 @@ mod tests {
             governance_frame: Some(GovernanceFrame {
                 policy_decision_refs: vec![Ref {
                     id: format!("decision-ref-{idx}"),
+                    digest: None,
                 }],
                 pvgs_receipt_ref: None,
                 dlp_refs: Vec::new(),
             }),
             core_frame_ref: Some(Ref {
                 id: format!("core-{idx}"),
+                digest: None,
             }),
             metabolic_frame_ref: None,
             governance_frame_ref: Some(Ref {
                 id: format!("gov-{idx}"),
+                digest: None,
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
@@ -10192,9 +10542,52 @@ mod tests {
 
         assert_eq!(
             outcome.plan.trigger_reason_codes,
-            vec![ReasonCodes::GV_CONSISTENCY_LOW.to_string()]
+            vec![
+                ReasonCodes::GV_ASSET_MISSING.to_string(),
+                ReasonCodes::GV_CONSISTENCY_LOW.to_string(),
+            ]
         );
         assert_eq!(outcome.plan.target_kind, ReplayTargetKind::Macro as i32);
+    }
+
+    #[test]
+    fn replay_plan_binds_latest_asset_manifest() {
+        let prev = [12u8; 32];
+        let keystore = KeyStore::new_dev_keystore(1);
+        let mut store = base_store(prev);
+
+        install_macro_target(&mut store, "macro-assets", [3u8; 32]);
+
+        let (manifest_one, _) = asset_manifest_payload(10, 1);
+        store
+            .asset_manifest_store
+            .insert(manifest_one)
+            .expect("manifest one stored");
+        let (manifest_two, digest_two) = asset_manifest_payload(11, 2);
+        store
+            .asset_manifest_store
+            .insert(manifest_two)
+            .expect("manifest two stored");
+
+        track_consistency_feedback(
+            &mut store,
+            "session-assets",
+            [0xA3u8; 32],
+            "CONSISTENCY_LOW",
+        );
+
+        let outcome = store
+            .maybe_plan_replay("session-assets", &keystore)
+            .expect("replay plan created")
+            .expect("replay plan outcome");
+
+        let asset_ref = outcome
+            .plan
+            .asset_manifest_ref
+            .as_ref()
+            .expect("asset manifest ref");
+        assert_eq!(asset_ref.id, "asset_manifest");
+        assert_eq!(asset_ref.digest.as_deref(), Some(digest_two.as_slice()));
     }
 
     #[test]
@@ -10218,7 +10611,10 @@ mod tests {
 
         assert_eq!(
             outcome.plan.trigger_reason_codes,
-            vec![ReasonCodes::GV_CONSISTENCY_MED_CLUSTER.to_string()]
+            vec![
+                ReasonCodes::GV_ASSET_MISSING.to_string(),
+                ReasonCodes::GV_CONSISTENCY_MED_CLUSTER.to_string(),
+            ]
         );
     }
 
