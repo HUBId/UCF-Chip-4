@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use hex::encode;
 use pvgs::PvgsStore;
 use query::{snapshot, PvgsSnapshot};
+use ucf_protocol::ucf::v1::AssetKind;
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -107,6 +108,25 @@ fn format_snapshot(snapshot: &PvgsSnapshot) -> String {
         "asset_connectivity: {}",
         hex_or_none(snapshot.assets_card.connectivity_digest)
     ));
+    lines.push(format!(
+        "asset_payload_summaries: {}",
+        snapshot.assets_card.asset_payload_summaries.len()
+    ));
+    for summary in &snapshot.assets_card.asset_payload_summaries {
+        lines.push(format!(
+            "- asset_summary:{} version={} digest={} bytes_len={} neuron_count={} edge_count={} syn_param_count={} channel_param_count={} labels:pool={} role={}",
+            asset_kind_label(summary.kind),
+            summary.version,
+            encode(summary.digest),
+            summary.bytes_len,
+            count_or_none(summary.neuron_count),
+            count_or_none(summary.edge_count),
+            count_or_none(summary.syn_param_count),
+            count_or_none(summary.channel_param_count),
+            summary.has_pool_labels,
+            summary.has_role_labels,
+        ));
+    }
 
     lines.push(format!(
         "pending_replay_plans: {}",
@@ -175,6 +195,22 @@ fn version_or_none(value: Option<u32>) -> String {
     value
         .map(|version| version.to_string())
         .unwrap_or_else(|| "NONE".to_string())
+}
+
+fn count_or_none(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "NONE".to_string())
+}
+
+fn asset_kind_label(kind: AssetKind) -> &'static str {
+    match kind {
+        AssetKind::Unspecified => "UNSPECIFIED",
+        AssetKind::Morphology => "MORPHOLOGY",
+        AssetKind::Channel => "CHANNEL",
+        AssetKind::Synapse => "SYNAPSE",
+        AssetKind::Connectivity => "CONNECTIVITY",
+    }
 }
 
 #[cfg(test)]
@@ -400,7 +436,7 @@ mod tests {
         assert_eq!(snapshot.last_seal_digest, Some(decision_event.event_digest));
 
         let expected = format!(
-            "head: id=7 digest={}\nruleset: current={} prev={}\ncbv: epoch=5 digest={}\npev_digest: {}\nmicro_config_lc: version=1 digest={}\nmicro_config_sn: version=2 digest={}\nmicro_config_hpa: version=3 digest={}\nasset_manifest: {}\nasset_morphology: {}\nasset_channel: {}\nasset_synapse: {}\nasset_connectivity: {}\npending_replay_plans: 2\n- replay:sess-1:7:1\n- replay:sess-1:7:2\ncompleteness: {}\nlast_seal: {}\nrecovery: state=R0Captured checks=0/1 id=recovery:test\nunlock_permit: present=true digest={}\nunlock_hint: UNLOCKED_READONLY",
+            "head: id=7 digest={}\nruleset: current={} prev={}\ncbv: epoch=5 digest={}\npev_digest: {}\nmicro_config_lc: version=1 digest={}\nmicro_config_sn: version=2 digest={}\nmicro_config_hpa: version=3 digest={}\nasset_manifest: {}\nasset_morphology: {}\nasset_channel: {}\nasset_synapse: {}\nasset_connectivity: {}\nasset_payload_summaries: 0\npending_replay_plans: 2\n- replay:sess-1:7:1\n- replay:sess-1:7:2\ncompleteness: {}\nlast_seal: {}\nrecovery: state=R0Captured checks=0/1 id=recovery:test\nunlock_permit: present=true digest={}\nunlock_hint: UNLOCKED_READONLY",
             encode(head_digest),
             encode(snapshot.ruleset_digest.unwrap()),
             encode(snapshot.prev_ruleset_digest.unwrap()),

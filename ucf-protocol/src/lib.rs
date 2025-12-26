@@ -428,6 +428,78 @@ pub mod ucf {
             pub chunks: Vec<AssetChunk>,
         }
 
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct MorphologySetPayload {
+            #[prost(message, repeated, tag = "1")]
+            pub morphologies: Vec<MorphologyEntry>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct MorphologyEntry {
+            #[prost(uint32, tag = "1")]
+            pub neuron_id: u32,
+            #[prost(string, tag = "2")]
+            pub pool_label: String,
+            #[prost(string, tag = "3")]
+            pub role_label: String,
+            #[prost(bytes = "vec", tag = "4")]
+            pub payload: Vec<u8>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct ChannelParamsSetPayload {
+            #[prost(message, repeated, tag = "1")]
+            pub channel_params: Vec<ChannelParamsEntry>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct ChannelParamsEntry {
+            #[prost(string, tag = "1")]
+            pub channel_id: String,
+            #[prost(bytes = "vec", tag = "2")]
+            pub params: Vec<u8>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct SynapseParamsSetPayload {
+            #[prost(message, repeated, tag = "1")]
+            pub synapse_params: Vec<SynapseParamsEntry>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct SynapseParamsEntry {
+            #[prost(string, tag = "1")]
+            pub synapse_id: String,
+            #[prost(bytes = "vec", tag = "2")]
+            pub params: Vec<u8>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct ConnectivityGraphPayload {
+            #[prost(message, repeated, tag = "1")]
+            pub edges: Vec<ConnectivityEdge>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct ConnectivityEdge {
+            #[prost(uint32, tag = "1")]
+            pub source_id: u32,
+            #[prost(uint32, tag = "2")]
+            pub target_id: u32,
+            #[prost(string, tag = "3")]
+            pub pool_label: String,
+            #[prost(string, tag = "4")]
+            pub role_label: String,
+        }
+
         /// Control frame emitted by the engine with overlays and reasons.
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
         #[derive(Clone, Debug, PartialEq, Eq)]
@@ -497,6 +569,9 @@ pub mod ucf {
             pub const GV_ASSET_MANIFEST_APPENDED: &'static str = "RC.GV.ASSET.MANIFEST_APPENDED";
             pub const GV_ASSET_BUNDLE_APPENDED: &'static str = "RC.GV.ASSET.BUNDLE_APPENDED";
             pub const GV_ASSET_DIGEST_MISMATCH: &'static str = "RC.GV.ASSET.DIGEST_MISMATCH";
+            pub const GV_ASSET_CANONICAL_MISMATCH: &'static str = "RC.GV.ASSET.CANONICAL_MISMATCH";
+            pub const GV_ASSET_DECODE_SKIPPED_DUE_TO_SIZE: &'static str =
+                "RC.GV.ASSET.DECODE_SKIPPED_DUE_TO_SIZE";
             pub const GV_RECOVERY_CREATED: &'static str = "RC.GV.RECOVERY.CREATED";
             pub const GV_RECOVERY_ADVANCED: &'static str = "RC.GV.RECOVERY.ADVANCED";
             pub const GV_RECOVERY_UNLOCK_GRANTED: &'static str = "RC.GV.RECOVERY.UNLOCK_GRANTED";
