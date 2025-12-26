@@ -4856,13 +4856,10 @@ fn verify_asset_bundle_append(
                 decode_skipped_due_to_size = true;
                 continue;
             }
-            match canonicalize_asset_payload_bytes(kind, &payload_bytes) {
-                Ok(canonical_bytes) => {
-                    if canonical_bytes != payload_bytes {
-                        canonical_mismatch = true;
-                    }
+            if let Ok(canonical_bytes) = canonicalize_asset_payload_bytes(kind, &payload_bytes) {
+                if canonical_bytes != payload_bytes {
+                    canonical_mismatch = true;
                 }
-                Err(_) => {}
             }
         }
     }
