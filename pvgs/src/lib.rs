@@ -27,7 +27,6 @@ use replay_plan::{
     BuildReplayPlanArgs, ConsistencyClass, ConsistencyCounts, ReplayPlanStore, ReplaySignals,
 };
 use replay_runs::ReplayRunStore;
-use trace_runs::{TraceRunEvidence, TraceRunStore, TraceStatus};
 use sep::{
     CausalGraph, EdgeType, FrameEventKind, NodeKey, SepError, SepEventInternal, SepEventType,
     SepLog, SessionSeal,
@@ -40,6 +39,7 @@ use tool_events::{
     compute_event_digest as compute_tool_event_digest, ToolEventError, ToolEventStore,
 };
 use tool_registry_state::{ToolRegistryError, ToolRegistryState};
+use trace_runs::{TraceRunEvidence, TraceRunStore, TraceStatus};
 use ucf_protocol::ucf::v1::{
     self as protocol, AssetBundle, AssetChunk, AssetKind, AssetManifest, ChannelParamsSetPayload,
     CharacterBaselineVector, ConnectivityGraphPayload, ConsistencyFeedback, Digest32, DlpDecision,
@@ -8832,10 +8832,10 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: Some(
-            trace_run_evidence_payload: None,
                 replay_run_evidence(run_digest, asset_manifest_digest, micro_config_digest, 11)
                     .encode_to_vec(),
             ),
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -8976,8 +8976,7 @@ mod tests {
             asset_bundle_payload: None,
         };
 
-        let (second_receipt, _) =
-            verify_and_commit(second_req, &mut store, &keystore, &vrf_engine);
+        let (second_receipt, _) = verify_and_commit(second_req, &mut store, &keystore, &vrf_engine);
         assert_eq!(second_receipt.status, ReceiptStatus::Accepted);
         assert_eq!(store.trace_run_store.len(), 1);
 
