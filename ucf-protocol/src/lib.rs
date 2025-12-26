@@ -57,6 +57,7 @@ pub mod ucf {
             DlpDecisionAppend,
             ReplayPlanAppend,
             ReplayRunEvidenceAppend,
+            TraceRunEvidenceAppend,
             MicrocircuitConfigAppend,
             AssetManifestAppend,
             AssetBundleAppend,
@@ -560,6 +561,7 @@ pub mod ucf {
             pub const GV_REPLAY_SPOTCHECK: &'static str = "RC.GV.REPLAY.SPOTCHECK";
             pub const GV_REPLAY_RUN_EVIDENCE_APPENDED: &'static str =
                 "RC.GV.REPLAY.RUN_EVIDENCE_APPENDED";
+            pub const GV_TRACE_RUN_APPENDED: &'static str = "RC.GV.TRACE.RUN_APPENDED";
             pub const GV_PEV_UPDATED: &'static str = "RC.GV.PEV.UPDATED";
             pub const GV_TOOL_REGISTRY_UPDATED: &'static str = "RC.GV.TOOL_REGISTRY.UPDATED";
             pub const GV_TOOL_ONBOARDING_EVENT_APPENDED: &'static str =

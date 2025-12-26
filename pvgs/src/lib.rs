@@ -27,6 +27,7 @@ use replay_plan::{
     BuildReplayPlanArgs, ConsistencyClass, ConsistencyCounts, ReplayPlanStore, ReplaySignals,
 };
 use replay_runs::ReplayRunStore;
+use trace_runs::{TraceRunEvidence, TraceRunStore, TraceStatus};
 use sep::{
     CausalGraph, EdgeType, FrameEventKind, NodeKey, SepError, SepEventInternal, SepEventType,
     SepLog, SessionSeal,
@@ -83,6 +84,7 @@ pub enum CommitType {
     DlpDecisionAppend,
     ReplayPlanAppend,
     ReplayRunEvidenceAppend,
+    TraceRunEvidenceAppend,
     MicrocircuitConfigAppend,
     AssetManifestAppend,
     AssetBundleAppend,
@@ -314,6 +316,7 @@ pub struct PvgsCommitRequest {
     pub key_epoch: Option<PVGSKeyEpoch>,
     pub experience_record_payload: Option<Vec<u8>>,
     pub replay_run_evidence_payload: Option<Vec<u8>>,
+    pub trace_run_evidence_payload: Option<Vec<u8>>,
     pub macro_milestone: Option<MacroMilestone>,
     pub meso_milestone: Option<MesoMilestone>,
     pub dlp_decision_payload: Option<Vec<u8>>,
@@ -633,6 +636,7 @@ pub struct PvgsStore {
     pub macro_milestones: MacroMilestoneStore,
     pub replay_plans: ReplayPlanStore,
     pub replay_run_store: ReplayRunStore,
+    pub trace_run_store: TraceRunStore,
     pub committed_payload_digests: HashSet<[u8; 32]>,
     pub recovery_store: RecoveryStore,
     pub unlock_permits: HashMap<String, UnlockPermit>,
@@ -742,6 +746,7 @@ impl<'a> PvgsPlanner<'a> {
             key_epoch: Some(epoch.clone()),
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -861,6 +866,7 @@ impl PvgsStore {
             macro_milestones: MacroMilestoneStore::default(),
             replay_plans: ReplayPlanStore::default(),
             replay_run_store: ReplayRunStore::default(),
+            trace_run_store: TraceRunStore::default(),
             committed_payload_digests: HashSet::new(),
             recovery_store: RecoveryStore::default(),
             unlock_permits: HashMap::new(),
@@ -1689,6 +1695,7 @@ impl PvgsStore {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: Some(meso),
             dlp_decision_payload: None,
@@ -1751,6 +1758,7 @@ impl PvgsStore {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: Some(proposal.clone()),
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -1830,6 +1838,7 @@ impl PvgsStore {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: Some(macro_milestone),
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -2312,6 +2321,7 @@ fn event_type_for_commit(
         CommitType::DlpDecisionAppend => SepEventType::EvDlpDecision,
         CommitType::ReplayPlanAppend => SepEventType::EvReplay,
         CommitType::ReplayRunEvidenceAppend => SepEventType::EvReplay,
+        CommitType::TraceRunEvidenceAppend => SepEventType::EvReplay,
         CommitType::RecoveryCaseCreate => SepEventType::EvRecoveryGov,
         CommitType::RecoveryCaseAdvance => SepEventType::EvRecoveryGov,
         CommitType::RecoveryApproval => SepEventType::EvRecoveryGov,
@@ -2572,6 +2582,10 @@ pub fn verify_and_commit(
 
     if req.commit_type == CommitType::ReplayRunEvidenceAppend {
         return verify_replay_run_evidence_append(req, store, keystore);
+    }
+
+    if req.commit_type == CommitType::TraceRunEvidenceAppend {
+        return verify_trace_run_evidence_append(req, store, keystore);
     }
 
     if req.commit_type == CommitType::RecoveryCaseCreate {
@@ -5268,6 +5282,171 @@ fn verify_replay_run_evidence_append(
     (receipt, Some(proof_receipt))
 }
 
+fn verify_trace_run_evidence_append(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let payload = match req.trace_run_evidence_payload.take() {
+        Some(payload) => payload,
+        None => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let evidence = match TraceRunEvidence::decode(payload.as_slice()) {
+        Ok(evidence) => evidence,
+        Err(_) => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let run_digest = evidence.trace_run_digest;
+    if req.payload_digests.is_empty() {
+        req.payload_digests = vec![run_digest];
+    }
+
+    let receipt_input = to_receipt_input(&req);
+    let mut reject_reason_codes = Vec::new();
+
+    if req.payload_digests.len() != 1 || req.payload_digests[0] != run_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if evidence.validate().is_err() {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if req.epoch_id != keystore.current_epoch() {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+    }
+
+    if req.bindings.prev_record_digest != store.current_head_record_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+    }
+
+    if !req
+        .required_checks
+        .iter()
+        .any(|check| matches!(check, RequiredCheck::SchemaOk))
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if !store
+        .known_charter_versions
+        .contains(&req.bindings.charter_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_CHARTER_SCOPE.to_string());
+    }
+
+    if !store
+        .known_policy_versions
+        .contains(&req.bindings.policy_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_INTEGRITY_REQUIRED.to_string());
+    }
+
+    if !reject_reason_codes.is_empty() {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(run_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    let verified_fields_digest =
+        compute_verified_fields_digest(&req.bindings, req.required_receipt_kind);
+    let mut proof_receipt = issue_proof_receipt(
+        store.ruleset_state.ruleset_digest,
+        verified_fields_digest,
+        [0u8; 32],
+        keystore,
+    );
+    let receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        Vec::new(),
+        keystore,
+    );
+    proof_receipt.receipt_digest = receipt.receipt_digest.clone();
+
+    store.add_receipt_edges(&receipt);
+    if store.trace_run_store.insert(evidence.clone()).is_err() {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: vec![
+                protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+            ],
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(run_digest),
+            event_reason_codes: None,
+        });
+    }
+    store.committed_payload_digests.insert(run_digest);
+
+    store.add_graph_edge(
+        run_digest,
+        EdgeType::References,
+        evidence.asset_manifest_digest,
+        None,
+    );
+    store.add_graph_edge(
+        run_digest,
+        EdgeType::References,
+        evidence.circuit_config_digest,
+        None,
+    );
+
+    let mut reason_codes = vec![protocol::ReasonCodes::GV_TRACE_RUN_APPENDED.to_string()];
+    let event_type = if matches!(evidence.status, TraceStatus::Fail) {
+        reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+        SepEventType::EvRecovery
+    } else {
+        SepEventType::EvReplay
+    };
+
+    let _ = store.record_sep_event(&req.commit_id, event_type, run_digest, reason_codes);
+
+    (receipt, Some(proof_receipt))
+}
+
 fn verify_tool_event_append(
     mut req: PvgsCommitRequest,
     store: &mut PvgsStore,
@@ -6421,6 +6600,7 @@ impl From<CommitType> for protocol::CommitType {
             CommitType::DlpDecisionAppend => protocol::CommitType::DlpDecisionAppend,
             CommitType::ReplayPlanAppend => protocol::CommitType::ReplayPlanAppend,
             CommitType::ReplayRunEvidenceAppend => protocol::CommitType::ReplayRunEvidenceAppend,
+            CommitType::TraceRunEvidenceAppend => protocol::CommitType::TraceRunEvidenceAppend,
             CommitType::MicrocircuitConfigAppend => protocol::CommitType::MicrocircuitConfigAppend,
             CommitType::AssetManifestAppend => protocol::CommitType::AssetManifestAppend,
             CommitType::AssetBundleAppend => protocol::CommitType::AssetBundleAppend,
@@ -6526,6 +6706,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -6585,6 +6766,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -6638,6 +6820,7 @@ mod tests {
                 key_epoch: Some(epoch.clone()),
                 experience_record_payload: None,
                 replay_run_evidence_payload: None,
+                trace_run_evidence_payload: None,
                 macro_milestone: None,
                 meso_milestone: None,
                 dlp_decision_payload: None,
@@ -6800,6 +6983,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: Some(macro_milestone.clone()),
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -6890,6 +7074,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -7021,6 +7206,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -7066,6 +7252,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -7736,6 +7923,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -7806,6 +7994,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: Some(macro_milestone),
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -8065,6 +8254,25 @@ mod tests {
         }
     }
 
+    fn trace_run_evidence(
+        run_digest: [u8; 32],
+        asset_manifest_digest: [u8; 32],
+        circuit_config_digest: [u8; 32],
+        created_at_ms: u64,
+        status: TraceStatus,
+    ) -> TraceRunEvidence {
+        TraceRunEvidence {
+            trace_id: "trace-1".to_string(),
+            trace_run_digest: run_digest,
+            asset_manifest_digest,
+            circuit_config_digest,
+            steps: 42,
+            created_at_ms,
+            status,
+            reason_codes: vec!["RC.GV.OK".to_string()],
+        }
+    }
+
     fn make_experience_request_with_id(
         record: &ExperienceRecord,
         store: &PvgsStore,
@@ -8092,6 +8300,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -8580,6 +8789,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: Some(evidence.encode_to_vec()),
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -8622,6 +8832,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: Some(
+            trace_run_evidence_payload: None,
                 replay_run_evidence(run_digest, asset_manifest_digest, micro_config_digest, 11)
                     .encode_to_vec(),
             ),
@@ -8655,6 +8866,132 @@ mod tests {
         let neighbors = store.causal_graph.neighbors(run_digest);
         assert!(neighbors.contains(&(EdgeType::References, asset_manifest_digest)));
         assert!(neighbors.contains(&(EdgeType::References, micro_config_digest)));
+    }
+
+    #[test]
+    fn trace_run_evidence_append_is_idempotent() {
+        let prev = [29u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let run_digest = [11u8; 32];
+        let asset_manifest_digest = [12u8; 32];
+        let circuit_config_digest = [13u8; 32];
+        let evidence = trace_run_evidence(
+            run_digest,
+            asset_manifest_digest,
+            circuit_config_digest,
+            10,
+            TraceStatus::Pass,
+        );
+
+        let req = PvgsCommitRequest {
+            commit_id: "trace-run-evidence-1".to_string(),
+            commit_type: CommitType::TraceRunEvidenceAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Write,
+            required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            replay_run_evidence_payload: None,
+            trace_run_evidence_payload: Some(evidence.encode().expect("encode trace run")),
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: None,
+            microcircuit_config_payload: None,
+            asset_manifest_payload: None,
+            asset_bundle_payload: None,
+        };
+
+        let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(proof_receipt.is_some());
+        assert!(store.trace_run_store.get(run_digest).is_some());
+        assert_eq!(store.trace_run_store.len(), 1);
+
+        let second_req = PvgsCommitRequest {
+            commit_id: "trace-run-evidence-2".to_string(),
+            commit_type: CommitType::TraceRunEvidenceAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Write,
+            required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            replay_run_evidence_payload: None,
+            trace_run_evidence_payload: Some(
+                trace_run_evidence(
+                    run_digest,
+                    asset_manifest_digest,
+                    circuit_config_digest,
+                    11,
+                    TraceStatus::Pass,
+                )
+                .encode()
+                .expect("encode trace run"),
+            ),
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: None,
+            microcircuit_config_payload: None,
+            asset_manifest_payload: None,
+            asset_bundle_payload: None,
+        };
+
+        let (second_receipt, _) =
+            verify_and_commit(second_req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(second_receipt.status, ReceiptStatus::Accepted);
+        assert_eq!(store.trace_run_store.len(), 1);
+
+        let logged = store.sep_log.events.iter().any(|event| {
+            event.object_digest == run_digest
+                && event
+                    .reason_codes
+                    .contains(&ReasonCodes::GV_TRACE_RUN_APPENDED.to_string())
+        });
+        assert!(logged);
+
+        let neighbors = store.causal_graph.neighbors(run_digest);
+        assert!(neighbors.contains(&(EdgeType::References, asset_manifest_digest)));
+        assert!(neighbors.contains(&(EdgeType::References, circuit_config_digest)));
     }
 
     #[test]
@@ -9092,6 +9429,7 @@ mod tests {
             key_epoch: Some(backward_epoch),
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9165,6 +9503,7 @@ mod tests {
             key_epoch: Some(epoch),
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9214,6 +9553,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9279,6 +9619,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: Some(decision.encode_to_vec()),
@@ -9344,6 +9685,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9434,6 +9776,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9518,6 +9861,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9601,6 +9945,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,

@@ -1,0 +1,13 @@
+[package]
+name = "trace_runs"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+blake3.workspace = true
+
+[features]
+default = []
+serde = ["dep:serde"]

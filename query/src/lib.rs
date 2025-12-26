@@ -16,6 +16,7 @@ use sep::{EdgeType, NodeKey, SepEventInternal, SepEventType, SepLog};
 use std::collections::{BTreeSet, VecDeque};
 use std::convert::TryFrom;
 use thiserror::Error;
+use trace_runs::{TraceRunEvidence, TraceStatus};
 use ucf_protocol::ucf::v1::{
     AssetBundle, AssetChunk, AssetKind, AssetManifest, ChannelParamsSetPayload, CompressionMode,
     ConnectivityGraphPayload, ConsistencyFeedback, DlpDecisionForm, ExperienceRecord, MicroModule,
@@ -158,6 +159,7 @@ pub struct PvgsSnapshot {
     pub plasticity_card: PlasticityCard,
     pub assets_card: AssetsCard,
     pub replay_card: ReplayCard,
+    pub trace_card: TraceCard,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -211,6 +213,23 @@ pub struct ReplayCard {
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TraceCard {
+    pub latest_trace_run_digest: Option<[u8; 32]>,
+    pub latest_trace_run_status: Option<TraceStatus>,
+    pub trace_run_pass_count_last_n: u64,
+    pub trace_run_fail_count_last_n: u64,
+    pub trace_run_failures_present: bool,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TraceRunSummaryCounts {
+    pub pass_count: u64,
+    pub fail_count: u64,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicroModuleCount {
     pub module: MicroModule,
@@ -256,6 +275,8 @@ const MAX_REPLAY_SCORECARD_DIGESTS: usize = 128;
 const MAX_REPLAY_SCORECARD_LIST: usize = 5;
 const REPLAY_SCORECARD_WINDOW: usize = 1000;
 const REPLAY_RUN_EVIDENCE_WINDOW: usize = 1000;
+const TRACE_RUN_EVIDENCE_WINDOW: usize = 1000;
+const MAX_TRACE_RUNS: usize = 128;
 const MAX_PLASTICITY_EVIDENCE: usize = 128;
 const MAX_PLASTICITY_SCORECARD_DIGESTS: usize = 128;
 const MAX_PLASTICITY_SCORECARD_LIST: usize = 5;
@@ -630,6 +651,7 @@ pub fn snapshot(store: &PvgsStore, session_id: Option<&str>) -> PvgsSnapshot {
         plasticity_card: plasticity_card_from_store(store),
         assets_card: assets_card_from_store(store),
         replay_card: replay_card_from_store(store, session_id),
+        trace_card: trace_card_from_store(store),
     }
 }
 
@@ -851,6 +873,48 @@ fn replay_card_from_store(store: &PvgsStore, session_id: Option<&str>) -> Replay
         latest_replay_run_evidence_digest,
         asset_bound_run_count,
         top_micro_modules_in_runs,
+    }
+}
+
+fn trace_card_from_store(store: &PvgsStore) -> TraceCard {
+    let run_start = store
+        .trace_run_store
+        .runs
+        .len()
+        .saturating_sub(TRACE_RUN_EVIDENCE_WINDOW);
+    let recent_runs = store.trace_run_store.runs.iter().skip(run_start);
+    let mut pass_count = 0u64;
+    let mut fail_count = 0u64;
+    let mut latest_digest = None;
+    let mut latest_status = None;
+    let mut latest_created_at = 0u64;
+
+    for run in recent_runs {
+        match run.status {
+            TraceStatus::Pass => pass_count = pass_count.saturating_add(1),
+            TraceStatus::Fail => fail_count = fail_count.saturating_add(1),
+        }
+
+        let is_newer = match latest_digest {
+            Some(digest) => {
+                run.created_at_ms > latest_created_at
+                    || (run.created_at_ms == latest_created_at && run.trace_run_digest > digest)
+            }
+            None => true,
+        };
+        if is_newer {
+            latest_created_at = run.created_at_ms;
+            latest_digest = Some(run.trace_run_digest);
+            latest_status = Some(run.status);
+        }
+    }
+
+    TraceCard {
+        latest_trace_run_digest: latest_digest,
+        latest_trace_run_status: latest_status,
+        trace_run_pass_count_last_n: pass_count,
+        trace_run_fail_count_last_n: fail_count,
+        trace_run_failures_present: fail_count > 0,
     }
 }
 
@@ -1697,6 +1761,45 @@ pub fn list_replay_runs(store: &PvgsStore, limit: usize) -> Vec<ReplayRunEvidenc
     runs
 }
 
+/// List trace run evidence entries in deterministic order.
+pub fn list_trace_runs(store: &PvgsStore, limit: usize) -> Vec<TraceRunEvidence> {
+    let mut runs: Vec<TraceRunEvidence> = store.trace_run_store.runs.clone();
+    runs.sort_by(|a, b| {
+        a.created_at_ms
+            .cmp(&b.created_at_ms)
+            .then_with(|| a.trace_run_digest.cmp(&b.trace_run_digest))
+    });
+    runs.truncate(limit.min(MAX_TRACE_RUNS));
+    runs
+}
+
+/// Return the latest trace run evidence by created time.
+pub fn latest_trace_run(store: &PvgsStore) -> Option<TraceRunEvidence> {
+    store
+        .trace_run_store
+        .runs
+        .iter()
+        .max_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.trace_run_digest.cmp(&b.trace_run_digest))
+        })
+        .cloned()
+}
+
+/// Summarize pass/fail counts for the last N trace runs.
+pub fn trace_run_summary_counts(store: &PvgsStore, last_n: usize) -> TraceRunSummaryCounts {
+    let mut counts = TraceRunSummaryCounts::default();
+    let start = store.trace_run_store.runs.len().saturating_sub(last_n);
+    for run in store.trace_run_store.runs.iter().skip(start) {
+        match run.status {
+            TraceStatus::Pass => counts.pass_count = counts.pass_count.saturating_add(1),
+            TraceStatus::Fail => counts.fail_count = counts.fail_count.saturating_add(1),
+        }
+    }
+    counts
+}
+
 /// Return the latest replay run digest by created time.
 pub fn latest_replay_run_digest(store: &PvgsStore) -> Option<[u8; 32]> {
     store
@@ -2281,6 +2384,7 @@ mod tests {
     use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
     use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
+    use trace_runs::{TraceRunEvidence, TraceStatus};
     use ucf_protocol::ucf::v1::{
         AssetBundle, AssetChunk, AssetDigest, AssetKind, AssetManifest, CompressionMode,
         ConnectivityEdge, ConnectivityGraphPayload, ConsistencyFeedback, Digest32, DlpDecision,
@@ -2346,6 +2450,23 @@ mod tests {
             known_policy_versions,
             known_profiles,
         )
+    }
+
+    fn trace_run_evidence(
+        run_digest: [u8; 32],
+        created_at_ms: u64,
+        status: TraceStatus,
+    ) -> TraceRunEvidence {
+        TraceRunEvidence {
+            trace_id: "trace-1".to_string(),
+            trace_run_digest: run_digest,
+            asset_manifest_digest: [2u8; 32],
+            circuit_config_digest: [3u8; 32],
+            steps: 100,
+            created_at_ms,
+            status,
+            reason_codes: vec!["RC.GV.OK".to_string()],
+        }
     }
 
     fn asset_bundle_payload(
@@ -2480,6 +2601,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -2637,6 +2759,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -2696,6 +2819,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -2763,6 +2887,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: None,
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -3381,6 +3506,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -4071,6 +4197,39 @@ mod tests {
     }
 
     #[test]
+    fn trace_scorecard_tracks_latest_and_counts() {
+        let mut store = minimal_store();
+        store
+            .trace_run_store
+            .insert(trace_run_evidence([4u8; 32], 10, TraceStatus::Pass))
+            .expect("valid trace run");
+        store
+            .trace_run_store
+            .insert(trace_run_evidence([6u8; 32], 12, TraceStatus::Fail))
+            .expect("valid trace run");
+        store
+            .trace_run_store
+            .insert(trace_run_evidence([5u8; 32], 12, TraceStatus::Pass))
+            .expect("valid trace run");
+
+        let runs = list_trace_runs(&store, 10);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].trace_run_digest, [4u8; 32]);
+
+        let latest = latest_trace_run(&store).expect("latest trace run");
+        assert_eq!(latest.trace_run_digest, [6u8; 32]);
+        assert_eq!(latest.status, TraceStatus::Fail);
+
+        let snapshot = snapshot(&store, None);
+        let card = snapshot.trace_card;
+        assert_eq!(card.latest_trace_run_digest, Some([6u8; 32]));
+        assert_eq!(card.latest_trace_run_status, Some(TraceStatus::Fail));
+        assert_eq!(card.trace_run_pass_count_last_n, 2);
+        assert_eq!(card.trace_run_fail_count_last_n, 1);
+        assert!(card.trace_run_failures_present);
+    }
+
+    #[test]
     fn list_microcircuit_evidence_includes_configs() {
         let mut known_charter_versions = HashSet::new();
         known_charter_versions.insert("charter".to_string());
@@ -4209,6 +4368,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -4297,6 +4457,7 @@ mod tests {
             key_epoch: None,
             experience_record_payload: Some(record.encode_to_vec()),
             replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
