@@ -5231,7 +5231,7 @@ fn verify_replay_run_evidence_append(
 
     store.add_receipt_edges(&receipt);
     let run_digest = run_digest.expect("validated run digest");
-    if let Err(_) = store.replay_run_store.insert(evidence.clone()) {
+    if store.replay_run_store.insert(evidence.clone()).is_err() {
         return finalize_receipt(FinalizeReceiptArgs {
             req: &req,
             receipt_input: &receipt_input,
