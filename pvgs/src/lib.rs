@@ -10224,6 +10224,66 @@ mod tests {
     }
 
     #[test]
+    fn experience_record_roots_are_deterministic_and_distinct() {
+        let prev = [5u8; 32];
+        let keystore = KeyStore::new_dev_keystore(8);
+        let vrf_engine = VrfEngine::new_dev(8);
+        let record_one = perception_record([7u8; 32]);
+        let record_two = perception_record([8u8; 32]);
+
+        let mut store_one = base_store(prev);
+        let req_one_first = make_experience_request_with_id(
+            &record_one,
+            &store_one,
+            keystore.current_epoch(),
+            "exp-root-1",
+        );
+        let (receipt_one_first, _) =
+            verify_and_commit(req_one_first, &mut store_one, &keystore, &vrf_engine);
+        assert_eq!(receipt_one_first.status, ReceiptStatus::Accepted);
+        let root_one_first = store_one.current_head_record_digest;
+
+        let req_one_second = make_experience_request_with_id(
+            &record_two,
+            &store_one,
+            keystore.current_epoch(),
+            "exp-root-2",
+        );
+        let (receipt_one_second, _) =
+            verify_and_commit(req_one_second, &mut store_one, &keystore, &vrf_engine);
+        assert_eq!(receipt_one_second.status, ReceiptStatus::Accepted);
+        let root_one_second = store_one.current_head_record_digest;
+
+        assert_ne!(root_one_first, root_one_second);
+
+        let mut store_two = base_store(prev);
+        let req_two_first = make_experience_request_with_id(
+            &record_one,
+            &store_two,
+            keystore.current_epoch(),
+            "exp-root-3",
+        );
+        let (receipt_two_first, _) =
+            verify_and_commit(req_two_first, &mut store_two, &keystore, &vrf_engine);
+        assert_eq!(receipt_two_first.status, ReceiptStatus::Accepted);
+        let root_two_first = store_two.current_head_record_digest;
+
+        let req_two_second = make_experience_request_with_id(
+            &record_two,
+            &store_two,
+            keystore.current_epoch(),
+            "exp-root-4",
+        );
+        let (receipt_two_second, _) =
+            verify_and_commit(req_two_second, &mut store_two, &keystore, &vrf_engine);
+        assert_eq!(receipt_two_second.status, ReceiptStatus::Accepted);
+        let root_two_second = store_two.current_head_record_digest;
+
+        assert_eq!(root_one_first, root_two_first);
+        assert_eq!(root_one_second, root_two_second);
+    }
+
+    #[test]
     fn experience_store_evicts_oldest_record_and_logs_reason() {
         let mut store = base_store([0u8; 32]);
         store.limits.max_experience_records = 1;

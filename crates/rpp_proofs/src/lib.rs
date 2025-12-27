@@ -95,3 +95,59 @@ pub use envelope::{
     compute_accumulator_digest, verify_transition, Digest, RppProofEnvelope, RppPublicInputs,
     ACCUMULATOR_DOMAIN, DIGEST_LENGTH, MAX_PROOF_BYTES,
 };
+
+#[cfg(all(test, feature = "rpp-proof-envelope"))]
+mod tests {
+    use super::{compute_accumulator_digest, verify_transition, Digest, RppProofEnvelope, RppPublicInputs};
+
+    #[test]
+    fn accumulator_digest_is_deterministic() {
+        let prev_acc = [1u8; 32];
+        let prev_root = [2u8; 32];
+        let new_root = [3u8; 32];
+        let payload = [4u8; 32];
+        let ruleset = [5u8; 32];
+        let asset = [6u8; 32];
+
+        let first = compute_accumulator_digest(prev_acc, prev_root, new_root, payload, ruleset, asset);
+        let second = compute_accumulator_digest(prev_acc, prev_root, new_root, payload, ruleset, asset);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn verifier_fails_closed_on_mismatched_digest() {
+        let prev_acc = [7u8; 32];
+        let prev_root = [8u8; 32];
+        let new_root = [9u8; 32];
+        let payload = [10u8; 32];
+        let ruleset = [11u8; 32];
+        let asset = [12u8; 32];
+
+        let acc = compute_accumulator_digest(prev_acc, prev_root, new_root, payload, ruleset, asset);
+        let pub_inputs = RppPublicInputs {
+            prev_acc_digest: prev_acc,
+            acc_digest: acc,
+            prev_root,
+            new_root,
+            payload_digest: payload,
+            ruleset_digest: ruleset,
+            asset_manifest_digest_or_zero: asset,
+        };
+
+        let mut envelope = RppProofEnvelope {
+            prev_acc_digest: prev_acc,
+            acc_digest: acc,
+            prev_root_proof: Vec::new(),
+            new_root_proof: Vec::new(),
+            payload_proof: Vec::new(),
+            ruleset_proof: Vec::new(),
+            asset_manifest_proof: Vec::new(),
+        };
+
+        assert!(verify_transition(&pub_inputs, &envelope));
+
+        envelope.acc_digest = Digest::from([0u8; 32]);
+        assert!(!verify_transition(&pub_inputs, &envelope));
+    }
+}
