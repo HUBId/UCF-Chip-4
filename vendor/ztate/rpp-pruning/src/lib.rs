@@ -555,7 +555,7 @@ const fn version_from_digest(digest: &[u8; DIGEST_LENGTH]) -> u16 {
 }
 
 #[cfg(feature = "rpp-proof-envelope")]
-fn ensure_version_matches(
+const fn ensure_version_matches(
     component: &'static str,
     digest: &[u8; DIGEST_LENGTH],
     version: u16,
