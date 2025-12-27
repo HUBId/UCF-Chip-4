@@ -31,8 +31,12 @@ use sep::{
     CausalGraph, EdgeType, FrameEventKind, NodeKey, SepError, SepEventInternal, SepEventType,
     SepLog, SessionSeal,
 };
+#[cfg(feature = "rpp-firewood")]
+use rpp_store::{DeltaOp, RppStateStore};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
+#[cfg(feature = "rpp-firewood")]
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tool_events::{
@@ -648,12 +652,37 @@ pub struct PvgsStore {
     pub suspended_tools: BTreeSet<(String, String)>,
     pub tool_event_correlations: BTreeMap<[u8; 32], ToolEventCorrelation>,
     pub registry_ruleset_correlation: BTreeMap<[u8; 32], [u8; 32]>,
+    pub head_index_store: HeadIndexStore,
+    #[cfg(feature = "rpp-firewood")]
+    pub rpp_state_store: Option<Arc<Mutex<Box<dyn RppStateStore>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolEventCorrelation {
     pub ruleset_digest: [u8; 32],
     pub tool_registry_digest: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadIndexEntry {
+    pub head_record_digest: [u8; 32],
+    pub state_root: [u8; 32],
+    pub prev_state_root: [u8; 32],
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HeadIndexStore {
+    entries: BTreeMap<u64, HeadIndexEntry>,
+}
+
+impl HeadIndexStore {
+    pub fn insert(&mut self, head_id: u64, entry: HeadIndexEntry) {
+        self.entries.insert(head_id, entry);
+    }
+
+    pub fn get(&self, head_id: u64) -> Option<HeadIndexEntry> {
+        self.entries.get(&head_id).copied()
+    }
 }
 
 /// Helper for planned commits that require mutable access to the PVGS store and cryptographic
@@ -878,7 +907,15 @@ impl PvgsStore {
             suspended_tools: BTreeSet::new(),
             tool_event_correlations: BTreeMap::new(),
             registry_ruleset_correlation: BTreeMap::new(),
+            head_index_store: HeadIndexStore::default(),
+            #[cfg(feature = "rpp-firewood")]
+            rpp_state_store: None,
         }
+    }
+
+    #[cfg(feature = "rpp-firewood")]
+    pub fn attach_rpp_state_store(&mut self, state_store: Box<dyn RppStateStore>) {
+        self.rpp_state_store = Some(Arc::new(Mutex::new(state_store)));
     }
 
     pub fn get_latest_cbv(&self) -> Option<CharacterBaselineVector> {
@@ -1149,7 +1186,7 @@ impl PvgsStore {
         event_type: SepEventType,
         object_digest: [u8; 32],
         reason_codes: Vec<String>,
-    ) -> Result<(), SepError> {
+    ) -> Result<[u8; 32], SepError> {
         let replay_mismatch = reason_codes
             .iter()
             .any(|rc| rc == protocol::ReasonCodes::RE_REPLAY_MISMATCH);
@@ -1160,7 +1197,10 @@ impl PvgsStore {
             object_digest,
             reason_codes,
         ) {
-            Ok(_) => self.maybe_trigger_replay_mismatch(session_id, replay_mismatch),
+            Ok(event) => {
+                self.maybe_trigger_replay_mismatch(session_id, replay_mismatch)?;
+                Ok(event.event_digest)
+            }
             Err(SepError::Overflow) => {
                 self.record_sep_overflow_incident(session_id)?;
                 Err(SepError::Overflow)
@@ -1175,14 +1215,14 @@ impl PvgsStore {
         kind: FrameEventKind,
         frame_digest: [u8; 32],
         reason_codes: Vec<String>,
-    ) -> Result<(), SepError> {
+    ) -> Result<[u8; 32], SepError> {
         match self.sep_log.append_frame_event(
             session_id.to_string(),
             kind,
             frame_digest,
             reason_codes,
         ) {
-            Ok(_) => Ok(()),
+            Ok(event) => Ok(event.event_digest),
             Err(SepError::Overflow) => {
                 self.record_sep_overflow_incident(session_id)?;
                 Err(SepError::Overflow)
@@ -1196,7 +1236,7 @@ impl PvgsStore {
         session_id: &str,
         event_type: SepEventType,
         mut reason_codes: Vec<String>,
-    ) {
+    ) -> [u8; 32] {
         reason_codes.push(protocol::ReasonCodes::GV_RULESET_CHANGED.to_string());
         self.record_sep_event(
             session_id,
@@ -1204,7 +1244,7 @@ impl PvgsStore {
             self.ruleset_state.ruleset_digest,
             reason_codes,
         )
-        .expect("sep log append failed");
+        .expect("sep log append failed")
     }
 
     fn log_retention_evictions(
@@ -3896,12 +3936,27 @@ fn verify_tool_registry_update(
     );
     proof_receipt.receipt_digest = receipt.receipt_digest.clone();
 
+    let mut event_digests = Vec::new();
     if effective_tool_change {
-        store.log_ruleset_change(
+        let event_digest = store.log_ruleset_change(
             &req.commit_id,
             SepEventType::EvToolOnboarding,
             vec![protocol::ReasonCodes::GV_TOOL_REGISTRY_UPDATED.to_string()],
         );
+        event_digests.push(event_digest);
+    }
+
+    #[cfg(not(feature = "rpp-firewood"))]
+    let _ = &event_digests;
+
+    #[cfg(feature = "rpp-firewood")]
+    {
+        let mut delta_ops = Vec::new();
+        delta_ops.push(rpp_put("pvgs/records", record_digest));
+        for digest in event_digests {
+            delta_ops.push(rpp_put("pvgs/sep", digest));
+        }
+        apply_rpp_delta_ops(store, store.current_head_record_digest, delta_ops);
     }
 
     (receipt, Some(proof_receipt))
@@ -4105,8 +4160,21 @@ fn verify_experience_record_append(
         req.bindings.prev_record_digest,
         &record,
     );
-    log_experience_events(&req.commit_id, record_digest, &record, store);
+    let event_digests = log_experience_events(&req.commit_id, record_digest, &record, store);
     store.append_record(&req.commit_id, record, record_digest, proof_receipt.clone());
+
+    #[cfg(not(feature = "rpp-firewood"))]
+    let _ = &event_digests;
+
+    #[cfg(feature = "rpp-firewood")]
+    {
+        let mut delta_ops = Vec::new();
+        delta_ops.push(rpp_put("pvgs/records", record_digest));
+        for digest in event_digests {
+            delta_ops.push(rpp_put("pvgs/sep", digest));
+        }
+        apply_rpp_delta_ops(store, record_digest, delta_ops);
+    }
 
     (receipt, Some(proof_receipt))
 }
@@ -5082,12 +5150,28 @@ fn verify_asset_bundle_append(
             .push(protocol::ReasonCodes::GV_ASSET_DECODE_SKIPPED_DUE_TO_SIZE.to_string());
     }
 
-    let _ = store.record_sep_event(
+    let mut event_digests = Vec::new();
+    if let Ok(event_digest) = store.record_sep_event(
         &req.commit_id,
         SepEventType::EvRecoveryGov,
         payload_digest,
         event_reason_codes,
-    );
+    ) {
+        event_digests.push(event_digest);
+    }
+
+    #[cfg(not(feature = "rpp-firewood"))]
+    let _ = &event_digests;
+
+    #[cfg(feature = "rpp-firewood")]
+    {
+        let mut delta_ops = Vec::new();
+        delta_ops.push(rpp_put("pvgs/assets", payload_digest));
+        for digest in event_digests {
+            delta_ops.push(rpp_put("pvgs/sep", digest));
+        }
+        apply_rpp_delta_ops(store, store.current_head_record_digest, delta_ops);
+    }
 
     (receipt, Some(proof_receipt))
 }
@@ -5272,12 +5356,28 @@ fn verify_replay_run_evidence_append(
         }
     }
 
-    let _ = store.record_sep_event(
+    let mut event_digests = Vec::new();
+    if let Ok(event_digest) = store.record_sep_event(
         &req.commit_id,
         SepEventType::EvReplay,
         run_digest,
         vec![protocol::ReasonCodes::GV_REPLAY_RUN_EVIDENCE_APPENDED.to_string()],
-    );
+    ) {
+        event_digests.push(event_digest);
+    }
+
+    #[cfg(not(feature = "rpp-firewood"))]
+    let _ = &event_digests;
+
+    #[cfg(feature = "rpp-firewood")]
+    {
+        let mut delta_ops = Vec::new();
+        delta_ops.push(rpp_put("pvgs/replay_runs", run_digest));
+        for digest in event_digests {
+            delta_ops.push(rpp_put("pvgs/sep", digest));
+        }
+        apply_rpp_delta_ops(store, store.current_head_record_digest, delta_ops);
+    }
 
     (receipt, Some(proof_receipt))
 }
@@ -5717,15 +5817,18 @@ fn log_experience_events(
     record_digest: [u8; 32],
     record: &ExperienceRecord,
     store: &mut PvgsStore,
-) {
+) -> Vec<[u8; 32]> {
+    let mut event_digests = Vec::new();
     let record_type = RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified);
 
-    let _ = store.record_sep_event(
+    if let Ok(event_digest) = store.record_sep_event(
         commit_id,
         SepEventType::EvAgentStep,
         record_digest,
         Vec::new(),
-    );
+    ) {
+        event_digests.push(event_digest);
+    }
 
     if let RecordType::RtOutput = record_type {
         let mut dlp_digests: Vec<[u8; 32]> = Vec::new();
@@ -5754,79 +5857,145 @@ fn log_experience_events(
             if output_reason_codes.is_none() {
                 output_reason_codes = Some(reason_codes.clone());
             }
-            let _ = store.record_sep_event(
+            if let Ok(event_digest) = store.record_sep_event(
                 commit_id,
                 SepEventType::EvDlpDecision,
                 *digest,
                 reason_codes,
-            );
+            ) {
+                event_digests.push(event_digest);
+            }
         }
 
         let output_reason = output_reason_codes
             .unwrap_or_else(|| vec![protocol::ReasonCodes::RE_INTEGRITY_OK.to_string()]);
 
-        let _ = store.record_sep_event(
+        if let Ok(event_digest) = store.record_sep_event(
             commit_id,
             SepEventType::EvOutput,
             record_digest,
             output_reason,
-        );
+        ) {
+            event_digests.push(event_digest);
+        }
     }
 
     if let Some(gov) = &record.governance_frame {
         if !gov.policy_decision_refs.is_empty() {
-            let _ = store.record_sep_event(
+            if let Ok(event_digest) = store.record_sep_event(
                 commit_id,
                 SepEventType::EvDecision,
                 record_digest,
                 Vec::new(),
-            );
+            ) {
+                event_digests.push(event_digest);
+            }
         }
 
         if !gov.dlp_refs.is_empty() {
-            let _ = store.record_sep_event(
+            if let Ok(event_digest) = store.record_sep_event(
                 commit_id,
                 SepEventType::EvOutcome,
                 record_digest,
                 Vec::new(),
-            );
+            ) {
+                event_digests.push(event_digest);
+            }
         }
     }
 
     if record.metabolic_frame_ref.is_some() {
-        let _ = store.record_sep_event(
+        if let Ok(event_digest) = store.record_sep_event(
             commit_id,
             SepEventType::EvProfileChange,
             record_digest,
             Vec::new(),
-        );
+        ) {
+            event_digests.push(event_digest);
+        }
     }
 
     if let Some(meta) = &record.metabolic_frame {
         if meta.profile_digest.is_some() {
-            let _ = store.record_sep_event(
+            if let Ok(event_digest) = store.record_sep_event(
                 commit_id,
                 SepEventType::EvProfileChange,
                 record_digest,
                 Vec::new(),
-            );
+            ) {
+                event_digests.push(event_digest);
+            }
         }
 
         if !meta.outcome_refs.is_empty() {
-            let _ = store.record_sep_event(
+            if let Ok(event_digest) = store.record_sep_event(
                 commit_id,
                 SepEventType::EvOutcome,
                 record_digest,
                 Vec::new(),
-            );
+            ) {
+                event_digests.push(event_digest);
+            }
         }
     }
 
-    let _ = store.record_sep_event(
+    if let Ok(event_digest) = store.record_sep_event(
         commit_id,
         SepEventType::EvRecoveryGov,
         record_digest,
         vec!["RECORD_APPEND_OK".to_string()],
+    ) {
+        event_digests.push(event_digest);
+    }
+
+    event_digests
+}
+
+#[cfg(feature = "rpp-firewood")]
+fn rpp_key(namespace: &str, digest: [u8; 32]) -> Vec<u8> {
+    format!("{}/{}", namespace, hex::encode(digest)).into_bytes()
+}
+
+#[cfg(feature = "rpp-firewood")]
+fn rpp_put(namespace: &str, digest: [u8; 32]) -> DeltaOp {
+    DeltaOp::Put {
+        key: rpp_key(namespace, digest),
+        value: digest.to_vec(),
+    }
+}
+
+#[cfg(feature = "rpp-firewood")]
+fn apply_rpp_delta_ops(
+    store: &mut PvgsStore,
+    head_record_digest: [u8; 32],
+    delta_ops: Vec<DeltaOp>,
+) {
+    if delta_ops.is_empty() {
+        return;
+    }
+
+    let Some(state_store) = store.rpp_state_store.as_ref() else {
+        return;
+    };
+
+    let mut guard = match state_store.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    let prev_state_root = guard.current_root();
+    let new_state_root = match guard.apply_ops(&delta_ops) {
+        Ok(root) => root,
+        Err(_) => return,
+    };
+
+    store.head_index_store.insert(
+        store.experience_store.head_id,
+        HeadIndexEntry {
+            head_record_digest,
+            state_root: new_state_root,
+            prev_state_root,
+        },
     );
 }
 

@@ -622,6 +622,7 @@ dependencies = [
  "thiserror",
  "tool_events",
  "tool_registry_state",
+ "trace_runs",
  "ucf-protocol",
  "vrf",
 ]
@@ -639,6 +640,7 @@ name = "query"
 version = "0.1.0"
 dependencies = [
  "assets",
+ "blake3",
  "cbv",
  "dlp_store",
  "hex",
@@ -657,6 +659,7 @@ dependencies = [
  "serde_yaml",
  "thiserror",
  "tool_events",
+ "trace_runs",
  "ucf-protocol",
  "vrf",
  "wire",
@@ -944,6 +947,15 @@ dependencies = [
 name = "tool_registry_state"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "trace_runs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
  "serde",
  "thiserror",
 ]
