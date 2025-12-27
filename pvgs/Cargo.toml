@@ -30,6 +30,7 @@ limits = { workspace = true }
 recovery = { path = "../crates/recovery" }
 micro_evidence = { path = "../crates/micro_evidence" }
 assets = { path = "../crates/assets" }
+rpp_store = { path = "../crates/rpp_store", optional = true }
 
 [features]
 default = []
@@ -42,3 +43,4 @@ serde = [
     "replay_runs/serde",
     "trace_runs/serde",
 ]
+rpp-firewood = ["dep:rpp_store", "rpp_store/rpp-firewood"]
