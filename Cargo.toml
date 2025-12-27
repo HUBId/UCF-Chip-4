@@ -35,6 +35,11 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
+version = "0.1.0"
+license-file = "LICENSE.md"
+homepage = "https://github.com/HUBId/ztate"
+repository = "https://github.com/HUBId/ztate"
+readme = "README.md"
 
 [workspace.dependencies]
 thiserror = "1"
