@@ -50,3 +50,10 @@ ucf-protocol = { path = "ucf-protocol" }
 recovery = { path = "crates/recovery" }
 replay_runs = { path = "crates/replay_runs" }
 trace_runs = { path = "crates/trace_runs" }
+
+[patch.crates-io]
+firewood = { path = "vendor/ztate/firewood" }
+firewood-storage = { path = "vendor/ztate/storage" }
+storage-firewood = { path = "vendor/ztate/storage-firewood" }
+firewood-triehash = { path = "vendor/ztate/triehash" }
+rpp-pruning = { path = "vendor/ztate/rpp-pruning" }
