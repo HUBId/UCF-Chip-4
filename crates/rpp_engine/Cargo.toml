@@ -1,0 +1,22 @@
+[package]
+name = "rpp_engine"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+hex = { workspace = true }
+prost = { workspace = true }
+rpp_store = { path = "../rpp_store" }
+rpp_proofs = { path = "../rpp_proofs", optional = true }
+
+[features]
+default = []
+rpp-proofs = ["dep:rpp_proofs"]
+
+[lints]
+workspace = true
