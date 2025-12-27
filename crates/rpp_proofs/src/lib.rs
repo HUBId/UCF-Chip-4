@@ -33,6 +33,7 @@ mod envelope {
     }
 
     impl RppProofEnvelope {
+        #[allow(clippy::missing_const_for_fn)]
         fn proofs_within_limits(&self) -> bool {
             self.prev_root_proof.len() <= MAX_PROOF_BYTES
                 && self.new_root_proof.len() <= MAX_PROOF_BYTES
