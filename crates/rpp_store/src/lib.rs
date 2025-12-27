@@ -15,12 +15,14 @@ pub enum DeltaOp {
 }
 
 impl DeltaOp {
+    #[must_use]
     pub fn key(&self) -> &[u8] {
         match self {
             Self::Put { key, .. } | Self::Del { key } => key,
         }
     }
 
+    #[allow(clippy::missing_const_for_fn)]
     fn validate(&self) -> Result<(), Error> {
         match self {
             Self::Put { key, value } => {
@@ -63,6 +65,14 @@ pub enum Error {
 
 pub trait RppStateStore {
     fn current_root(&self) -> [u8; 32];
+
+    /// Apply a batch of operations to the state store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::KeyTooLarge`] or [`Error::ValueTooLarge`] if an op exceeds
+    /// the maximum key/value sizes. Implementations may return backend-specific
+    /// errors as well.
     fn apply_ops(&mut self, ops: &[DeltaOp]) -> Result<[u8; 32], Error>;
     fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
 }
@@ -73,6 +83,7 @@ pub struct InMemoryStateStore {
 }
 
 impl InMemoryStateStore {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -111,6 +122,12 @@ pub struct FirewoodStateStore {
 
 #[cfg(feature = "rpp-firewood")]
 impl FirewoodStateStore {
+    /// Open or create a Firewood-backed store at the given path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::FirewoodKv`] if the underlying Firewood KV store fails
+    /// to open.
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         let kv = storage_firewood::kv::FirewoodKv::open(path)?;
         Ok(Self { kv })
