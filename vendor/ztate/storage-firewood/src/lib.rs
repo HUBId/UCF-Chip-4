@@ -34,7 +34,6 @@ mod tests {
     use std::path::Path;
 
     use super::{kv::FirewoodKv, pruning::FirewoodPruner, tree::FirewoodTree};
-    use hex;
     use rpp_pruning::{TaggedDigest, ENVELOPE_TAG, SNAPSHOT_STATE_TAG};
     use sha2::{Digest, Sha256};
 

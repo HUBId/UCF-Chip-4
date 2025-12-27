@@ -117,11 +117,9 @@ impl FirewoodStateStore {
     }
 
     fn trie_root(&self) -> [u8; 32] {
-        let root: ethereum_types::H256 =
-            firewood_triehash::trie_root::<keccak_hasher::KeccakHasher, _, _, _>(
-                self.kv.scan_prefix(b""),
-            );
-        *root.as_bytes()
+        firewood_triehash::trie_root::<keccak_hasher::KeccakHasher, _, _, _>(
+            self.kv.scan_prefix(b""),
+        )
     }
 }
 

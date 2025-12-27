@@ -14,7 +14,6 @@ thiserror = { workspace = true }
 firewood-triehash = { workspace = true, optional = true }
 storage-firewood = { path = "../../vendor/ztate/storage-firewood", optional = true }
 keccak-hasher = { version = "=0.16.0", optional = true }
-ethereum-types = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -22,7 +21,6 @@ rpp-firewood = [
     "dep:firewood-triehash",
     "dep:storage-firewood",
     "dep:keccak-hasher",
-    "dep:ethereum-types",
 ]
 
 [lints]
