@@ -120,6 +120,7 @@ pub fn build_decision_record(decision: &PolicyDecision, ctx: &DecisionContext) -
         }),
         dlp_refs: Vec::new(),
         finalization_header: None,
+        rpp_refs: Vec::new(),
     }
 }
 

@@ -845,6 +845,8 @@ pub mod ucf {
             pub dlp_refs: Vec<Ref>,
             #[prost(message, optional, tag = "9")]
             pub finalization_header: Option<FinalizationHeader>,
+            #[prost(message, repeated, tag = "10")]
+            pub rpp_refs: Vec<Ref>,
         }
 
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
