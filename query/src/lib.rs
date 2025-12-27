@@ -12,6 +12,7 @@ use recovery::{
     RecoveryCase as InternalRecoveryCase, RecoveryCheck as InternalRecoveryCheck,
     RecoveryState as InternalRecoveryState,
 };
+use rpp_engine::RppHeadMeta;
 use sep::{EdgeType, NodeKey, SepEventInternal, SepEventType, SepLog};
 use std::collections::{BTreeSet, VecDeque};
 use std::convert::TryFrom;
@@ -317,6 +318,16 @@ pub fn get_key_epoch(store: &PvgsStore, epoch_id: u64) -> Option<PVGSKeyEpoch> {
         .iter()
         .find(|epoch| epoch.key_epoch_id == epoch_id)
         .cloned()
+}
+
+/// Return the latest RPP head metadata if present.
+pub fn get_latest_rpp_head_meta(store: &PvgsStore) -> Option<RppHeadMeta> {
+    store.rpp_engine.latest_head_meta().cloned()
+}
+
+/// Retrieve a specific RPP head metadata entry by id.
+pub fn get_rpp_head_meta(store: &PvgsStore, head_id: u64) -> Option<RppHeadMeta> {
+    store.rpp_engine.head_meta(head_id).cloned()
 }
 
 /// Return the most recent Policy Ecology Vector if present.
@@ -2378,8 +2389,8 @@ mod tests {
     use pev::PolicyEcologyDimension;
     use prost::Message;
     use pvgs::{
-        compute_ruleset_digest, verify_and_commit, CommitBindings, CommitType, RequiredCheck,
-        RequiredReceiptKind,
+        compute_ruleset_digest, verify_and_commit, CommitBindings, CommitType, PvgsCommitRequest,
+        RequiredCheck, RequiredReceiptKind,
     };
     use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
     use sep::{EdgeType, FrameEventKind, SepLog};
@@ -2388,10 +2399,10 @@ mod tests {
     use ucf_protocol::ucf::v1::{
         AssetBundle, AssetChunk, AssetDigest, AssetKind, AssetManifest, CompressionMode,
         ConnectivityEdge, ConnectivityGraphPayload, ConsistencyFeedback, Digest32, DlpDecision,
-        GovernanceFrame, MacroMilestone, MacroMilestoneState, MagnitudeClass, MetabolicFrame,
-        MicroModule, MicrocircuitConfigEvidence, MorphologyEntry, MorphologySetPayload,
-        ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayRunEvidence, ReplayTargetKind,
-        TraitDirection, TraitUpdate,
+        ExperienceRecord, GovernanceFrame, MacroMilestone, MacroMilestoneState, MagnitudeClass,
+        MetabolicFrame, MicroModule, MicrocircuitConfigEvidence, MorphologyEntry,
+        MorphologySetPayload, ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayRunEvidence,
+        ReplayTargetKind, TraitDirection, TraitUpdate,
     };
     use vrf::VrfEngine;
 
@@ -5150,5 +5161,82 @@ mod tests {
             snapshot.replay_card.pending_replay_plans_asset_missing_ids,
             vec![plan_missing.replay_id]
         );
+    }
+
+    #[test]
+    fn latest_rpp_head_meta_includes_payload_digest() {
+        let mut known_charter_versions = HashSet::new();
+        known_charter_versions.insert("charter".to_string());
+        let mut known_policy_versions = HashSet::new();
+        known_policy_versions.insert("policy".to_string());
+        let mut known_profiles = HashSet::new();
+        known_profiles.insert([9u8; 32]);
+
+        let prev = [1u8; 32];
+        let mut store = PvgsStore::new(
+            prev,
+            "charter".to_string(),
+            "policy".to_string(),
+            known_charter_versions,
+            known_policy_versions,
+            known_profiles,
+        );
+        store.rpp_enabled = true;
+
+        let keystore = KeyStore::new_dev_keystore(2);
+        let vrf_engine = VrfEngine::new_dev(2);
+
+        let record = ExperienceRecord {
+            record_type: RecordType::RtReplay as i32,
+            core_frame: None,
+            metabolic_frame: None,
+            governance_frame: None,
+            core_frame_ref: None,
+            metabolic_frame_ref: None,
+            governance_frame_ref: None,
+            dlp_refs: Vec::new(),
+            finalization_header: None,
+        };
+
+        let req = PvgsCommitRequest {
+            commit_id: "rpp-head".to_string(),
+            commit_type: CommitType::ExperienceRecordAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: Some(record.encode_to_vec()),
+            replay_run_evidence_payload: None,
+            trace_run_evidence_payload: None,
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: None,
+            microcircuit_config_payload: None,
+            asset_manifest_payload: None,
+            asset_bundle_payload: None,
+        };
+
+        let (_receipt, _proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        let meta = get_latest_rpp_head_meta(&store).expect("meta");
+        assert_ne!(meta.payload_digest, [0u8; 32]);
     }
 }

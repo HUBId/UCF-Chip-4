@@ -5,7 +5,7 @@ mod envelope {
     use blake3::Hasher;
 
     pub const DIGEST_LENGTH: usize = 32;
-    pub const MAX_PROOF_BYTES: usize = 1_048_576;
+    pub const MAX_PROOF_BYTES: usize = 4096;
     pub const ACCUMULATOR_DOMAIN: &[u8] = b"UCF:RPP:ACC";
 
     pub type Digest = [u8; DIGEST_LENGTH];
@@ -25,21 +25,24 @@ mod envelope {
     pub struct RppProofEnvelope {
         pub prev_acc_digest: Digest,
         pub acc_digest: Digest,
-        pub prev_root_proof: Vec<u8>,
-        pub new_root_proof: Vec<u8>,
-        pub payload_proof: Vec<u8>,
-        pub ruleset_proof: Vec<u8>,
-        pub asset_manifest_proof: Vec<u8>,
+        pub acc_proof_bytes: Vec<u8>,
+        pub step_proof_bytes: Option<Vec<u8>>,
     }
 
     impl RppProofEnvelope {
         #[allow(clippy::missing_const_for_fn)]
         fn proofs_within_limits(&self) -> bool {
-            self.prev_root_proof.len() <= MAX_PROOF_BYTES
-                && self.new_root_proof.len() <= MAX_PROOF_BYTES
-                && self.payload_proof.len() <= MAX_PROOF_BYTES
-                && self.ruleset_proof.len() <= MAX_PROOF_BYTES
-                && self.asset_manifest_proof.len() <= MAX_PROOF_BYTES
+            if self.acc_proof_bytes.len() > MAX_PROOF_BYTES {
+                return false;
+            }
+
+            if let Some(bytes) = &self.step_proof_bytes {
+                if bytes.len() > MAX_PROOF_BYTES {
+                    return false;
+                }
+            }
+
+            true
         }
     }
 
