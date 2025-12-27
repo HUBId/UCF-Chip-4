@@ -719,6 +719,7 @@ impl TryFrom<FirewoodEnvelope> for Envelope {
 }
 
 #[cfg(all(test, feature = "rpp-proof-envelope"))]
+#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
