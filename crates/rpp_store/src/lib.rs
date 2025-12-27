@@ -123,8 +123,7 @@ impl FirewoodStateStore {
             _,
             _,
         >(self.kv.scan_prefix(b""));
-        let trie_hash = firewood_storage::TrieHash::from_bytes(*root.as_bytes());
-        trie_hash.into()
+        *root.as_bytes()
     }
 }
 
@@ -140,23 +139,14 @@ impl RppStateStore for FirewoodStateStore {
             return Ok(self.current_root());
         }
 
-        let batch: Vec<firewood::v2::api::BatchOp<Vec<u8>, Vec<u8>>> = ordered
-            .into_iter()
-            .map(|op| match op {
-                DeltaOp::Put { key, value } => firewood::v2::api::BatchOp::Put { key, value },
-                DeltaOp::Del { key } => firewood::v2::api::BatchOp::Delete { key },
-            })
-            .collect();
-
-        for op in &batch {
+        for op in ordered {
             match op {
-                firewood::v2::api::BatchOp::Put { key, value } => {
-                    self.kv.put(key.clone(), value.clone());
+                DeltaOp::Put { key, value } => {
+                    self.kv.put(key, value);
                 }
-                firewood::v2::api::BatchOp::Delete { key } => {
-                    self.kv.delete(key);
+                DeltaOp::Del { key } => {
+                    self.kv.delete(&key);
                 }
-                firewood::v2::api::BatchOp::DeleteRange { .. } => {}
             }
         }
 
