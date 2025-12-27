@@ -28,10 +28,12 @@ use replay_plan::{
     BuildReplayPlanArgs, ConsistencyClass, ConsistencyCounts, ReplayPlanStore, ReplaySignals,
 };
 use replay_runs::ReplayRunStore;
+use rpp_pruning::{canonical_bincode_options, TaggedDigest, COMMITMENT_TAG};
 use sep::{
     CausalGraph, EdgeType, FrameEventKind, NodeKey, SepError, SepEventInternal, SepEventType,
     SepLog, SessionSeal,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,9 +53,6 @@ use ucf_protocol::ucf::v1::{
     ToolOnboardingStage, ToolRegistryContainer,
 };
 use vrf::VrfEngine;
-
-use serde::{Deserialize, Serialize};
-use rpp_pruning::{canonical_bincode_options, TaggedDigest, COMMITMENT_TAG};
 
 const CONSISTENCY_SIGNAL_WINDOW: usize = DEFAULT_LIMITS.consistency_signal_window;
 const CONSISTENCY_HISTORY_MAX: usize = DEFAULT_LIMITS.consistency_history_max;
