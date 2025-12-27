@@ -1,4 +1,6 @@
-use assets::{compute_asset_bundle_digest, compute_asset_chunk_digest, compute_asset_manifest_digest};
+use assets::{
+    compute_asset_bundle_digest, compute_asset_chunk_digest, compute_asset_manifest_digest,
+};
 use blake3;
 use keys::KeyStore;
 use prost::Message;
@@ -198,10 +200,7 @@ fn evidence_smoke_snapshot_is_deterministic() {
         trigger_reason_codes: vec!["RC.GV.TRIGGER".to_string()],
         asset_manifest_ref: asset_manifest_ref.clone(),
     });
-    store
-        .replay_plans
-        .push(plan_two.clone())
-        .expect("plan two");
+    store.replay_plans.push(plan_two.clone()).expect("plan two");
 
     let plan_one = build_replay_plan(BuildReplayPlanArgs {
         session_id: "session-1".to_string(),
@@ -217,14 +216,16 @@ fn evidence_smoke_snapshot_is_deterministic() {
         trigger_reason_codes: vec!["RC.GV.TRIGGER".to_string()],
         asset_manifest_ref: asset_manifest_ref.clone(),
     });
-    store
-        .replay_plans
-        .push(plan_one.clone())
-        .expect("plan one");
+    store.replay_plans.push(plan_one.clone()).expect("plan one");
 
     let replay_run_digest = [9u8; 32];
     let micro_config_digest = [10u8; 32];
-    let replay_evidence = replay_run_evidence(replay_run_digest, manifest_digest, micro_config_digest, 1234);
+    let replay_evidence = replay_run_evidence(
+        replay_run_digest,
+        manifest_digest,
+        micro_config_digest,
+        1234,
+    );
     let replay_req = PvgsCommitRequest {
         commit_id: "replay-run-evidence".to_string(),
         commit_type: CommitType::ReplayRunEvidenceAppend,
@@ -262,8 +263,7 @@ fn evidence_smoke_snapshot_is_deterministic() {
         asset_bundle_payload: None,
     };
 
-    let (replay_receipt, _) =
-        verify_and_commit(replay_req, &mut store, &keystore, &vrf_engine);
+    let (replay_receipt, _) = verify_and_commit(replay_req, &mut store, &keystore, &vrf_engine);
     assert_eq!(replay_receipt.status, ReceiptStatus::Accepted);
 
     let trace_run_digest = [11u8; 32];
@@ -327,7 +327,10 @@ fn evidence_smoke_snapshot_is_deterministic() {
     expected_pending.sort();
     assert_eq!(snapshot_one.pending_replay_ids, expected_pending);
 
-    assert_eq!(snapshot_one.assets_card.latest_manifest_digest, Some(manifest_digest));
+    assert_eq!(
+        snapshot_one.assets_card.latest_manifest_digest,
+        Some(manifest_digest)
+    );
     assert_eq!(
         snapshot_one.replay_card.latest_replay_run_evidence_digest,
         Some(replay_run_digest)
@@ -337,5 +340,8 @@ fn evidence_smoke_snapshot_is_deterministic() {
         snapshot_one.trace_card.latest_trace_run_digest,
         Some(trace_run_digest)
     );
-    assert_eq!(snapshot_one.trace_card.latest_trace_run_status, Some(TraceStatus::Pass));
+    assert_eq!(
+        snapshot_one.trace_card.latest_trace_run_status,
+        Some(TraceStatus::Pass)
+    );
 }
