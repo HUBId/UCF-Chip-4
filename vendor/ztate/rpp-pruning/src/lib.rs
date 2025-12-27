@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 /// The returned options enforce fixed-width integer encoding while retaining
 /// the default behaviour of rejecting trailing bytes, which keeps the
 /// serialized stream deterministic.
+#[must_use]
 pub fn canonical_bincode_options() -> impl Options {
     bincode::DefaultOptions::new().with_fixint_encoding()
 }
@@ -118,11 +119,13 @@ pub struct DomainTag {
 
 impl DomainTag {
     /// Creates a new domain tag from a fixed-length byte array.
+    #[must_use]
     pub const fn new(bytes: [u8; DOMAIN_TAG_LENGTH]) -> Self {
         Self { bytes }
     }
 
     /// Returns the raw tag bytes.
+    #[must_use]
     pub const fn as_bytes(self) -> [u8; DOMAIN_TAG_LENGTH] {
         self.bytes
     }
@@ -151,22 +154,26 @@ pub struct TaggedDigest {
 
 impl TaggedDigest {
     /// Builds a new tagged digest with the provided domain tag and raw digest bytes.
+    #[must_use]
     pub const fn new(tag: DomainTag, digest: [u8; DIGEST_LENGTH]) -> Self {
         Self { tag, digest }
     }
 
     /// Accessor for the domain tag.
+    #[must_use]
     pub const fn tag(self) -> DomainTag {
         self.tag
     }
 
     /// Accessor for the raw digest bytes.
+    #[must_use]
     pub const fn digest(&self) -> &[u8; DIGEST_LENGTH] {
         &self.digest
     }
 
     /// Returns the concatenation `tag || digest`, which is useful when hashing
     /// higher-level structures.
+    #[must_use]
     pub fn prefixed_bytes(&self) -> [u8; DOMAIN_TAG_LENGTH + DIGEST_LENGTH] {
         let mut bytes = [0u8; DOMAIN_TAG_LENGTH + DIGEST_LENGTH];
         bytes[..DOMAIN_TAG_LENGTH].copy_from_slice(&self.tag.as_bytes());
@@ -175,6 +182,11 @@ impl TaggedDigest {
     }
 
     /// Ensures that this digest carries the expected domain tag.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::UnexpectedDomainTag`] if the digest tag does not
+    /// match `expected`.
     pub fn ensure_tag(&self, expected: DomainTag) -> Result<(), ValidationError> {
         if self.tag == expected {
             Ok(())
@@ -238,6 +250,7 @@ pub struct SegmentIndex([4]); u32);
 
 impl BlockHeight {
     /// Returns the block height as a `u64`.
+    #[must_use]
     pub const fn as_u64(self) -> u64 {
         self.get()
     }
@@ -245,6 +258,7 @@ impl BlockHeight {
 
 impl SegmentIndex {
     /// Returns the underlying index as a `u32`.
+    #[must_use]
     pub const fn as_u32(self) -> u32 {
         self.get()
     }
@@ -252,6 +266,7 @@ impl SegmentIndex {
 
 impl SchemaVersion {
     /// Returns the canonical Firewood digest associated with this version.
+    #[must_use]
     pub fn canonical_digest(self) -> [u8; DIGEST_LENGTH] {
         canonical_version_digest(self.get())
     }
@@ -259,6 +274,7 @@ impl SchemaVersion {
 
 impl ParameterVersion {
     /// Returns the canonical Firewood digest associated with this version.
+    #[must_use]
     pub fn canonical_digest(self) -> [u8; DIGEST_LENGTH] {
         canonical_version_digest(self.get())
     }
@@ -276,6 +292,11 @@ pub struct Snapshot {
 impl Snapshot {
     /// Constructs a snapshot after verifying that the commitment uses the
     /// [`SNAPSHOT_STATE_TAG`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::UnexpectedDomainTag`] if the state commitment
+    /// is tagged with a different domain.
     pub fn new(
         schema_version: SchemaVersion,
         parameter_version: ParameterVersion,
@@ -292,21 +313,25 @@ impl Snapshot {
     }
 
     /// Returns the schema version identifier.
+    #[must_use]
     pub const fn schema_version(&self) -> SchemaVersion {
         self.schema_version
     }
 
     /// Returns the parameter version identifier.
+    #[must_use]
     pub const fn parameter_version(&self) -> ParameterVersion {
         self.parameter_version
     }
 
     /// Returns the height of the block used to generate the snapshot.
+    #[must_use]
     pub const fn block_height(&self) -> BlockHeight {
         self.block_height
     }
 
     /// Returns the state commitment.
+    #[must_use]
     pub const fn state_commitment(&self) -> TaggedDigest {
         self.state_commitment
     }
@@ -326,6 +351,12 @@ pub struct ProofSegment {
 impl ProofSegment {
     /// Constructs a proof segment after validating the commitment tag and the
     /// height range ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidSegmentRange`] if `start_height` is
+    /// greater than `end_height`, or [`ValidationError::UnexpectedDomainTag`]
+    /// if the commitment tag does not match [`PROOF_SEGMENT_TAG`].
     pub fn new(
         schema_version: SchemaVersion,
         parameter_version: ParameterVersion,
@@ -352,31 +383,37 @@ impl ProofSegment {
     }
 
     /// Returns the schema version identifier.
+    #[must_use]
     pub const fn schema_version(&self) -> SchemaVersion {
         self.schema_version
     }
 
     /// Returns the parameter version identifier.
+    #[must_use]
     pub const fn parameter_version(&self) -> ParameterVersion {
         self.parameter_version
     }
 
     /// Returns the segment index.
+    #[must_use]
     pub const fn segment_index(&self) -> SegmentIndex {
         self.segment_index
     }
 
     /// Returns the inclusive starting block height for the segment.
+    #[must_use]
     pub const fn start_height(&self) -> BlockHeight {
         self.start_height
     }
 
     /// Returns the inclusive ending block height for the segment.
+    #[must_use]
     pub const fn end_height(&self) -> BlockHeight {
         self.end_height
     }
 
     /// Returns the commitment that authenticates the segment contents.
+    #[must_use]
     pub const fn segment_commitment(&self) -> TaggedDigest {
         self.segment_commitment
     }
@@ -384,6 +421,7 @@ impl ProofSegment {
 
 /// Aggregate commitment that binds snapshots and segments.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)]
 pub struct Commitment {
     schema_version: SchemaVersion,
     parameter_version: ParameterVersion,
@@ -392,6 +430,11 @@ pub struct Commitment {
 
 impl Commitment {
     /// Builds a commitment validated against the [`COMMITMENT_TAG`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::UnexpectedDomainTag`] if the commitment tag
+    /// does not match [`COMMITMENT_TAG`].
     pub fn new(
         schema_version: SchemaVersion,
         parameter_version: ParameterVersion,
@@ -406,16 +449,19 @@ impl Commitment {
     }
 
     /// Returns the schema version identifier.
+    #[must_use]
     pub const fn schema_version(&self) -> SchemaVersion {
         self.schema_version
     }
 
     /// Returns the parameter version identifier.
+    #[must_use]
     pub const fn parameter_version(&self) -> ParameterVersion {
         self.parameter_version
     }
 
     /// Returns the aggregate commitment digest.
+    #[must_use]
     pub const fn aggregate_commitment(&self) -> TaggedDigest {
         self.aggregate_commitment
     }
@@ -436,6 +482,11 @@ pub struct Envelope {
 #[cfg(feature = "rpp-proof-envelope")]
 impl Envelope {
     /// Builds an envelope validated against the [`ENVELOPE_TAG`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::UnexpectedDomainTag`] if the binding digest
+    /// does not match [`ENVELOPE_TAG`].
     pub fn new(
         schema_version: SchemaVersion,
         parameter_version: ParameterVersion,
@@ -456,31 +507,37 @@ impl Envelope {
     }
 
     /// Returns the schema version identifier.
+    #[must_use]
     pub const fn schema_version(&self) -> SchemaVersion {
         self.schema_version
     }
 
     /// Returns the parameter version identifier.
+    #[must_use]
     pub const fn parameter_version(&self) -> ParameterVersion {
         self.parameter_version
     }
 
     /// Returns the snapshot carried by this envelope.
-    pub fn snapshot(&self) -> &Snapshot {
+    #[must_use]
+    pub const fn snapshot(&self) -> &Snapshot {
         &self.snapshot
     }
 
     /// Returns the proof segments carried by this envelope.
+    #[must_use]
     pub fn segments(&self) -> &[ProofSegment] {
         &self.segments
     }
 
     /// Returns the aggregate commitment for the envelope.
-    pub fn commitment(&self) -> &Commitment {
+    #[must_use]
+    pub const fn commitment(&self) -> &Commitment {
         &self.commitment
     }
 
     /// Returns the binding digest that authenticates the envelope.
+    #[must_use]
     pub const fn binding_digest(&self) -> TaggedDigest {
         self.binding_digest
     }
@@ -493,7 +550,7 @@ fn canonical_version_digest(version: u16) -> [u8; DIGEST_LENGTH] {
 }
 
 #[cfg(feature = "rpp-proof-envelope")]
-fn version_from_digest(digest: &[u8; DIGEST_LENGTH]) -> u16 {
+const fn version_from_digest(digest: &[u8; DIGEST_LENGTH]) -> u16 {
     u16::from_be_bytes([digest[0], digest[1]])
 }
 
@@ -533,6 +590,12 @@ pub struct FirewoodEnvelope {
 #[cfg(feature = "rpp-proof-envelope")]
 impl FirewoodEnvelope {
     /// Builds a Firewood envelope after ensuring the digests encode the supplied versions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::VersionDigestMismatch`] if any digest prefix
+    /// disagrees with the corresponding version values.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         schema_digest: [u8; DIGEST_LENGTH],
         parameter_digest: [u8; DIGEST_LENGTH],
@@ -599,16 +662,23 @@ impl FirewoodEnvelope {
     }
 
     /// Returns the schema digest carried by the Firewood envelope.
+    #[must_use]
     pub const fn schema_digest(&self) -> &[u8; DIGEST_LENGTH] {
         &self.schema_digest
     }
 
     /// Returns the parameter digest carried by the Firewood envelope.
+    #[must_use]
     pub const fn parameter_digest(&self) -> &[u8; DIGEST_LENGTH] {
         &self.parameter_digest
     }
 
     /// Converts this Firewood wrapper back into the canonical [`Envelope`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::UnexpectedDomainTag`] if the binding digest
+    /// is not tagged with [`ENVELOPE_TAG`].
     pub fn into_envelope(self) -> Result<Envelope, ValidationError> {
         Envelope::new(
             self.schema_version,
@@ -622,6 +692,7 @@ impl FirewoodEnvelope {
 }
 
 #[cfg(feature = "rpp-proof-envelope")]
+#[allow(clippy::expect_used)]
 impl From<&Envelope> for FirewoodEnvelope {
     fn from(envelope: &Envelope) -> Self {
         FirewoodEnvelope::new(
