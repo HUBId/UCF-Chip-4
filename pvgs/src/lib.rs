@@ -4,6 +4,7 @@ use assets::{
     compute_asset_bundle_digest, compute_asset_chunk_digest, compute_asset_manifest_digest,
     validate_manifest, AssetBundleStore, AssetBundleStoreError, AssetManifestStore,
 };
+use bincode::Options;
 use blake3::Hasher;
 use cbv::{
     cbv_attestation_preimage, compute_cbv_digest, compute_cbv_verified_fields_digest,
@@ -31,7 +32,7 @@ use sep::{
     CausalGraph, EdgeType, FrameEventKind, NodeKey, SepError, SepEventInternal, SepEventType,
     SepLog, SessionSeal,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -51,13 +52,14 @@ use ucf_protocol::ucf::v1::{
 };
 use vrf::VrfEngine;
 
-#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+use rpp_pruning::{canonical_bincode_options, TaggedDigest, COMMITMENT_TAG};
 
 const CONSISTENCY_SIGNAL_WINDOW: usize = DEFAULT_LIMITS.consistency_signal_window;
 const CONSISTENCY_HISTORY_MAX: usize = DEFAULT_LIMITS.consistency_history_max;
 const GRAPH_TRIM_SESSION_ID: &str = "graph-trim";
 const MAX_ASSET_PAYLOAD_DECODE_BYTES: usize = 2 * 1024 * 1024;
+const PRUNE_MANIFEST_PREFIX: &str = "pvgs/prune";
 
 /// Commit type supported by PVGS.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -357,6 +359,13 @@ pub struct ExperienceStore {
     pub limits: StoreLimits,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PruneManifest {
+    head_id: u64,
+    prune_ops_digest: TaggedDigest,
+    pruned_record_digests: Vec<[u8; 32]>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConsistencyHistory {
     entries: Vec<(String, [u8; 32])>,
@@ -648,6 +657,8 @@ pub struct PvgsStore {
     pub suspended_tools: BTreeSet<(String, String)>,
     pub tool_event_correlations: BTreeMap<[u8; 32], ToolEventCorrelation>,
     pub registry_ruleset_correlation: BTreeMap<[u8; 32], [u8; 32]>,
+    pub prune_manifests: BTreeMap<String, Vec<u8>>,
+    prune_manifest_order: VecDeque<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -878,6 +889,8 @@ impl PvgsStore {
             suspended_tools: BTreeSet::new(),
             tool_event_correlations: BTreeMap::new(),
             registry_ruleset_correlation: BTreeMap::new(),
+            prune_manifests: BTreeMap::new(),
+            prune_manifest_order: VecDeque::new(),
         }
     }
 
@@ -1222,6 +1235,32 @@ impl PvgsStore {
         }
     }
 
+    fn store_prune_manifest(&mut self, head_id: u64, pruned_record_digests: Vec<[u8; 32]>) {
+        let limit = self.limits.max_experience_records;
+        if limit == 0 {
+            return;
+        }
+
+        let prune_ops_digest = compute_prune_ops_digest(head_id, &pruned_record_digests);
+        let manifest = PruneManifest {
+            head_id,
+            prune_ops_digest,
+            pruned_record_digests,
+        };
+        let bytes = canonical_bincode_options()
+            .serialize(&manifest)
+            .expect("serialize prune manifest");
+        let key = prune_manifest_key(head_id);
+        self.prune_manifests.insert(key.clone(), bytes);
+        self.prune_manifest_order.push_back(key.clone());
+
+        while self.prune_manifest_order.len() > limit {
+            if let Some(evicted_key) = self.prune_manifest_order.pop_front() {
+                self.prune_manifests.remove(&evicted_key);
+            }
+        }
+    }
+
     pub fn check_completeness(
         &mut self,
         session_id: &str,
@@ -1509,7 +1548,8 @@ impl PvgsStore {
         proof_receipt: ProofReceipt,
     ) {
         self.current_head_record_digest = record_digest;
-        self.experience_store
+        let evicted = self
+            .experience_store
             .append(
                 record,
                 record_digest,
@@ -1518,6 +1558,7 @@ impl PvgsStore {
                 session_id,
             )
             .expect("sep log append failed");
+        self.store_prune_manifest(self.experience_store.head_id, evicted);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1880,11 +1921,12 @@ impl ExperienceStore {
         proof_receipt: ProofReceipt,
         sep_log: &mut SepLog,
         session_id: &str,
-    ) -> Result<(), SepError> {
+    ) -> Result<Vec<[u8; 32]>, SepError> {
         let limit = self.limits.max_experience_records;
+        let mut evicted_digests = Vec::new();
 
         if limit == 0 {
-            return Ok(());
+            return Ok(evicted_digests);
         }
 
         while self.records.len() >= limit {
@@ -1901,6 +1943,7 @@ impl ExperienceStore {
                         evicted_digest,
                         vec!["RC.GV.RETENTION.EVICTED".to_string()],
                     )?;
+                    evicted_digests.push(evicted_digest);
                 }
             }
 
@@ -1922,7 +1965,7 @@ impl ExperienceStore {
         self.head_id = self.head_id.saturating_add(1);
         self.proof_receipts.insert(record_digest, proof_receipt);
 
-        Ok(())
+        Ok(evicted_digests)
     }
 }
 
@@ -1940,6 +1983,20 @@ pub fn compute_ruleset_digest(
     hasher.update(pev_digest.unwrap_or([0u8; 32].as_slice()));
     hasher.update(tool_registry_digest.unwrap_or([0u8; 32].as_slice()));
     *hasher.finalize().as_bytes()
+}
+
+fn prune_manifest_key(head_id: u64) -> String {
+    format!("{PRUNE_MANIFEST_PREFIX}/{head_id}")
+}
+
+fn compute_prune_ops_digest(head_id: u64, pruned_records: &[[u8; 32]]) -> TaggedDigest {
+    let mut hasher = Hasher::new();
+    hasher.update(b"UCF:PVGS:PRUNE_OPS");
+    hasher.update(&head_id.to_be_bytes());
+    for digest in pruned_records {
+        hasher.update(digest);
+    }
+    TaggedDigest::new(COMMITMENT_TAG, hasher.finalize().into())
 }
 
 /// Compute the digest of fields verified during PVGS evaluation.
