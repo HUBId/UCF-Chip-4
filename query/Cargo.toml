@@ -25,6 +25,7 @@ hex = "0.4"
 prost = { workspace = true }
 recovery = { path = "../crates/recovery" }
 tool_events = { path = "../crates/tool_events" }
+rpp_engine = { path = "../crates/rpp_engine" }
 
 [dev-dependencies]
 assets = { path = "../crates/assets" }

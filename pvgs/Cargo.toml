@@ -32,6 +32,8 @@ recovery = { path = "../crates/recovery" }
 micro_evidence = { path = "../crates/micro_evidence" }
 assets = { path = "../crates/assets" }
 rpp-pruning = { path = "../vendor/ztate/rpp/pruning" }
+rpp_engine = { path = "../crates/rpp_engine" }
+rpp_store = { path = "../crates/rpp_store" }
 
 [features]
 default = []

@@ -28,6 +28,15 @@ use replay_plan::{
     BuildReplayPlanArgs, ConsistencyClass, ConsistencyCounts, ReplayPlanStore, ReplaySignals,
 };
 use replay_runs::ReplayRunStore;
+use rpp_engine::{
+    build_asset_bundle_delta_ops, build_asset_manifest_delta_ops,
+    build_experience_record_delta_ops, build_replay_run_delta_ops, build_tool_event_delta_ops,
+    build_tool_registry_delta_ops, build_trace_run_delta_ops, canonicalize_asset_bundle,
+    canonicalize_asset_manifest, canonicalize_experience_record, canonicalize_replay_run_evidence,
+    canonicalize_tool_event, canonicalize_trace_run_evidence, compute_payload_digest, RppEngine,
+    RppEngineError, RppTransitionInput, RppTransitionOutcome,
+};
+use rpp_store::DeltaOp;
 use sep::{
     CausalGraph, EdgeType, FrameEventKind, NodeKey, SepError, SepEventInternal, SepEventType,
     SepLog, SessionSeal,
@@ -43,17 +52,17 @@ use tool_registry_state::{ToolRegistryError, ToolRegistryState};
 use trace_runs::{TraceRunEvidence, TraceRunStore, TraceStatus};
 use ucf_protocol::ucf::v1::{
     self as protocol, AssetBundle, AssetChunk, AssetKind, AssetManifest, ChannelParamsSetPayload,
-    CharacterBaselineVector, ConnectivityGraphPayload, ConsistencyFeedback, Digest32, DlpDecision,
-    DlpDecisionForm, ExperienceRecord, FinalizationHeader, MacroMilestone, MacroMilestoneState,
-    MicroModule, MicrocircuitConfigEvidence, MorphologySetPayload, PVGSKeyEpoch, PVGSReceipt,
-    ProofReceipt, ReasonCodes, ReceiptStatus, RecordType, Ref, ReplayFidelity, ReplayPlan,
-    ReplayRunEvidence, ReplayTargetKind, SynapseParamsSetPayload, ToolOnboardingEvent,
-    ToolOnboardingStage, ToolRegistryContainer,
+    CharacterBaselineVector, ConnectivityGraphPayload, ConsistencyFeedback, CoreFrame, Digest32,
+    DlpDecision, DlpDecisionForm, ExperienceRecord, FinalizationHeader, MacroMilestone,
+    MacroMilestoneState, MicroModule, MicrocircuitConfigEvidence, MorphologySetPayload,
+    PVGSKeyEpoch, PVGSReceipt, ProofReceipt, ReasonCodes, ReceiptStatus, RecordType, Ref,
+    ReplayFidelity, ReplayPlan, ReplayRunEvidence, ReplayTargetKind, SynapseParamsSetPayload,
+    ToolOnboardingEvent, ToolOnboardingStage, ToolRegistryContainer,
 };
 use vrf::VrfEngine;
 
-use serde::{Deserialize, Serialize};
 use rpp_pruning::{canonical_bincode_options, TaggedDigest, COMMITMENT_TAG};
+use serde::{Deserialize, Serialize};
 
 const CONSISTENCY_SIGNAL_WINDOW: usize = DEFAULT_LIMITS.consistency_signal_window;
 const CONSISTENCY_HISTORY_MAX: usize = DEFAULT_LIMITS.consistency_history_max;
@@ -127,18 +136,21 @@ impl Default for CriticalTriggerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PvgsConfig {
     pub auto_seal_on_replay_mismatch: bool,
+    pub rpp_enabled: bool,
 }
 
 impl PvgsConfig {
     pub fn beta() -> Self {
         Self {
             auto_seal_on_replay_mismatch: false,
+            rpp_enabled: false,
         }
     }
 
     pub fn production() -> Self {
         Self {
             auto_seal_on_replay_mismatch: true,
+            rpp_enabled: true,
         }
     }
 }
@@ -622,6 +634,8 @@ pub struct PvgsStore {
     pub experience_store: ExperienceStore,
     pub limits: StoreLimits,
     pub config: PvgsConfig,
+    pub rpp_enabled: bool,
+    pub rpp_engine: RppEngine,
     pub critical_triggers: CriticalTriggerConfig,
     pub receipts: HashMap<[u8; 32], PVGSReceipt>,
     pub known_charter_versions: HashSet<String>,
@@ -854,6 +868,8 @@ impl PvgsStore {
             experience_store,
             limits,
             config,
+            rpp_enabled: config.rpp_enabled,
+            rpp_engine: RppEngine::default(),
             critical_triggers: CriticalTriggerConfig::default(),
             receipts: HashMap::new(),
             known_charter_versions,
@@ -1983,6 +1999,56 @@ pub fn compute_ruleset_digest(
     hasher.update(pev_digest.unwrap_or([0u8; 32].as_slice()));
     hasher.update(tool_registry_digest.unwrap_or([0u8; 32].as_slice()));
     *hasher.finalize().as_bytes()
+}
+
+fn projected_ruleset_digest(
+    store: &PvgsStore,
+    bindings: &CommitBindings,
+    tool_registry_override: Option<[u8; 32]>,
+    pev_override: Option<[u8; 32]>,
+) -> [u8; 32] {
+    let pev_digest = pev_override
+        .or(bindings.pev_digest)
+        .or_else(|| store.pev_store.latest().and_then(extract_pev_digest));
+    let tool_registry_digest =
+        tool_registry_override.or_else(|| store.tool_registry_state.current());
+
+    compute_ruleset_digest(
+        bindings.charter_version_digest.as_bytes(),
+        bindings.policy_version_digest.as_bytes(),
+        pev_digest.as_ref().map(|digest| digest.as_slice()),
+        tool_registry_digest
+            .as_ref()
+            .map(|digest| digest.as_slice()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_rpp_transition(
+    store: &mut PvgsStore,
+    payload_digest: [u8; 32],
+    delta_ops: Vec<DeltaOp>,
+    ruleset_digest: [u8; 32],
+    asset_manifest_digest: Option<[u8; 32]>,
+    created_at_ms: u64,
+    head_record_digest: Option<[u8; 32]>,
+    advance_head: bool,
+) -> Result<Option<RppTransitionOutcome>, RppEngineError> {
+    if !store.rpp_enabled {
+        return Ok(None);
+    }
+
+    let outcome = store.rpp_engine.apply_transition(RppTransitionInput {
+        payload_digest,
+        delta_ops,
+        ruleset_digest,
+        asset_manifest_digest,
+        created_at_ms,
+        head_record_digest,
+        advance_head,
+    })?;
+
+    Ok(Some(outcome))
 }
 
 fn prune_manifest_key(head_id: u64) -> String {
@@ -3835,10 +3901,12 @@ fn verify_tool_registry_update(
     };
 
     let mut reject_reason_codes = Vec::new();
+    let payload_bytes = container.encode_to_vec();
+    let payload_digest = compute_payload_digest("ToolRegistryUpdate", &payload_bytes, &[]);
 
     if req.payload_digests.is_empty() {
-        req.payload_digests = vec![registry_digest];
-    } else if req.payload_digests.len() != 1 || req.payload_digests[0] != registry_digest {
+        req.payload_digests = vec![payload_digest];
+    } else if req.payload_digests.len() != 1 || req.payload_digests[0] != payload_digest {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
@@ -3875,7 +3943,32 @@ fn verify_tool_registry_update(
             store,
             keystore,
             frame_kind: None,
-            event_object_digest: Some(registry_digest),
+            event_object_digest: Some(payload_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    if apply_rpp_transition(
+        store,
+        payload_digest,
+        build_tool_registry_delta_ops(registry_digest, payload_bytes),
+        projected_ruleset_digest(store, &req.bindings, Some(registry_digest), None),
+        None,
+        now_ms(),
+        None,
+        false,
+    )
+    .is_err()
+    {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: vec![protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string()],
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(payload_digest),
             event_reason_codes: None,
         });
     }
@@ -3895,7 +3988,7 @@ fn verify_tool_registry_update(
             store,
             keystore,
             frame_kind: None,
-            event_object_digest: Some(registry_digest),
+            event_object_digest: Some(payload_digest),
             event_reason_codes: None,
         });
     }
@@ -3943,7 +4036,7 @@ fn verify_tool_registry_update(
 
     store.add_receipt_edges(&receipt);
 
-    store.committed_payload_digests.insert(registry_digest);
+    store.committed_payload_digests.insert(payload_digest);
 
     let mut proof_receipt = issue_proof_receipt(
         store.ruleset_state.ruleset_digest,
@@ -3970,13 +4063,49 @@ fn verify_experience_record_append(
     keystore: &KeyStore,
     vrf_engine: &VrfEngine,
 ) -> (PVGSReceipt, Option<ProofReceipt>) {
-    let payload_digest = req
-        .experience_record_payload
-        .as_ref()
-        .map(|payload| *blake3::hash(payload).as_bytes());
-    if let Some(digest) = payload_digest {
-        req.payload_digests = vec![digest];
-    }
+    let payload = match req.experience_record_payload.take() {
+        Some(p) => p,
+        None => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let mut record = match ExperienceRecord::decode(payload.as_slice()) {
+        Ok(record) => record,
+        Err(_) => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let payload_bytes = canonicalize_experience_record(&record);
+    let payload_digest = compute_payload_digest("ExperienceRecordAppend", &payload_bytes, &[]);
+    req.payload_digests = vec![payload_digest];
 
     let receipt_input = to_receipt_input(&req);
     let mut reject_reason_codes = Vec::new();
@@ -3991,7 +4120,7 @@ fn verify_experience_record_append(
             store,
             keystore,
             frame_kind: None,
-            event_object_digest: payload_digest,
+            event_object_digest: Some(payload_digest),
             event_reason_codes: None,
         });
     }
@@ -4006,7 +4135,7 @@ fn verify_experience_record_append(
             store,
             keystore,
             frame_kind: None,
-            event_object_digest: payload_digest,
+            event_object_digest: Some(payload_digest),
             event_reason_codes: None,
         });
     }
@@ -4024,7 +4153,7 @@ fn verify_experience_record_append(
             store,
             keystore,
             frame_kind: None,
-            event_object_digest: payload_digest,
+            event_object_digest: Some(payload_digest),
             event_reason_codes: None,
         });
     }
@@ -4042,48 +4171,10 @@ fn verify_experience_record_append(
             store,
             keystore,
             frame_kind: None,
-            event_object_digest: payload_digest,
+            event_object_digest: Some(payload_digest),
             event_reason_codes: None,
         });
     }
-
-    let payload = match req.experience_record_payload.take() {
-        Some(p) => p,
-        None => {
-            reject_reason_codes
-                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
-            return finalize_receipt(FinalizeReceiptArgs {
-                req: &req,
-                receipt_input: &receipt_input,
-                status: ReceiptStatus::Rejected,
-                reject_reason_codes,
-                store,
-                keystore,
-                frame_kind: None,
-                event_object_digest: payload_digest,
-                event_reason_codes: None,
-            });
-        }
-    };
-
-    let mut record = match ExperienceRecord::decode(payload.as_slice()) {
-        Ok(record) => record,
-        Err(_) => {
-            reject_reason_codes
-                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
-            return finalize_receipt(FinalizeReceiptArgs {
-                req: &req,
-                receipt_input: &receipt_input,
-                status: ReceiptStatus::Rejected,
-                reject_reason_codes,
-                store,
-                keystore,
-                frame_kind: None,
-                event_object_digest: payload_digest,
-                event_reason_codes: None,
-            });
-        }
-    };
 
     if let Err(reasons) = validate_experience_record(&record, store) {
         return finalize_receipt(FinalizeReceiptArgs {
@@ -4094,7 +4185,7 @@ fn verify_experience_record_append(
             store,
             keystore,
             frame_kind: None,
-            event_object_digest: payload_digest,
+            event_object_digest: Some(payload_digest),
             event_reason_codes: None,
         });
     }
@@ -4119,6 +4210,45 @@ fn verify_experience_record_append(
         profile_digest,
         key_epoch_id,
     );
+
+    let sep_events = preview_experience_events(&req.commit_id, record_digest, &record, store);
+    let sep_ops: Vec<([u8; 32], Vec<u8>)> = sep_events
+        .into_iter()
+        .map(|event| (event.event_digest, encode_sep_event(&event)))
+        .collect();
+    let delta_ops =
+        build_experience_record_delta_ops(record_digest, payload_bytes.clone(), &sep_ops);
+    let ruleset_digest =
+        projected_ruleset_digest(store, &req.bindings, None, req.bindings.pev_digest);
+    let asset_manifest_digest = store
+        .asset_manifest_store
+        .latest()
+        .and_then(|manifest| digest_from_bytes(&manifest.manifest_digest));
+    let rpp_outcome = match apply_rpp_transition(
+        store,
+        payload_digest,
+        delta_ops,
+        ruleset_digest,
+        asset_manifest_digest,
+        now_ms(),
+        Some(record_digest),
+        true,
+    ) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string()],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: Some(payload_digest),
+                event_reason_codes: None,
+            });
+        }
+    };
 
     let receipt = issue_receipt(
         &receipt_input,
@@ -4155,6 +4285,10 @@ fn verify_experience_record_append(
     finalization_header.prev_record_digest = digest_to_vec(store.current_head_record_digest);
     finalization_header.record_digest = digest_to_vec(record_digest);
     record.finalization_header = Some(finalization_header);
+
+    if let Some(outcome) = rpp_outcome.as_ref() {
+        attach_rpp_refs(&mut record, outcome);
+    }
 
     store.add_record_edges(
         &req.commit_id,
@@ -4688,10 +4822,10 @@ fn verify_asset_manifest_append(
 
     let manifest_digest = digest_from_bytes(&manifest.manifest_digest);
     let recomputed_digest = compute_asset_manifest_digest(&manifest);
+    let payload_bytes = canonicalize_asset_manifest(&manifest);
+    let payload_digest = compute_payload_digest("AssetManifestAppend", &payload_bytes, &[]);
     if req.payload_digests.is_empty() {
-        if let Some(digest) = manifest_digest {
-            req.payload_digests = vec![digest];
-        }
+        req.payload_digests = vec![payload_digest];
     }
 
     let receipt_input = to_receipt_input(&req);
@@ -4707,7 +4841,7 @@ fn verify_asset_manifest_append(
                 .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
         }
 
-        if req.payload_digests.len() != 1 || req.payload_digests[0] != digest {
+        if req.payload_digests.len() != 1 || req.payload_digests[0] != payload_digest {
             reject_reason_codes
                 .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
         }
@@ -4778,14 +4912,42 @@ fn verify_asset_manifest_append(
     proof_receipt.receipt_digest = receipt.receipt_digest.clone();
 
     store.add_receipt_edges(&receipt);
-    let payload_digest = manifest_digest.expect("validated manifest digest");
+    if apply_rpp_transition(
+        store,
+        payload_digest,
+        build_asset_manifest_delta_ops(
+            manifest_digest.expect("validated manifest digest"),
+            payload_bytes,
+        ),
+        projected_ruleset_digest(store, &req.bindings, None, None),
+        manifest_digest,
+        now_ms(),
+        None,
+        false,
+    )
+    .is_err()
+    {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: vec![protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string()],
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(payload_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    let manifest_digest = manifest_digest.expect("validated manifest digest");
     let _ = store.asset_manifest_store.insert(manifest);
     store.committed_payload_digests.insert(payload_digest);
 
     let _ = store.record_sep_event(
         &req.commit_id,
         SepEventType::EvRecoveryGov,
-        payload_digest,
+        manifest_digest,
         vec![protocol::ReasonCodes::GV_ASSET_MANIFEST_APPENDED.to_string()],
     );
 
@@ -4895,10 +5057,10 @@ fn verify_asset_bundle_append(
     };
 
     let bundle_digest = digest_from_bytes(&bundle.bundle_digest);
+    let payload_bytes = canonicalize_asset_bundle(&bundle);
+    let payload_digest = compute_payload_digest("AssetBundleAppend", &payload_bytes, &[]);
     if req.payload_digests.is_empty() {
-        if let Some(digest) = bundle_digest {
-            req.payload_digests = vec![digest];
-        }
+        req.payload_digests = vec![payload_digest];
     }
 
     let receipt_input = to_receipt_input(&req);
@@ -5020,7 +5182,7 @@ fn verify_asset_bundle_append(
             integrity_failed = true;
         }
 
-        if req.payload_digests.len() != 1 || req.payload_digests[0] != digest {
+        if req.payload_digests.len() != 1 || req.payload_digests[0] != payload_digest {
             schema_failed = true;
         }
     } else {
@@ -5090,7 +5252,42 @@ fn verify_asset_bundle_append(
         });
     }
 
-    let payload_digest = bundle_digest.expect("validated bundle digest");
+    if apply_rpp_transition(
+        store,
+        payload_digest,
+        build_asset_bundle_delta_ops(
+            bundle_digest.expect("validated bundle digest"),
+            payload_bytes,
+            bundle.manifest.as_ref().and_then(|manifest| {
+                let digest = digest_from_bytes(&manifest.manifest_digest)?;
+                Some((digest, canonicalize_asset_manifest(manifest)))
+            }),
+        ),
+        projected_ruleset_digest(store, &req.bindings, None, None),
+        bundle
+            .manifest
+            .as_ref()
+            .and_then(|manifest| digest_from_bytes(&manifest.manifest_digest)),
+        bundle.created_at_ms,
+        None,
+        false,
+    )
+    .is_err()
+    {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: vec![protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string()],
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(payload_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    let bundle_digest = bundle_digest.expect("validated bundle digest");
     if let Err(err) = store.asset_bundle_store.insert(bundle) {
         let reject_reason_codes = match err {
             AssetBundleStoreError::TooManyBundles | AssetBundleStoreError::TooManyChunks => {
@@ -5109,7 +5306,7 @@ fn verify_asset_bundle_append(
             store,
             keystore,
             frame_kind: None,
-            event_object_digest: Some(payload_digest),
+            event_object_digest: Some(bundle_digest),
             event_reason_codes: None,
         });
     }
@@ -5142,7 +5339,7 @@ fn verify_asset_bundle_append(
     let _ = store.record_sep_event(
         &req.commit_id,
         SepEventType::EvRecoveryGov,
-        payload_digest,
+        bundle_digest,
         event_reason_codes,
     );
 
@@ -5195,10 +5392,10 @@ fn verify_replay_run_evidence_append(
     };
 
     let run_digest = digest_from_bytes(&evidence.run_digest);
+    let payload_bytes = canonicalize_replay_run_evidence(&evidence);
+    let payload_digest = compute_payload_digest("ReplayRunEvidenceAppend", &payload_bytes, &[]);
     if req.payload_digests.is_empty() {
-        if let Some(digest) = run_digest {
-            req.payload_digests = vec![digest];
-        }
+        req.payload_digests = vec![payload_digest];
     }
 
     let receipt_input = to_receipt_input(&req);
@@ -5208,11 +5405,8 @@ fn verify_replay_run_evidence_append(
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
-    if let Some(digest) = run_digest {
-        if req.payload_digests.len() != 1 || req.payload_digests[0] != digest {
-            reject_reason_codes
-                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
-        }
+    if req.payload_digests.len() != 1 || req.payload_digests[0] != payload_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
     let asset_manifest_digest = evidence
@@ -5301,6 +5495,31 @@ fn verify_replay_run_evidence_append(
     proof_receipt.receipt_digest = receipt.receipt_digest.clone();
 
     store.add_receipt_edges(&receipt);
+    if apply_rpp_transition(
+        store,
+        payload_digest,
+        build_replay_run_delta_ops(run_digest.expect("validated run digest"), payload_bytes),
+        projected_ruleset_digest(store, &req.bindings, None, None),
+        asset_manifest_digest,
+        evidence.created_at_ms,
+        None,
+        false,
+    )
+    .is_err()
+    {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: vec![protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string()],
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(payload_digest),
+            event_reason_codes: None,
+        });
+    }
+
     let run_digest = run_digest.expect("validated run digest");
     if store.replay_run_store.insert(evidence.clone()).is_err() {
         return finalize_receipt(FinalizeReceiptArgs {
@@ -5317,7 +5536,7 @@ fn verify_replay_run_evidence_append(
             event_reason_codes: None,
         });
     }
-    store.committed_payload_digests.insert(run_digest);
+    store.committed_payload_digests.insert(payload_digest);
 
     if let Some(asset_digest) = asset_manifest_digest {
         store.add_graph_edge(run_digest, EdgeType::References, asset_digest, None);
@@ -5385,14 +5604,16 @@ fn verify_trace_run_evidence_append(
     };
 
     let run_digest = evidence.trace_run_digest;
+    let payload_bytes = canonicalize_trace_run_evidence(&evidence);
+    let payload_digest = compute_payload_digest("TraceRunEvidenceAppend", &payload_bytes, &[]);
     if req.payload_digests.is_empty() {
-        req.payload_digests = vec![run_digest];
+        req.payload_digests = vec![payload_digest];
     }
 
     let receipt_input = to_receipt_input(&req);
     let mut reject_reason_codes = Vec::new();
 
-    if req.payload_digests.len() != 1 || req.payload_digests[0] != run_digest {
+    if req.payload_digests.len() != 1 || req.payload_digests[0] != payload_digest {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
@@ -5461,6 +5682,30 @@ fn verify_trace_run_evidence_append(
     proof_receipt.receipt_digest = receipt.receipt_digest.clone();
 
     store.add_receipt_edges(&receipt);
+    if apply_rpp_transition(
+        store,
+        payload_digest,
+        build_trace_run_delta_ops(run_digest, payload_bytes),
+        projected_ruleset_digest(store, &req.bindings, None, None),
+        Some(evidence.asset_manifest_digest),
+        evidence.created_at_ms,
+        None,
+        false,
+    )
+    .is_err()
+    {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: vec![protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string()],
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(payload_digest),
+            event_reason_codes: None,
+        });
+    }
     if store.trace_run_store.insert(evidence.clone()).is_err() {
         return finalize_receipt(FinalizeReceiptArgs {
             req: &req,
@@ -5476,7 +5721,7 @@ fn verify_trace_run_evidence_append(
             event_reason_codes: None,
         });
     }
-    store.committed_payload_digests.insert(run_digest);
+    store.committed_payload_digests.insert(payload_digest);
 
     store.add_graph_edge(
         run_digest,
@@ -5529,7 +5774,28 @@ fn verify_tool_event_append(
         }
     };
 
-    let payload_digest = *blake3::hash(&payload).as_bytes();
+    let event = match ToolOnboardingEvent::decode(payload.as_slice()) {
+        Ok(event) => event,
+        Err(_) => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let payload_bytes = canonicalize_tool_event(&event);
+    let payload_digest = compute_payload_digest("ToolOnboardingEventAppend", &payload_bytes, &[]);
     if req.payload_digests.is_empty() {
         req.payload_digests = vec![payload_digest];
     }
@@ -5548,25 +5814,6 @@ fn verify_tool_event_append(
     if req.bindings.prev_record_digest != store.current_head_record_digest {
         reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
     }
-
-    let event = match ToolOnboardingEvent::decode(payload.as_slice()) {
-        Ok(event) => event,
-        Err(_) => {
-            reject_reason_codes
-                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
-            return finalize_receipt(FinalizeReceiptArgs {
-                req: &req,
-                receipt_input: &receipt_input,
-                status: ReceiptStatus::Rejected,
-                reject_reason_codes,
-                store,
-                keystore,
-                frame_kind: None,
-                event_object_digest: Some(payload_digest),
-                event_reason_codes: None,
-            });
-        }
-    };
 
     let event_digest = compute_tool_event_digest(&event).ok();
 
@@ -5597,6 +5844,31 @@ fn verify_tool_event_append(
     }
 
     let digest = stored_digest.unwrap_or_else(|| event_digest.unwrap_or([0u8; 32]));
+    if apply_rpp_transition(
+        store,
+        payload_digest,
+        build_tool_event_delta_ops(digest, payload_bytes),
+        projected_ruleset_digest(store, &req.bindings, None, None),
+        None,
+        event.created_at_ms.unwrap_or_else(now_ms),
+        None,
+        false,
+    )
+    .is_err()
+    {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes: vec![protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string()],
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(payload_digest),
+            event_reason_codes: None,
+        });
+    }
+
     store.committed_payload_digests.insert(payload_digest);
     update_suspended_tools(store, &event);
     store.correlate_tool_event(digest);
@@ -5767,6 +6039,205 @@ fn profile_digest_from_record(record: &ExperienceRecord) -> Option<[u8; 32]> {
         .as_ref()
         .and_then(|m| m.profile_digest.as_ref())
         .and_then(|bytes| digest_from_bytes(bytes))
+}
+
+fn preview_experience_events(
+    commit_id: &str,
+    record_digest: [u8; 32],
+    record: &ExperienceRecord,
+    store: &PvgsStore,
+) -> Vec<SepEventInternal> {
+    let mut temp_log = store.sep_log.clone();
+    let mut events = Vec::new();
+
+    let record_type = RecordType::try_from(record.record_type).unwrap_or(RecordType::Unspecified);
+
+    append_preview_event(
+        &mut temp_log,
+        &mut events,
+        commit_id,
+        SepEventType::EvAgentStep,
+        record_digest,
+        Vec::new(),
+    );
+
+    if let RecordType::RtOutput = record_type {
+        let mut dlp_digests: Vec<[u8; 32]> = Vec::new();
+        let mut output_reason_codes: Option<Vec<String>> = None;
+
+        if let Some(gov) = &record.governance_frame {
+            for reference in &gov.dlp_refs {
+                if let Some(digest) = digest_from_ref(reference) {
+                    dlp_digests.push(digest);
+                }
+            }
+        }
+
+        for digest in &record.dlp_refs {
+            if let Some(target) = digest_from_ref(digest) {
+                dlp_digests.push(target);
+            }
+        }
+
+        for digest in &dlp_digests {
+            let reason_codes = store
+                .dlp_store
+                .get(*digest)
+                .map(|dlp| dlp.reason_codes.clone())
+                .unwrap_or_else(|| vec![protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string()]);
+            if output_reason_codes.is_none() {
+                output_reason_codes = Some(reason_codes.clone());
+            }
+            append_preview_event(
+                &mut temp_log,
+                &mut events,
+                commit_id,
+                SepEventType::EvDlpDecision,
+                *digest,
+                reason_codes,
+            );
+        }
+
+        let output_reason = output_reason_codes
+            .unwrap_or_else(|| vec![protocol::ReasonCodes::RE_INTEGRITY_OK.to_string()]);
+
+        append_preview_event(
+            &mut temp_log,
+            &mut events,
+            commit_id,
+            SepEventType::EvOutput,
+            record_digest,
+            output_reason,
+        );
+    }
+
+    if let Some(gov) = &record.governance_frame {
+        if !gov.policy_decision_refs.is_empty() {
+            append_preview_event(
+                &mut temp_log,
+                &mut events,
+                commit_id,
+                SepEventType::EvDecision,
+                record_digest,
+                Vec::new(),
+            );
+        }
+
+        if !gov.dlp_refs.is_empty() {
+            append_preview_event(
+                &mut temp_log,
+                &mut events,
+                commit_id,
+                SepEventType::EvOutcome,
+                record_digest,
+                Vec::new(),
+            );
+        }
+    }
+
+    if let Some(core) = &record.core_frame {
+        if !core.evidence_refs.is_empty() {
+            append_preview_event(
+                &mut temp_log,
+                &mut events,
+                commit_id,
+                SepEventType::EvIncident,
+                record_digest,
+                Vec::new(),
+            );
+        }
+    }
+
+    events
+}
+
+fn append_preview_event(
+    log: &mut SepLog,
+    events: &mut Vec<SepEventInternal>,
+    session_id: &str,
+    event_type: SepEventType,
+    object_digest: [u8; 32],
+    reason_codes: Vec<String>,
+) {
+    let before_len = log.events.len();
+    let _ = log.append_event(
+        session_id.to_string(),
+        event_type,
+        object_digest,
+        reason_codes,
+    );
+    if log.events.len() > before_len {
+        if let Some(event) = log.events.last() {
+            events.push(event.clone());
+        }
+    }
+}
+
+fn encode_sep_event(event: &SepEventInternal) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_len_prefixed(&mut out, event.session_id.as_bytes());
+    write_len_prefixed(&mut out, sep_event_type_label(&event.event_type).as_bytes());
+    out.extend_from_slice(&event.object_digest);
+    out.extend_from_slice(&(event.reason_codes.len() as u32).to_le_bytes());
+    for rc in &event.reason_codes {
+        write_len_prefixed(&mut out, rc.as_bytes());
+    }
+    out.extend_from_slice(&event.prev_event_digest);
+    out.extend_from_slice(&event.event_digest);
+    out
+}
+
+fn sep_event_type_label(event_type: &SepEventType) -> &'static str {
+    match event_type {
+        SepEventType::EvIncident => "EV_INCIDENT",
+        SepEventType::EvDecision => "EV_DECISION",
+        SepEventType::EvRecoveryGov => "EV_RECOVERY_GOV",
+        SepEventType::EvRecovery => "EV_RECOVERY",
+        SepEventType::EvPevUpdate => "EV_PEV_UPDATE",
+        SepEventType::EvKeyEpoch => "EV_KEY_EPOCH",
+        SepEventType::EvToolOnboarding => "EV_TOOL_ONBOARDING",
+        SepEventType::EvCharterUpdate => "EV_CHARTER_UPDATE",
+        SepEventType::EvControlFrame => "EV_CONTROL_FRAME",
+        SepEventType::EvSignalFrame => "EV_SIGNAL_FRAME",
+        SepEventType::EvOutcome => "EV_OUTCOME",
+        SepEventType::EvDlpDecision => "EV_DLP_DECISION",
+        SepEventType::EvOutput => "EV_OUTPUT",
+        SepEventType::EvProfileChange => "EV_PROFILE_CHANGE",
+        SepEventType::EvAgentStep => "EV_AGENT_STEP",
+        SepEventType::EvIntent => "EV_INTENT",
+        SepEventType::EvReplay => "EV_REPLAY",
+    }
+}
+
+fn write_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn attach_rpp_refs(record: &mut ExperienceRecord, outcome: &RppTransitionOutcome) {
+    let refs = vec![
+        Ref {
+            id: "rpp:prev_acc".to_string(),
+            digest: Some(outcome.prev_acc_digest.to_vec()),
+        },
+        Ref {
+            id: "rpp:acc".to_string(),
+            digest: Some(outcome.acc_digest.to_vec()),
+        },
+        Ref {
+            id: "rpp:new_root".to_string(),
+            digest: Some(outcome.state_root.to_vec()),
+        },
+        Ref {
+            id: "rpp:payload_digest".to_string(),
+            digest: Some(outcome.payload_digest.to_vec()),
+        },
+    ];
+
+    let core_frame = record.core_frame.get_or_insert_with(|| CoreFrame {
+        evidence_refs: Vec::new(),
+    });
+    core_frame.evidence_refs.extend(refs);
 }
 
 fn log_experience_events(
@@ -7337,7 +7808,11 @@ mod tests {
         let req = micro_config_request(&store, MicroModule::Lc, 1, config_bytes);
         let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
 
-        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(
+            receipt.status == ReceiptStatus::Accepted,
+            "rejects: {:?}",
+            receipt.reject_reason_codes
+        );
         assert!(proof_receipt.is_some());
 
         let stored = store
@@ -7415,7 +7890,12 @@ mod tests {
         let req = micro_config_request(&store, MicroModule::Hpa, 2, config_bytes);
         let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
 
-        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert_eq!(
+            receipt.status,
+            ReceiptStatus::Accepted,
+            "rejects: {:?}",
+            receipt.reject_reason_codes
+        );
         assert!(proof_receipt.is_some());
 
         let stored = store
@@ -7436,7 +7916,12 @@ mod tests {
         let req = asset_manifest_request(&store, &manifest);
         let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
 
-        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert_eq!(
+            receipt.status,
+            ReceiptStatus::Accepted,
+            "rejects: {:?}",
+            receipt.reject_reason_codes
+        );
         assert!(proof_receipt.is_some());
 
         let stored = store
@@ -7504,7 +7989,12 @@ mod tests {
         let req = asset_bundle_request(&store, &bundle);
         let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
 
-        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert_eq!(
+            receipt.status,
+            ReceiptStatus::Accepted,
+            "rejects: {:?}",
+            receipt.reject_reason_codes
+        );
         assert!(proof_receipt.is_some());
 
         let stored = store.asset_bundle_store.get(digest).expect("bundle stored");
@@ -7555,7 +8045,12 @@ mod tests {
         let req = asset_bundle_request(&store, &bundle);
         let (receipt, proof_receipt) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
 
-        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert_eq!(
+            receipt.status,
+            ReceiptStatus::Accepted,
+            "rejects: {:?}",
+            receipt.reject_reason_codes
+        );
         assert!(proof_receipt.is_some());
     }
 
@@ -9354,7 +9849,11 @@ mod tests {
         let (req, epoch) = make_key_epoch_request(&keystore, &vrf_engine, &store, 1, None, "ke-1");
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
-        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(
+            receipt.status == ReceiptStatus::Accepted,
+            "rejects: {:?}",
+            receipt.reject_reason_codes
+        );
         assert!(proof.is_some());
         let latest = store
             .key_epoch_history
@@ -9629,7 +10128,11 @@ mod tests {
         let vrf_engine = VrfEngine::new_dev(1);
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
-        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(
+            receipt.status == ReceiptStatus::Accepted,
+            "rejects: {:?}",
+            receipt.reject_reason_codes
+        );
         assert!(proof.is_some());
 
         let last_event = store.sep_log.events.last().expect("missing frame event");
@@ -9692,7 +10195,11 @@ mod tests {
         };
 
         let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
-        assert_eq!(receipt.status, ReceiptStatus::Accepted);
+        assert!(
+            receipt.status == ReceiptStatus::Accepted,
+            "rejects: {:?}",
+            receipt.reject_reason_codes
+        );
         assert!(proof.is_none());
 
         let stored = store.dlp_store.get(dlp_digest).expect("missing decision");
@@ -11532,5 +12039,25 @@ mod tests {
             digest_from_ref(outcome.plan.target_refs.first().expect("target")),
             Some([0x21u8; 32])
         );
+    }
+
+    #[test]
+    fn rpp_rejects_when_verifier_fails() {
+        let prev = [42u8; 32];
+        let keystore = KeyStore::new_dev_keystore(7);
+        let vrf_engine = VrfEngine::new_dev(7);
+        let mut store = base_store(prev);
+        store.rpp_enabled = true;
+        store.rpp_engine.set_verifier(|_, _| false);
+
+        let record = replay_record(Vec::new(), None);
+        let req =
+            make_experience_request_with_id(&record, &store, keystore.current_epoch(), "rpp-fail");
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert!(receipt
+            .reject_reason_codes
+            .contains(&protocol::ReasonCodes::RE_INTEGRITY_FAIL.to_string()));
     }
 }

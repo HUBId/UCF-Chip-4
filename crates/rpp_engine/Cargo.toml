@@ -1,0 +1,18 @@
+[package]
+name = "rpp_engine"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+blake3.workspace = true
+hex.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+rpp_proofs = { path = "../rpp_proofs", features = ["rpp-proof-envelope"] }
+rpp_store = { path = "../rpp_store" }
+ucf-protocol = { path = "../../ucf-protocol" }
+trace_runs = { path = "../trace_runs" }
+
+[features]
+default = []
+rpp-firewood = ["rpp_store/rpp-firewood"]
