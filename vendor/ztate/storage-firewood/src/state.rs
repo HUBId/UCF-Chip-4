@@ -1,3 +1,5 @@
+#![cfg(feature = "rpp-proof-envelope")]
+
 use std::collections::HashSet;
 use std::env;
 use std::fs;

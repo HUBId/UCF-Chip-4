@@ -1,3 +1,5 @@
+#![cfg(feature = "rpp-proof-envelope")]
+
 use std::collections::VecDeque;
 
 use crate::kv::Hash;
