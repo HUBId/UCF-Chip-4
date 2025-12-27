@@ -1,0 +1,115 @@
+// Copyright (C) 2023, Ava Labs, Inc. All rights reserved.
+// See the file LICENSE.md for licensing terms.
+
+#![cfg_attr(
+    not(feature = "ethhash"),
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "Found 1 occurrences after enabling the lint."
+    )
+)]
+#![allow(clippy::expect_used)] // Hashers use expect to enforce assumptions about serialized trie payloads during hashing.
+
+use crate::hashednode::{HasUpdate, Hashable, Preimage};
+use crate::{TrieHash, ValueDigest};
+/// Merkledb compatible hashing algorithm.
+use integer_encoding::VarInt;
+use sha2::{Digest, Sha256};
+
+const MAX_VARINT_SIZE: usize = 10;
+#[cfg(feature = "branch_factor_256")]
+const BITS_PER_STEP: u64 = 8;
+#[cfg(not(feature = "branch_factor_256"))]
+const BITS_PER_STEP: u64 = 4;
+
+impl HasUpdate for Sha256 {
+    fn update<T: AsRef<[u8]>>(&mut self, data: T) {
+        sha2::Digest::update(self, data);
+    }
+}
+
+impl<T: Hashable> Preimage for T {
+    fn to_hash(&self) -> TrieHash {
+        let mut hasher = Sha256::new();
+
+        self.write(&mut hasher);
+        hasher.finalize().into()
+    }
+
+    fn write(&self, buf: &mut impl HasUpdate) {
+        let children = self.children();
+
+        let num_children = children.iter().filter(|c| c.is_some()).count() as u64;
+
+        add_varint_to_buf(buf, num_children);
+
+        for (index, hash) in children.iter().enumerate() {
+            if let Some(hash) = hash {
+                add_varint_to_buf(buf, index as u64);
+                buf.update(hash);
+            }
+        }
+
+        // Add value digest (if any) to hash pre-image
+        add_value_digest_to_buf(buf, self.value_digest());
+
+        // Add key length (in bits) to hash pre-image
+        let key_iter = self.full_path();
+        let key_bit_len = BITS_PER_STEP * key_iter.clone().count() as u64;
+        add_varint_to_buf(buf, key_bit_len);
+
+        // Add key to hash pre-image
+        #[cfg(feature = "branch_factor_256")]
+        {
+            for byte in key_iter {
+                buf.update([byte]);
+            }
+        }
+
+        #[cfg(not(feature = "branch_factor_256"))]
+        {
+            let mut key = key_iter;
+            while let Some(high_nibble) = key.next() {
+                let low_nibble = key.next().unwrap_or(0);
+                let byte = (high_nibble << 4) | low_nibble;
+                buf.update([byte]);
+            }
+        }
+    }
+}
+
+fn add_value_digest_to_buf<H: HasUpdate, T: AsRef<[u8]>>(
+    buf: &mut H,
+    value_digest: Option<ValueDigest<T>>,
+) {
+    let Some(value_digest) = value_digest else {
+        let value_exists: u8 = 0;
+        buf.update([value_exists]);
+        return;
+    };
+
+    let value_exists: u8 = 1;
+    buf.update([value_exists]);
+
+    add_len_and_value_to_buf(buf, value_digest.make_hash());
+}
+
+#[inline]
+/// Writes the length of `value` and `value` to `buf`.
+fn add_len_and_value_to_buf<H: HasUpdate, V: AsRef<[u8]>>(buf: &mut H, value: V) {
+    let value_bytes = value.as_ref();
+    add_varint_to_buf(buf, value_bytes.len() as u64);
+    buf.update(value_bytes);
+}
+
+#[inline]
+/// Encodes `value` as a varint and writes it to `buf`.
+fn add_varint_to_buf<H: HasUpdate>(buf: &mut H, value: u64) {
+    let mut buf_arr = [0u8; MAX_VARINT_SIZE];
+    let len = value.encode_var(&mut buf_arr);
+    buf.update(
+        buf_arr
+            .get(..len)
+            .expect("length is always less than MAX_VARINT_SIZE"),
+    );
+}
