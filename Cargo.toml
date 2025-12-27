@@ -107,4 +107,4 @@ firewood = { path = "vendor/ztate/firewood" }
 firewood-storage = { path = "vendor/ztate/storage" }
 storage-firewood = { path = "vendor/ztate/storage-firewood" }
 firewood-triehash = { path = "vendor/ztate/triehash" }
-rpp-pruning = { path = "vendor/ztate/rpp-pruning" }
+rpp-pruning = { path = "vendor/ztate/rpp/pruning" }
