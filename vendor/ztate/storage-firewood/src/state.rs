@@ -446,6 +446,7 @@ fn maybe_open_global_cf(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_manifest_alignment(
     snapshots_cf: &ColumnFamily,
     proofs_cf: &ColumnFamily,
@@ -638,16 +639,11 @@ fn snapshot_id_from_name(name: &str) -> Option<u64> {
     id.parse().ok()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum SyncPolicy {
+    #[default]
     Always,
     Deferred,
-}
-
-impl Default for SyncPolicy {
-    fn default() -> Self {
-        SyncPolicy::Always
-    }
 }
 
 #[derive(Clone, Debug)]

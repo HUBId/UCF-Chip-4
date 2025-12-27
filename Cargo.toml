@@ -30,6 +30,7 @@ members = [
     "crates/replay_runs",
     "crates/trace_runs",
     "crates/assets",
+    "crates/rpp_store",
 ]
 resolver = "2"
 

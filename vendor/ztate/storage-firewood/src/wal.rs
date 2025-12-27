@@ -54,6 +54,7 @@ impl FileWal {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&path)?;
 
         let wal = FileWal {
@@ -222,6 +223,7 @@ impl FileWal {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&self.path)?;
         let mut writer = BufWriter::new(file);
         writer.seek(SeekFrom::End(0))?;
