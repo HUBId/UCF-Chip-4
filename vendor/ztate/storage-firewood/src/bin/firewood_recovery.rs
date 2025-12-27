@@ -1,3 +1,5 @@
+#![cfg(all(feature = "rpp-firewood", feature = "rpp-proof-envelope"))]
+
 use std::{
     env,
     error::Error,

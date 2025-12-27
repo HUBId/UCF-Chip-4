@@ -1,3 +1,5 @@
+#![cfg(feature = "rpp-proof-envelope")]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

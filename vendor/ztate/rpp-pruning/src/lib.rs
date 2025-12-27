@@ -422,6 +422,7 @@ impl Commitment {
 }
 
 /// Outer envelope that wraps snapshots, proof segments, and the aggregate commitment.
+#[cfg(feature = "rpp-proof-envelope")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
     schema_version: SchemaVersion,
@@ -432,6 +433,7 @@ pub struct Envelope {
     binding_digest: TaggedDigest,
 }
 
+#[cfg(feature = "rpp-proof-envelope")]
 impl Envelope {
     /// Builds an envelope validated against the [`ENVELOPE_TAG`].
     pub fn new(
@@ -490,10 +492,12 @@ fn canonical_version_digest(version: u16) -> [u8; DIGEST_LENGTH] {
     digest
 }
 
+#[cfg(feature = "rpp-proof-envelope")]
 fn version_from_digest(digest: &[u8; DIGEST_LENGTH]) -> u16 {
     u16::from_be_bytes([digest[0], digest[1]])
 }
 
+#[cfg(feature = "rpp-proof-envelope")]
 fn ensure_version_matches(
     component: &'static str,
     digest: &[u8; DIGEST_LENGTH],
@@ -512,6 +516,7 @@ fn ensure_version_matches(
 }
 
 /// Firewood-specific wrapper that pairs canonical envelopes with schema and parameter digests.
+#[cfg(feature = "rpp-proof-envelope")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FirewoodEnvelope {
     schema_digest: [u8; DIGEST_LENGTH],
@@ -525,6 +530,7 @@ pub struct FirewoodEnvelope {
     binding_digest: TaggedDigest,
 }
 
+#[cfg(feature = "rpp-proof-envelope")]
 impl FirewoodEnvelope {
     /// Builds a Firewood envelope after ensuring the digests encode the supplied versions.
     pub fn new(
@@ -615,6 +621,7 @@ impl FirewoodEnvelope {
     }
 }
 
+#[cfg(feature = "rpp-proof-envelope")]
 impl From<&Envelope> for FirewoodEnvelope {
     fn from(envelope: &Envelope) -> Self {
         FirewoodEnvelope::new(
@@ -631,6 +638,7 @@ impl From<&Envelope> for FirewoodEnvelope {
     }
 }
 
+#[cfg(feature = "rpp-proof-envelope")]
 impl TryFrom<FirewoodEnvelope> for Envelope {
     type Error = ValidationError;
 
@@ -639,7 +647,7 @@ impl TryFrom<FirewoodEnvelope> for Envelope {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rpp-proof-envelope"))]
 mod tests {
     use super::*;
 

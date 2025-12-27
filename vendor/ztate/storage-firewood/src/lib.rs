@@ -1,20 +1,32 @@
+#[cfg(feature = "rpp-firewood")]
 pub mod api;
+#[cfg(feature = "rpp-firewood")]
 pub mod column_family;
+#[cfg(feature = "rpp-firewood")]
 pub mod kv;
+#[cfg(all(feature = "rpp-firewood", feature = "rpp-proof-envelope"))]
 pub mod lifecycle;
+#[cfg(all(feature = "rpp-firewood", feature = "rpp-proof-envelope"))]
 pub mod pruning;
+#[cfg(feature = "rpp-firewood")]
 pub mod schema;
+#[cfg(all(feature = "rpp-firewood", feature = "rpp-proof-envelope"))]
 pub mod state;
+#[cfg(feature = "rpp-firewood")]
 pub mod tree;
+#[cfg(feature = "rpp-firewood")]
 pub mod wal;
 
+#[cfg(all(feature = "rpp-firewood", feature = "rpp-proof-envelope"))]
 pub use crate::pruning::SnapshotManifest;
+#[cfg(all(feature = "rpp-firewood", feature = "rpp-proof-envelope"))]
 pub use crate::state::{
     FirewoodState as Storage, StorageOptions, SyncPolicy, STORAGE_LAYOUT_VERSION,
 };
+#[cfg(all(feature = "rpp-firewood", feature = "rpp-proof-envelope"))]
 pub use lifecycle::{FirewoodLifecycle, LifecycleError, LifecycleReceipt, LifecycleStatus};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rpp-firewood", feature = "rpp-proof-envelope"))]
 mod tests {
     use std::env;
 
