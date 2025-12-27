@@ -378,6 +378,7 @@ mod tests {
             governance_frame_ref: None,
             dlp_refs: Vec::new(),
             finalization_header: None,
+            rpp_refs: Vec::new(),
         }
     }
 

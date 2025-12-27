@@ -3483,6 +3483,7 @@ mod tests {
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
+            rpp_refs: Vec::new(),
         };
 
         let req = PvgsCommitRequest {
@@ -3684,6 +3685,7 @@ mod tests {
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
+            rpp_refs: Vec::new(),
         };
 
         let record_two = ExperienceRecord {
@@ -3708,6 +3710,7 @@ mod tests {
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
+            rpp_refs: Vec::new(),
         };
 
         let record_one_digest = compute_experience_record_digest(&record_one);
@@ -3775,6 +3778,7 @@ mod tests {
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
+            rpp_refs: Vec::new(),
         };
 
         let record_two = ExperienceRecord {
@@ -3794,6 +3798,7 @@ mod tests {
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
+            rpp_refs: Vec::new(),
         };
 
         let record_one_digest = compute_experience_record_digest(&record_one);
@@ -4345,6 +4350,7 @@ mod tests {
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
+            rpp_refs: Vec::new(),
         };
 
         let req = PvgsCommitRequest {
@@ -4434,6 +4440,7 @@ mod tests {
             }),
             dlp_refs: Vec::new(),
             finalization_header: None,
+            rpp_refs: Vec::new(),
         };
 
         let req = PvgsCommitRequest {
