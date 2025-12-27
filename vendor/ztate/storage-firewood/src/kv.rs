@@ -126,7 +126,7 @@ impl FirewoodKv {
                 WAL_TRANSACTION_METRIC,
                 WAL_TRANSACTION_RESULT_LABEL => WAL_TRANSACTION_ROLLED_BACK
             )
-            .increment(rolled_back as u64);
+            .increment(rolled_back);
         }
         Ok(kv)
     }

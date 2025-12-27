@@ -334,3 +334,9 @@ impl FirewoodTree {
         Node::branch(left, right)
     }
 }
+
+impl Default for FirewoodTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}

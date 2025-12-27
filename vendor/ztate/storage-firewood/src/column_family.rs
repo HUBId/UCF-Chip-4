@@ -83,8 +83,7 @@ impl ColumnFamily {
     }
 
     pub fn put_json<T: Serialize>(&self, key: &str, value: &T, sync: bool) -> io::Result<()> {
-        let encoded = serde_json::to_vec_pretty(value)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        let encoded = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
         self.put_bytes(key, &encoded, sync)
     }
 
@@ -92,8 +91,7 @@ impl ColumnFamily {
         let Some(bytes) = self.get_bytes(key)? else {
             return Ok(None);
         };
-        let decoded = serde_json::from_slice(&bytes)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        let decoded = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         Ok(Some(decoded))
     }
 }
