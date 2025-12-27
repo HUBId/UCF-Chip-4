@@ -1,0 +1,27 @@
+[package]
+name = "rpp_engine"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+hex = { workspace = true }
+prost = { workspace = true }
+rpp_store = { path = "../rpp_store", default-features = false }
+thiserror = { workspace = true }
+ucf-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rpp_proofs = { path = "../rpp_proofs", optional = true, default-features = false }
+
+[features]
+default = []
+rpp-firewood = ["rpp_store/rpp-firewood"]
+rpp-proof-envelope = ["dep:rpp_proofs", "rpp_proofs/rpp-proof-envelope"]
+
+[lints]
+workspace = true
