@@ -204,3 +204,42 @@ fn hash_state(state: &BTreeMap<Vec<u8>, Vec<u8>>) -> [u8; 32] {
     }
     hasher.finalize().into()
 }
+
+#[cfg(all(test, feature = "rpp-firewood"))]
+mod tests {
+    use super::{DeltaOp, FirewoodStateStore, RppStateStore};
+
+    #[test]
+    fn firewood_roots_deterministic_across_op_ordering() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tempdir_one = tempfile::tempdir()?;
+        let tempdir_two = tempfile::tempdir()?;
+        let mut store_one = FirewoodStateStore::open(tempdir_one.path())?;
+        let mut store_two = FirewoodStateStore::open(tempdir_two.path())?;
+
+        let ops = vec![
+            DeltaOp::Put {
+                key: b"alpha".to_vec(),
+                value: b"one".to_vec(),
+            },
+            DeltaOp::Put {
+                key: b"bravo".to_vec(),
+                value: b"two".to_vec(),
+            },
+            DeltaOp::Del {
+                key: b"alpha".to_vec(),
+            },
+            DeltaOp::Put {
+                key: b"charlie".to_vec(),
+                value: b"three".to_vec(),
+            },
+        ];
+        let shuffled = vec![ops[2].clone(), ops[0].clone(), ops[3].clone(), ops[1].clone()];
+
+        let root_one = store_one.apply_ops(&ops)?;
+        let root_two = store_two.apply_ops(&shuffled)?;
+
+        assert_eq!(root_one, root_two);
+        Ok(())
+    }
+}
