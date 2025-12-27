@@ -1,7 +1,6 @@
 use assets::{
     compute_asset_bundle_digest, compute_asset_chunk_digest, compute_asset_manifest_digest,
 };
-use blake3;
 use keys::KeyStore;
 use prost::Message;
 use pvgs::{
@@ -35,7 +34,7 @@ fn base_store(prev_digest: [u8; 32]) -> PvgsStore {
     )
 }
 
-fn asset_bundle_payload(created_at_ms: u64, asset_seed: u8) -> (AssetBundle, [u8; 32]) {
+fn asset_manifest_payload(created_at_ms: u64, asset_seed: u8) -> (AssetManifest, [u8; 32]) {
     let asset_digest = [asset_seed; 32];
     let mut manifest = AssetManifest {
         manifest_digest: Vec::new(),
@@ -48,6 +47,16 @@ fn asset_bundle_payload(created_at_ms: u64, asset_seed: u8) -> (AssetBundle, [u8
     };
     let manifest_digest = compute_asset_manifest_digest(&manifest);
     manifest.manifest_digest = manifest_digest.to_vec();
+    (manifest, manifest_digest)
+}
+
+fn asset_bundle_payload(manifest: AssetManifest) -> AssetBundle {
+    let asset_digest = manifest
+        .asset_digests
+        .first()
+        .expect("asset digest")
+        .digest
+        .clone();
 
     let chunk_payload_one = b"evidence-bundle-one".to_vec();
     let chunk_payload_two = b"evidence-bundle-two".to_vec();
@@ -70,7 +79,7 @@ fn asset_bundle_payload(created_at_ms: u64, asset_seed: u8) -> (AssetBundle, [u8
 
     let mut bundle = AssetBundle {
         bundle_digest: Vec::new(),
-        created_at_ms,
+        created_at_ms: manifest.created_at_ms,
         manifest: Some(manifest),
         chunks: vec![chunk_one, chunk_two],
     };
@@ -79,7 +88,47 @@ fn asset_bundle_payload(created_at_ms: u64, asset_seed: u8) -> (AssetBundle, [u8
             .expect("bundle digest computed");
     bundle.bundle_digest = bundle_digest.to_vec();
 
-    (bundle, manifest_digest)
+    bundle
+}
+
+fn asset_manifest_request(store: &PvgsStore, manifest: &AssetManifest) -> PvgsCommitRequest {
+    let payload = manifest.encode_to_vec();
+    PvgsCommitRequest {
+        commit_id: "asset-manifest-commit".to_string(),
+        commit_type: CommitType::AssetManifestAppend,
+        bindings: CommitBindings {
+            action_digest: None,
+            decision_digest: None,
+            grant_id: None,
+            charter_version_digest: "charter".to_string(),
+            policy_version_digest: "policy".to_string(),
+            prev_record_digest: store.current_head_record_digest,
+            profile_digest: None,
+            tool_profile_digest: None,
+            pev_digest: None,
+        },
+        required_receipt_kind: RequiredReceiptKind::Read,
+        required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+        payload_digests: Vec::new(),
+        epoch_id: 1,
+        key_epoch: None,
+        experience_record_payload: None,
+        replay_run_evidence_payload: None,
+        trace_run_evidence_payload: None,
+        macro_milestone: None,
+        meso_milestone: None,
+        dlp_decision_payload: None,
+        tool_registry_container: None,
+        pev: None,
+        consistency_feedback_payload: None,
+        macro_consistency_digest: None,
+        recovery_case: None,
+        unlock_permit: None,
+        tool_onboarding_event: None,
+        microcircuit_config_payload: None,
+        asset_manifest_payload: Some(payload),
+        asset_bundle_payload: None,
+    }
 }
 
 fn asset_bundle_request(store: &PvgsStore, bundle: &AssetBundle) -> PvgsCommitRequest {
@@ -171,7 +220,12 @@ fn evidence_smoke_snapshot_is_deterministic() {
     let keystore = KeyStore::new_dev_keystore(1);
     let vrf_engine = VrfEngine::new_dev(1);
 
-    let (bundle, manifest_digest) = asset_bundle_payload(100, 5);
+    let (manifest, manifest_digest) = asset_manifest_payload(100, 5);
+    let manifest_req = asset_manifest_request(&store, &manifest);
+    let (manifest_receipt, _) = verify_and_commit(manifest_req, &mut store, &keystore, &vrf_engine);
+    assert_eq!(manifest_receipt.status, ReceiptStatus::Accepted);
+
+    let bundle = asset_bundle_payload(manifest.clone());
     let req = asset_bundle_request(&store, &bundle);
     let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
     assert_eq!(receipt.status, ReceiptStatus::Accepted);
