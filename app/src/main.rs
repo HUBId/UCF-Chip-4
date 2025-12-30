@@ -148,6 +148,17 @@ fn format_snapshot(snapshot: &PvgsSnapshot) -> String {
     }
 
     lines.push(format!(
+        "proposals: latest={} kind={:?} verdict={:?} risky_present={} counts_last_n={{promising={}, neutral={}, risky={}}}",
+        hex_or_none(snapshot.proposals_card.latest_proposal_digest),
+        snapshot.proposals_card.latest_proposal_kind,
+        snapshot.proposals_card.latest_proposal_verdict,
+        snapshot.proposals_card.risky_present,
+        snapshot.proposals_card.counts_last_n.promising,
+        snapshot.proposals_card.counts_last_n.neutral,
+        snapshot.proposals_card.counts_last_n.risky,
+    ));
+
+    lines.push(format!(
         "pending_replay_plans: {}",
         snapshot.pending_replay_ids.len()
     ));
@@ -459,7 +470,7 @@ mod tests {
         assert_eq!(snapshot.last_seal_digest, Some(decision_event.event_digest));
 
         let expected = format!(
-            "head: id=7 digest={}\nruleset: current={} prev={}\ncbv: epoch=5 digest={}\npev_digest: {}\nmicro_config_lc: version=1 digest={}\nmicro_config_sn: version=2 digest={}\nmicro_config_hpa: version=3 digest={}\nasset_manifest: {}\nasset_morphology: {}\nasset_channel: {}\nasset_synapse: {}\nasset_connectivity: {}\nasset_payload_summaries: 0\nreplay_assets: bound=0 missing=2 missing_ids=replay:sess-1:7:1,replay:sess-1:7:2\npending_replay_plans: 2\n- replay:sess-1:7:1\n- replay:sess-1:7:2\ncompleteness: {}\nlast_seal: {}\nrecovery: state=R0Captured checks=0/1 id=recovery:test\nunlock_permit: present=true digest={}\nunlock_hint: UNLOCKED_READONLY",
+            "head: id=7 digest={}\nruleset: current={} prev={}\ncbv: epoch=5 digest={}\npev_digest: {}\nmicro_config_lc: version=1 digest={}\nmicro_config_sn: version=2 digest={}\nmicro_config_hpa: version=3 digest={}\nasset_manifest: {}\nasset_morphology: {}\nasset_channel: {}\nasset_synapse: {}\nasset_connectivity: {}\nasset_payload_summaries: 0\nreplay_assets: bound=0 missing=2 missing_ids=replay:sess-1:7:1,replay:sess-1:7:2\nproposals: latest=NONE kind=None verdict=None risky_present=false counts_last_n={{promising=0, neutral=0, risky=0}}\npending_replay_plans: 2\n- replay:sess-1:7:1\n- replay:sess-1:7:2\ncompleteness: {}\nlast_seal: {}\nrecovery: state=R0Captured checks=0/1 id=recovery:test\nunlock_permit: present=true digest={}\nunlock_hint: UNLOCKED_READONLY",
             encode(head_digest),
             encode(snapshot.ruleset_digest.unwrap()),
             encode(snapshot.prev_ruleset_digest.unwrap()),

@@ -2,6 +2,7 @@ use assets::{
     compute_asset_bundle_digest, compute_asset_chunk_digest, compute_asset_manifest_digest,
 };
 use keys::KeyStore;
+use proposals::{ProposalEvidence, ProposalKind};
 use prost::Message;
 use pvgs::{
     verify_and_commit, CommitBindings, CommitType, PvgsCommitRequest, PvgsStore, RequiredCheck,
@@ -11,8 +12,8 @@ use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
 use std::collections::HashSet;
 use trace_runs::{TraceRunEvidence, TraceStatus};
 use ucf_protocol::ucf::v1::{
-    AssetBundle, AssetChunk, AssetDigest, AssetKind, AssetManifest, CompressionMode, ReceiptStatus,
-    Ref, ReplayFidelity, ReplayRunEvidence, ReplayTargetKind,
+    AssetBundle, AssetChunk, AssetDigest, AssetKind, AssetManifest, CompressionMode, ReasonCodes,
+    ReceiptStatus, Ref, ReplayFidelity, ReplayRunEvidence, ReplayTargetKind,
 };
 use vrf::VrfEngine;
 
@@ -115,6 +116,7 @@ fn asset_manifest_request(store: &PvgsStore, manifest: &AssetManifest) -> PvgsCo
         experience_record_payload: None,
         replay_run_evidence_payload: None,
         trace_run_evidence_payload: None,
+        proposal_evidence_payload: None,
         macro_milestone: None,
         meso_milestone: None,
         dlp_decision_payload: None,
@@ -155,6 +157,7 @@ fn asset_bundle_request(store: &PvgsStore, bundle: &AssetBundle) -> PvgsCommitRe
         experience_record_payload: None,
         replay_run_evidence_payload: None,
         trace_run_evidence_payload: None,
+        proposal_evidence_payload: None,
         macro_milestone: None,
         meso_milestone: None,
         dlp_decision_payload: None,
@@ -211,6 +214,73 @@ fn trace_run_evidence(
         created_at_ms,
         status,
         reason_codes: vec!["RC.GV.OK".to_string()],
+    }
+}
+
+fn proposal_evidence(
+    proposal_digest: [u8; 32],
+    base_evidence_digest: [u8; 32],
+    payload_digest: [u8; 32],
+    created_at_ms: u64,
+    verdict: u8,
+) -> ProposalEvidence {
+    ProposalEvidence {
+        proposal_id: "proposal-1".to_string(),
+        proposal_digest,
+        kind: ProposalKind::MappingUpdate,
+        base_evidence_digest,
+        payload_digest,
+        created_at_ms,
+        score: 0,
+        verdict,
+        reason_codes: vec![
+            "RC.GV.OK".to_string(),
+            ReasonCodes::GV_PROPOSAL_APPENDED.to_string(),
+        ],
+    }
+}
+
+fn proposal_evidence_request(
+    store: &PvgsStore,
+    payload: Vec<u8>,
+    commit_id: &str,
+) -> PvgsCommitRequest {
+    PvgsCommitRequest {
+        commit_id: commit_id.to_string(),
+        commit_type: CommitType::ProposalEvidenceAppend,
+        bindings: CommitBindings {
+            action_digest: None,
+            decision_digest: None,
+            grant_id: None,
+            charter_version_digest: "charter".to_string(),
+            policy_version_digest: "policy".to_string(),
+            prev_record_digest: store.current_head_record_digest,
+            profile_digest: None,
+            tool_profile_digest: None,
+            pev_digest: None,
+        },
+        required_receipt_kind: RequiredReceiptKind::Read,
+        required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+        payload_digests: Vec::new(),
+        epoch_id: 1,
+        key_epoch: None,
+        experience_record_payload: None,
+        replay_run_evidence_payload: None,
+        trace_run_evidence_payload: None,
+        proposal_evidence_payload: Some(payload),
+        macro_milestone: None,
+        meso_milestone: None,
+        dlp_decision_payload: None,
+        tool_registry_container: None,
+        pev: None,
+        consistency_feedback_payload: None,
+        macro_consistency_digest: None,
+        recovery_case: None,
+        unlock_permit: None,
+        tool_onboarding_event: None,
+        microcircuit_config_payload: None,
+        asset_manifest_payload: None,
+        asset_bundle_payload: None,
     }
 }
 
@@ -302,6 +372,7 @@ fn evidence_smoke_snapshot_is_deterministic() {
         experience_record_payload: None,
         replay_run_evidence_payload: Some(replay_evidence.encode_to_vec()),
         trace_run_evidence_payload: None,
+        proposal_evidence_payload: None,
         macro_milestone: None,
         meso_milestone: None,
         dlp_decision_payload: None,
@@ -351,6 +422,7 @@ fn evidence_smoke_snapshot_is_deterministic() {
         experience_record_payload: None,
         replay_run_evidence_payload: None,
         trace_run_evidence_payload: Some(trace_evidence.encode().expect("encode trace run")),
+        proposal_evidence_payload: None,
         macro_milestone: None,
         meso_milestone: None,
         dlp_decision_payload: None,
@@ -398,4 +470,80 @@ fn evidence_smoke_snapshot_is_deterministic() {
         snapshot_one.trace_card.latest_trace_run_status,
         Some(TraceStatus::Pass)
     );
+}
+
+#[test]
+fn proposal_evidence_append_is_accepted_and_idempotent() {
+    let mut store = base_store([2u8; 32]);
+    let keystore = KeyStore::new_dev_keystore(1);
+    let vrf_engine = VrfEngine::new_dev(1);
+
+    let proposal_digest = [11u8; 32];
+    let evidence = proposal_evidence(proposal_digest, [3u8; 32], [4u8; 32], 12, 1);
+    let payload = evidence.encode().expect("encode proposal evidence");
+    let req = proposal_evidence_request(&store, payload, "proposal-evidence-1");
+
+    let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+    assert_eq!(receipt.status, ReceiptStatus::Accepted);
+    assert!(proof.is_some());
+    assert_eq!(store.proposal_store.by_digest.len(), 1);
+
+    let second_payload = evidence.encode().expect("encode proposal evidence");
+    let second_req = proposal_evidence_request(&store, second_payload, "proposal-evidence-2");
+    let (second_receipt, _) = verify_and_commit(second_req, &mut store, &keystore, &vrf_engine);
+    assert_eq!(second_receipt.status, ReceiptStatus::Accepted);
+    assert_eq!(store.proposal_store.by_digest.len(), 1);
+
+    let sep_event = store
+        .sep_log
+        .events
+        .iter()
+        .find(|event| event.object_digest == proposal_digest)
+        .expect("sep event present");
+    assert!(sep_event
+        .reason_codes
+        .iter()
+        .any(|code| code == ReasonCodes::GV_PROPOSAL_APPENDED));
+}
+
+#[test]
+fn list_proposals_is_deterministic() {
+    let mut store = base_store([3u8; 32]);
+    let first = proposal_evidence([1u8; 32], [5u8; 32], [6u8; 32], 10, 0);
+    let second = proposal_evidence([2u8; 32], [5u8; 32], [6u8; 32], 9, 2);
+    let third = proposal_evidence([3u8; 32], [5u8; 32], [6u8; 32], 10, 1);
+
+    store.proposal_store.insert(first).expect("insert proposal");
+    store
+        .proposal_store
+        .insert(second)
+        .expect("insert proposal");
+    store.proposal_store.insert(third).expect("insert proposal");
+
+    let ordered = query::list_proposals(&store, 10);
+    let ordered_digests: Vec<[u8; 32]> = ordered
+        .iter()
+        .map(|proposal| proposal.proposal_digest)
+        .collect();
+    assert_eq!(ordered_digests, vec![[2u8; 32], [1u8; 32], [3u8; 32]]);
+}
+
+#[test]
+fn proposals_scorecard_includes_latest() {
+    let mut store = base_store([4u8; 32]);
+    let older = proposal_evidence([1u8; 32], [5u8; 32], [6u8; 32], 3, 0);
+    let latest = proposal_evidence([9u8; 32], [5u8; 32], [6u8; 32], 7, 2);
+
+    store.proposal_store.insert(older).expect("insert proposal");
+    store
+        .proposal_store
+        .insert(latest)
+        .expect("insert proposal");
+
+    let snapshot = query::snapshot(&store, None);
+    assert_eq!(
+        snapshot.proposals_card.latest_proposal_digest,
+        Some([9u8; 32])
+    );
+    assert!(snapshot.proposals_card.risky_present);
 }

@@ -13,6 +13,7 @@ ucf-protocol = { path = "../ucf-protocol" }
 replay_plan = { path = "../replay_plan" }
 replay_runs = { path = "../crates/replay_runs" }
 trace_runs = { path = "../crates/trace_runs" }
+proposals = { path = "../crates/proposals" }
 dlp_store = { path = "../dlp_store" }
 pev = { path = "../pev" }
 receipts = { path = "../receipts" }
@@ -42,4 +43,5 @@ serde = [
     "replay_plan/serde",
     "replay_runs/serde",
     "trace_runs/serde",
+    "proposals/serde",
 ]
