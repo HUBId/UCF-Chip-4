@@ -61,6 +61,7 @@ pub mod ucf {
             MicrocircuitConfigAppend,
             AssetManifestAppend,
             AssetBundleAppend,
+            ProposalEvidenceAppend,
         }
 
         /// Required receipt classes for PVGS commits.
@@ -584,6 +585,7 @@ pub mod ucf {
             pub const GV_RECOVERY_INVALID_STATE: &'static str = "RC.GV.RECOVERY.INVALID_STATE";
             pub const GV_RECOVERY_INVALID_CHECKS: &'static str = "RC.GV.RECOVERY.INVALID_CHECKS";
             pub const GV_RECOVERY_UNKNOWN_CASE: &'static str = "RC.GV.RECOVERY.UNKNOWN_CASE";
+            pub const GV_PROPOSAL_APPENDED: &'static str = "RC.GV.PROPOSAL.APPENDED";
             pub const RE_REPLAY_MISMATCH: &'static str = "RC.RE.REPLAY.MISMATCH";
             pub const RE_REPLAY_ASSET_MISSING: &'static str = "RC.RE.REPLAY.ASSET_MISSING";
             pub const RE_REPLAY_ASSET_BUNDLE_MISSING: &'static str =

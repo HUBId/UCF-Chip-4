@@ -21,6 +21,7 @@ milestones = { path = "../milestones" }
 replay_plan = { path = "../replay_plan" }
 replay_runs = { path = "../crates/replay_runs" }
 trace_runs = { path = "../crates/trace_runs" }
+proposals = { path = "../crates/proposals" }
 hex = "0.4"
 prost = { workspace = true }
 recovery = { path = "../crates/recovery" }
@@ -30,3 +31,15 @@ tool_events = { path = "../crates/tool_events" }
 assets = { path = "../crates/assets" }
 micro_evidence = { path = "../crates/micro_evidence" }
 blake3 = { workspace = true }
+
+[features]
+serde = [
+    "dep:serde",
+    "dep:serde_yaml",
+    "pvgs/serde",
+    "milestones/serde",
+    "replay_plan/serde",
+    "replay_runs/serde",
+    "trace_runs/serde",
+    "proposals/serde",
+]

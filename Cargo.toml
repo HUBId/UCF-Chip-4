@@ -33,6 +33,7 @@ members = [
     "crates/rpp_store",
     "crates/rpp_proofs",
     "crates/rpp_engine",
+    "crates/proposals",
 ]
 resolver = "2"
 
