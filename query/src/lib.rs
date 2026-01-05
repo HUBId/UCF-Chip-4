@@ -4467,7 +4467,7 @@ mod tests {
         let runs = list_trace_runs(&store, 10);
         assert_eq!(runs.len(), 3);
         assert_eq!(runs[0].created_at_ms, 10);
-        let mut expected = vec![second.trace_digest, third.trace_digest];
+        let mut expected = [second.trace_digest, third.trace_digest];
         expected.sort();
         assert_eq!(runs[1].trace_digest, expected[0]);
         assert_eq!(runs[2].trace_digest, expected[1]);

@@ -8732,7 +8732,7 @@ mod tests {
         }
     }
 
-    fn trace_run_evidence(
+    struct TraceRunEvidenceInput {
         run_digest: [u8; 32],
         active_cfg_digest: [u8; 32],
         shadow_cfg_digest: [u8; 32],
@@ -8741,19 +8741,21 @@ mod tests {
         created_at_ms: u64,
         verdict: TraceVerdict,
         delta: i32,
-    ) -> TraceRunEvidence {
+    }
+
+    fn trace_run_evidence(input: TraceRunEvidenceInput) -> TraceRunEvidence {
         let mut evidence = TraceRunEvidence {
             trace_id: "trace-1".to_string(),
-            trace_digest: run_digest,
-            active_cfg_digest,
-            shadow_cfg_digest,
-            active_feedback_digest,
-            shadow_feedback_digest,
+            trace_digest: input.run_digest,
+            active_cfg_digest: input.active_cfg_digest,
+            shadow_cfg_digest: input.shadow_cfg_digest,
+            active_feedback_digest: input.active_feedback_digest,
+            shadow_feedback_digest: input.shadow_feedback_digest,
             score_active: 10,
             score_shadow: 12,
-            delta,
-            verdict,
-            created_at_ms,
+            delta: input.delta,
+            verdict: input.verdict,
+            created_at_ms: input.created_at_ms,
             reason_codes: vec!["RC.GV.OK".to_string()],
         };
         evidence.trace_digest = evidence.compute_digest().expect("digest");
@@ -9372,16 +9374,16 @@ mod tests {
         let shadow_cfg_digest = [13u8; 32];
         let active_feedback_digest = [14u8; 32];
         let shadow_feedback_digest = [15u8; 32];
-        let evidence = trace_run_evidence(
-            [11u8; 32],
+        let evidence = trace_run_evidence(TraceRunEvidenceInput {
+            run_digest: [11u8; 32],
             active_cfg_digest,
             shadow_cfg_digest,
             active_feedback_digest,
             shadow_feedback_digest,
-            10,
-            TraceVerdict::Promising,
-            2,
-        );
+            created_at_ms: 10,
+            verdict: TraceVerdict::Promising,
+            delta: 2,
+        });
         let run_digest = evidence.trace_digest;
 
         let req = PvgsCommitRequest {
@@ -9453,16 +9455,16 @@ mod tests {
             proposal_evidence_payload: None,
             proposal_activation_payload: None,
             trace_run_evidence_payload: Some(
-                trace_run_evidence(
-                    [22u8; 32],
+                trace_run_evidence(TraceRunEvidenceInput {
+                    run_digest: [22u8; 32],
                     active_cfg_digest,
                     shadow_cfg_digest,
                     active_feedback_digest,
                     shadow_feedback_digest,
-                    10,
-                    TraceVerdict::Promising,
-                    2,
-                )
+                    created_at_ms: 10,
+                    verdict: TraceVerdict::Promising,
+                    delta: 2,
+                })
                 .encode()
                 .expect("encode trace run"),
             ),
@@ -9511,16 +9513,16 @@ mod tests {
         let shadow_cfg_digest = [13u8; 32];
         let active_feedback_digest = [14u8; 32];
         let shadow_feedback_digest = [15u8; 32];
-        let mut evidence = trace_run_evidence(
-            [11u8; 32],
+        let mut evidence = trace_run_evidence(TraceRunEvidenceInput {
+            run_digest: [11u8; 32],
             active_cfg_digest,
             shadow_cfg_digest,
             active_feedback_digest,
             shadow_feedback_digest,
-            10,
-            TraceVerdict::Promising,
-            2,
-        );
+            created_at_ms: 10,
+            verdict: TraceVerdict::Promising,
+            delta: 2,
+        });
         let run_digest = evidence.trace_digest;
         evidence.delta = evidence.delta.saturating_add(5);
 
