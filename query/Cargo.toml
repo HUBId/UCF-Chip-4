@@ -45,3 +45,7 @@ serde = [
     "proposals/serde",
     "proposal_activations/serde",
 ]
+
+[[test]]
+name = "proposal_activation_e2e"
+path = "../tests/proposal_activation_e2e.rs"
