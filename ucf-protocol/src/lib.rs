@@ -812,6 +812,115 @@ pub mod ucf {
         }
 
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum ProposalKind {
+            Unspecified = 0,
+            MappingUpdate = 1,
+            SaePackUpdate = 2,
+            LiquidParamsUpdate = 3,
+            InjectionLimitsUpdate = 4,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct ProposalEvidence {
+            #[prost(string, tag = "1")]
+            pub proposal_id: String,
+            #[prost(bytes = "vec", tag = "2")]
+            pub proposal_digest: Vec<u8>,
+            #[prost(enumeration = "ProposalKind", tag = "3")]
+            pub kind: i32,
+            #[prost(bytes = "vec", tag = "4")]
+            pub base_evidence_digest: Vec<u8>,
+            #[prost(bytes = "vec", tag = "5")]
+            pub payload_digest: Vec<u8>,
+            #[prost(uint64, tag = "6")]
+            pub created_at_ms: u64,
+            #[prost(int32, tag = "7")]
+            pub score: i32,
+            #[prost(int32, tag = "8")]
+            pub verdict: i32,
+            #[prost(string, repeated, tag = "9")]
+            pub reason_codes: Vec<String>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum ActivationStatus {
+            Unspecified = 0,
+            Applied = 1,
+            Rejected = 2,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct ProposalActivationEvidence {
+            #[prost(string, tag = "1")]
+            pub activation_id: String,
+            #[prost(bytes = "vec", tag = "2")]
+            pub activation_digest: Vec<u8>,
+            #[prost(bytes = "vec", tag = "3")]
+            pub proposal_digest: Vec<u8>,
+            #[prost(bytes = "vec", tag = "4")]
+            pub approval_digest: Vec<u8>,
+            #[prost(enumeration = "ActivationStatus", tag = "5")]
+            pub status: i32,
+            #[prost(bytes = "vec", optional, tag = "6")]
+            pub active_mapping_digest: Option<Vec<u8>>,
+            #[prost(bytes = "vec", optional, tag = "7")]
+            pub active_sae_pack_digest: Option<Vec<u8>>,
+            #[prost(bytes = "vec", optional, tag = "8")]
+            pub active_liquid_params_digest: Option<Vec<u8>>,
+            #[prost(bytes = "vec", optional, tag = "9")]
+            pub active_limits_digest: Option<Vec<u8>>,
+            #[prost(uint64, tag = "10")]
+            pub created_at_ms: u64,
+            #[prost(string, repeated, tag = "11")]
+            pub reason_codes: Vec<String>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+        #[repr(i32)]
+        pub enum TraceVerdict {
+            Unspecified = 0,
+            Promising = 1,
+            Neutral = 2,
+            Risky = 3,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[derive(Clone, PartialEq, Eq, Message)]
+        pub struct TraceRunEvidence {
+            #[prost(string, tag = "1")]
+            pub trace_id: String,
+            #[prost(bytes = "vec", tag = "2")]
+            pub trace_digest: Vec<u8>,
+            #[prost(bytes = "vec", tag = "3")]
+            pub active_cfg_digest: Vec<u8>,
+            #[prost(bytes = "vec", tag = "4")]
+            pub shadow_cfg_digest: Vec<u8>,
+            #[prost(bytes = "vec", tag = "5")]
+            pub active_feedback_digest: Vec<u8>,
+            #[prost(bytes = "vec", tag = "6")]
+            pub shadow_feedback_digest: Vec<u8>,
+            #[prost(int32, tag = "7")]
+            pub score_active: i32,
+            #[prost(int32, tag = "8")]
+            pub score_shadow: i32,
+            #[prost(int32, tag = "9")]
+            pub delta: i32,
+            #[prost(enumeration = "TraceVerdict", tag = "10")]
+            pub verdict: i32,
+            #[prost(uint64, tag = "11")]
+            pub created_at_ms: u64,
+            #[prost(string, repeated, tag = "12")]
+            pub reason_codes: Vec<String>,
+        }
+
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
         #[derive(Clone, PartialEq, Eq, Message)]
         pub struct FinalizationHeader {
             #[prost(uint64, tag = "1")]

@@ -229,7 +229,7 @@ pub struct TraceCard {
 pub struct ProposalsCard {
     pub latest_proposal_digest: Option<[u8; 32]>,
     pub latest_proposal_kind: Option<ProposalKind>,
-    pub latest_proposal_verdict: Option<u8>,
+    pub latest_proposal_verdict: Option<i32>,
     pub latest_activation_status: Option<ActivationStatus>,
     pub activation_counts_last_n: ActivationStatusCounts,
     pub activation_rejects_present: bool,
@@ -934,23 +934,26 @@ fn trace_card_from_store(store: &PvgsStore) -> TraceCard {
     let mut latest_created_at = 0u64;
 
     for run in recent_runs {
-        match run.verdict {
+        let verdict = TraceVerdict::try_from(run.verdict).unwrap_or(TraceVerdict::Unspecified);
+        match verdict {
             TraceVerdict::Promising => counts.promising = counts.promising.saturating_add(1),
             TraceVerdict::Neutral => counts.neutral = counts.neutral.saturating_add(1),
             TraceVerdict::Risky => counts.risky = counts.risky.saturating_add(1),
+            TraceVerdict::Unspecified => {}
         }
 
+        let run_digest = digest_from_bytes(&run.trace_digest).unwrap_or([0u8; 32]);
         let is_newer = match latest_digest {
             Some(digest) => {
                 run.created_at_ms > latest_created_at
-                    || (run.created_at_ms == latest_created_at && run.trace_digest > digest)
+                    || (run.created_at_ms == latest_created_at && run_digest > digest)
             }
             None => true,
         };
         if is_newer {
             latest_created_at = run.created_at_ms;
-            latest_digest = Some(run.trace_digest);
-            latest_verdict = Some(run.verdict);
+            latest_digest = Some(run_digest);
+            latest_verdict = Some(verdict);
             latest_delta = Some(run.delta.clamp(-TRACE_DELTA_BOUND, TRACE_DELTA_BOUND));
         }
     }
@@ -972,10 +975,15 @@ fn proposals_card_from_store(store: &PvgsStore) -> ProposalsCard {
         risky_activation_count_last_n(store, PROPOSAL_ACTIVATION_SCORECARD_WINDOW);
     let latest_activation = latest_proposal_activation(store);
     ProposalsCard {
-        latest_proposal_digest: latest.as_ref().map(|proposal| proposal.proposal_digest),
-        latest_proposal_kind: latest.as_ref().map(|proposal| proposal.kind),
+        latest_proposal_digest: latest
+            .as_ref()
+            .and_then(|proposal| digest_from_bytes(&proposal.proposal_digest)),
+        latest_proposal_kind: latest
+            .as_ref()
+            .and_then(|proposal| ProposalKind::try_from(proposal.kind).ok()),
         latest_proposal_verdict: latest.as_ref().map(|proposal| proposal.verdict),
-        latest_activation_status: latest_activation.map(|activation| activation.status),
+        latest_activation_status: latest_activation
+            .and_then(|activation| ActivationStatus::try_from(activation.status).ok()),
         activation_counts_last_n: activation_counts,
         activation_rejects_present,
         risky_activations_present: risky_activations > 0,
@@ -1831,9 +1839,11 @@ pub fn list_replay_runs(store: &PvgsStore, limit: usize) -> Vec<ReplayRunEvidenc
 pub fn list_trace_runs(store: &PvgsStore, limit: usize) -> Vec<TraceRunEvidence> {
     let mut runs: Vec<TraceRunEvidence> = store.trace_run_store.runs.clone();
     runs.sort_by(|a, b| {
+        let digest_a = digest_from_bytes(&a.trace_digest).unwrap_or([0u8; 32]);
+        let digest_b = digest_from_bytes(&b.trace_digest).unwrap_or([0u8; 32]);
         a.created_at_ms
             .cmp(&b.created_at_ms)
-            .then_with(|| a.trace_digest.cmp(&b.trace_digest))
+            .then_with(|| digest_a.cmp(&digest_b))
     });
     runs.truncate(limit.min(MAX_TRACE_RUNS));
     runs
@@ -1844,9 +1854,11 @@ pub fn list_proposals(store: &PvgsStore, limit: usize) -> Vec<ProposalEvidence> 
     let mut proposals: Vec<ProposalEvidence> =
         store.proposal_store.by_digest.values().cloned().collect();
     proposals.sort_by(|a, b| {
+        let digest_a = digest_from_bytes(&a.proposal_digest).unwrap_or([0u8; 32]);
+        let digest_b = digest_from_bytes(&b.proposal_digest).unwrap_or([0u8; 32]);
         a.created_at_ms
             .cmp(&b.created_at_ms)
-            .then_with(|| a.proposal_digest.cmp(&b.proposal_digest))
+            .then_with(|| digest_a.cmp(&digest_b))
     });
     proposals.truncate(limit);
     proposals
@@ -1864,9 +1876,11 @@ pub fn list_proposal_activations(
         .cloned()
         .collect();
     activations.sort_by(|a, b| {
+        let digest_a = digest_from_bytes(&a.activation_digest).unwrap_or([0u8; 32]);
+        let digest_b = digest_from_bytes(&b.activation_digest).unwrap_or([0u8; 32]);
         a.created_at_ms
             .cmp(&b.created_at_ms)
-            .then_with(|| a.activation_digest.cmp(&b.activation_digest))
+            .then_with(|| digest_a.cmp(&digest_b))
     });
     activations.truncate(limit);
     activations
@@ -1885,9 +1899,11 @@ pub fn latest_proposal_activation(store: &PvgsStore) -> Option<ProposalActivatio
         .values()
         .cloned()
         .max_by(|a, b| {
+            let digest_a = digest_from_bytes(&a.activation_digest).unwrap_or([0u8; 32]);
+            let digest_b = digest_from_bytes(&b.activation_digest).unwrap_or([0u8; 32]);
             a.created_at_ms
                 .cmp(&b.created_at_ms)
-                .then_with(|| a.activation_digest.cmp(&b.activation_digest))
+                .then_with(|| digest_a.cmp(&digest_b))
         })
 }
 
@@ -1900,12 +1916,16 @@ pub fn latest_activation_for_proposal(
         .proposal_activation_store
         .by_digest
         .values()
-        .filter(|activation| activation.proposal_digest == proposal_digest)
+        .filter(|activation| {
+            digest_from_bytes(&activation.proposal_digest) == Some(proposal_digest)
+        })
         .cloned()
         .max_by(|a, b| {
+            let digest_a = digest_from_bytes(&a.activation_digest).unwrap_or([0u8; 32]);
+            let digest_b = digest_from_bytes(&b.activation_digest).unwrap_or([0u8; 32]);
             a.created_at_ms
                 .cmp(&b.created_at_ms)
-                .then_with(|| a.activation_digest.cmp(&b.activation_digest))
+                .then_with(|| digest_a.cmp(&digest_b))
         })
 }
 
@@ -1917,9 +1937,11 @@ pub fn latest_proposal(store: &PvgsStore) -> Option<ProposalEvidence> {
         .values()
         .cloned()
         .max_by(|a, b| {
+            let digest_a = digest_from_bytes(&a.proposal_digest).unwrap_or([0u8; 32]);
+            let digest_b = digest_from_bytes(&b.proposal_digest).unwrap_or([0u8; 32]);
             a.created_at_ms
                 .cmp(&b.created_at_ms)
-                .then_with(|| a.proposal_digest.cmp(&b.proposal_digest))
+                .then_with(|| digest_a.cmp(&digest_b))
         })
 }
 
@@ -1954,9 +1976,11 @@ pub fn activation_counts_last_n(store: &PvgsStore, n: usize) -> ActivationStatus
     }
     let mut counts = ActivationStatusCounts::default();
     for activation in activations {
-        match activation.status {
+        match ActivationStatus::try_from(activation.status).unwrap_or(ActivationStatus::Unspecified)
+        {
             ActivationStatus::Applied => counts.applied = counts.applied.saturating_add(1),
             ActivationStatus::Rejected => counts.rejected = counts.rejected.saturating_add(1),
+            ActivationStatus::Unspecified => {}
         }
     }
     counts
@@ -1972,12 +1996,16 @@ fn risky_activation_count_last_n(store: &PvgsStore, n: usize) -> u64 {
     }
     let mut count = 0u64;
     for activation in activations {
-        if !matches!(activation.status, ActivationStatus::Applied) {
+        let status =
+            ActivationStatus::try_from(activation.status).unwrap_or(ActivationStatus::Unspecified);
+        if !matches!(status, ActivationStatus::Applied) {
             continue;
         }
-        if let Some(proposal) = store.proposal_store.get(activation.proposal_digest) {
-            if proposal.verdict == 2 {
-                count = count.saturating_add(1);
+        if let Some(proposal_digest) = digest_from_bytes(&activation.proposal_digest) {
+            if let Some(proposal) = store.proposal_store.get(proposal_digest) {
+                if proposal.verdict == 2 {
+                    count = count.saturating_add(1);
+                }
             }
         }
     }
@@ -1991,9 +2019,11 @@ pub fn latest_trace_run(store: &PvgsStore) -> Option<TraceRunEvidence> {
         .runs
         .iter()
         .max_by(|a, b| {
+            let digest_a = digest_from_bytes(&a.trace_digest).unwrap_or([0u8; 32]);
+            let digest_b = digest_from_bytes(&b.trace_digest).unwrap_or([0u8; 32]);
             a.created_at_ms
                 .cmp(&b.created_at_ms)
-                .then_with(|| a.trace_digest.cmp(&b.trace_digest))
+                .then_with(|| digest_a.cmp(&digest_b))
         })
         .cloned()
 }
@@ -2003,10 +2033,11 @@ pub fn trace_run_summary_counts(store: &PvgsStore, last_n: usize) -> TraceRunSum
     let mut counts = TraceRunSummaryCounts::default();
     let start = store.trace_run_store.runs.len().saturating_sub(last_n);
     for run in store.trace_run_store.runs.iter().skip(start) {
-        match run.verdict {
+        match TraceVerdict::try_from(run.verdict).unwrap_or(TraceVerdict::Unspecified) {
             TraceVerdict::Promising => counts.promising = counts.promising.saturating_add(1),
             TraceVerdict::Neutral => counts.neutral = counts.neutral.saturating_add(1),
             TraceVerdict::Risky => counts.risky = counts.risky.saturating_add(1),
+            TraceVerdict::Unspecified => {}
         }
     }
     counts
@@ -2023,12 +2054,15 @@ pub fn latest_trace_run_for_configs(
         .runs
         .iter()
         .filter(|run| {
-            run.active_cfg_digest == active_cfg_digest && run.shadow_cfg_digest == shadow_cfg_digest
+            digest_from_bytes(&run.active_cfg_digest) == Some(active_cfg_digest)
+                && digest_from_bytes(&run.shadow_cfg_digest) == Some(shadow_cfg_digest)
         })
         .max_by(|a, b| {
+            let digest_a = digest_from_bytes(&a.trace_digest).unwrap_or([0u8; 32]);
+            let digest_b = digest_from_bytes(&b.trace_digest).unwrap_or([0u8; 32]);
             a.created_at_ms
                 .cmp(&b.created_at_ms)
-                .then_with(|| a.trace_digest.cmp(&b.trace_digest))
+                .then_with(|| digest_a.cmp(&digest_b))
         })
         .cloned()
 }
@@ -2617,7 +2651,7 @@ mod tests {
     use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
     use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
-    use trace_runs::{TraceRunEvidence, TraceVerdict};
+    use trace_runs::{compute_trace_run_digest, TraceRunEvidence, TraceVerdict};
     use ucf_protocol::ucf::v1::{
         AssetBundle, AssetChunk, AssetDigest, AssetKind, AssetManifest, CompressionMode,
         ConnectivityEdge, ConnectivityGraphPayload, ConsistencyFeedback, Digest32, DlpDecision,
@@ -2692,19 +2726,20 @@ mod tests {
     ) -> TraceRunEvidence {
         let mut evidence = TraceRunEvidence {
             trace_id: "trace-1".to_string(),
-            trace_digest: run_digest,
-            active_cfg_digest: [2u8; 32],
-            shadow_cfg_digest: [3u8; 32],
-            active_feedback_digest: [4u8; 32],
-            shadow_feedback_digest: [5u8; 32],
+            trace_digest: run_digest.to_vec(),
+            active_cfg_digest: [2u8; 32].to_vec(),
+            shadow_cfg_digest: [3u8; 32].to_vec(),
+            active_feedback_digest: [4u8; 32].to_vec(),
+            shadow_feedback_digest: [5u8; 32].to_vec(),
             score_active: 10,
             score_shadow: 12,
             delta: 2,
-            verdict,
+            verdict: verdict as i32,
             created_at_ms,
             reason_codes: vec!["RC.GV.OK".to_string()],
         };
-        evidence.trace_digest = evidence.compute_digest().expect("digest");
+        let digest = compute_trace_run_digest(&evidence).expect("digest");
+        evidence.trace_digest = digest.to_vec();
         evidence
     }
 
@@ -4467,19 +4502,22 @@ mod tests {
         let runs = list_trace_runs(&store, 10);
         assert_eq!(runs.len(), 3);
         assert_eq!(runs[0].created_at_ms, 10);
-        let mut expected = [second.trace_digest, third.trace_digest];
+        let mut expected = [
+            digest_from_bytes(&second.trace_digest).unwrap(),
+            digest_from_bytes(&third.trace_digest).unwrap(),
+        ];
         expected.sort();
-        assert_eq!(runs[1].trace_digest, expected[0]);
-        assert_eq!(runs[2].trace_digest, expected[1]);
+        assert_eq!(digest_from_bytes(&runs[1].trace_digest), Some(expected[0]));
+        assert_eq!(digest_from_bytes(&runs[2].trace_digest), Some(expected[1]));
 
         let latest = latest_trace_run(&store).expect("latest trace run");
-        assert_eq!(latest.trace_digest, expected[1]);
-        let expected_verdict = if expected[1] == second.trace_digest {
+        assert_eq!(digest_from_bytes(&latest.trace_digest), Some(expected[1]));
+        let expected_verdict = if digest_from_bytes(&second.trace_digest) == Some(expected[1]) {
             TraceVerdict::Risky
         } else {
             TraceVerdict::Neutral
         };
-        assert_eq!(latest.verdict, expected_verdict);
+        assert_eq!(latest.verdict, expected_verdict as i32);
 
         let snapshot = snapshot(&store, None);
         let card = snapshot.trace_card;
@@ -4494,14 +4532,16 @@ mod tests {
     fn latest_trace_run_for_configs_is_deterministic() {
         let mut store = minimal_store();
         let mut first = trace_run_evidence([2u8; 32], 10, TraceVerdict::Promising);
-        first.active_cfg_digest = [9u8; 32];
-        first.shadow_cfg_digest = [8u8; 32];
-        first.trace_digest = first.compute_digest().expect("digest");
+        first.active_cfg_digest = [9u8; 32].to_vec();
+        first.shadow_cfg_digest = [8u8; 32].to_vec();
+        let digest = compute_trace_run_digest(&first).expect("digest");
+        first.trace_digest = digest.to_vec();
 
         let mut second = trace_run_evidence([3u8; 32], 12, TraceVerdict::Risky);
-        second.active_cfg_digest = [9u8; 32];
-        second.shadow_cfg_digest = [8u8; 32];
-        second.trace_digest = second.compute_digest().expect("digest");
+        second.active_cfg_digest = [9u8; 32].to_vec();
+        second.shadow_cfg_digest = [8u8; 32].to_vec();
+        let digest = compute_trace_run_digest(&second).expect("digest");
+        second.trace_digest = digest.to_vec();
 
         store
             .trace_run_store
@@ -4514,7 +4554,10 @@ mod tests {
 
         let latest =
             latest_trace_run_for_configs(&store, [9u8; 32], [8u8; 32]).expect("latest trace run");
-        assert_eq!(latest.trace_digest, second.trace_digest);
+        assert_eq!(
+            digest_from_bytes(&latest.trace_digest),
+            digest_from_bytes(&second.trace_digest)
+        );
     }
 
     #[test]
