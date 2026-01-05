@@ -222,7 +222,7 @@ fn trace_run_evidence(
         score_active: 10,
         score_shadow: 12,
         delta: 2,
-        verdict: verdict as i32,
+        verdict,
         created_at_ms,
         reason_codes: vec!["RC.GV.OK".to_string()],
     };
@@ -686,7 +686,7 @@ fn list_proposals_is_deterministic() {
                 .expect("digest")
         })
         .collect();
-    let mut same_time = vec![first_digest, third_digest];
+    let mut same_time = [first_digest, third_digest];
     same_time.sort();
     assert_eq!(
         ordered_digests,
@@ -741,7 +741,7 @@ fn list_proposal_activations_is_deterministic() {
                 .expect("digest")
         })
         .collect();
-    let mut same_time = vec![first_digest, third_digest];
+    let mut same_time = [first_digest, third_digest];
     same_time.sort();
     assert_eq!(
         ordered_digests,
