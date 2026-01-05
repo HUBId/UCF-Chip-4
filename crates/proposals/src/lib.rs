@@ -124,7 +124,7 @@ impl ProposalStore {
     pub fn insert(&mut self, evidence: ProposalEvidence) -> Result<bool, ProposalStoreError> {
         validate_proposal_evidence(&evidence)?;
         let digest = digest_from_bytes(&evidence.proposal_digest)
-            .ok_or_else(|| ProposalEvidenceError::InvalidProposalDigest)?;
+            .ok_or(ProposalEvidenceError::InvalidProposalDigest)?;
         if self.by_digest.contains_key(&digest) {
             return Ok(false);
         }
