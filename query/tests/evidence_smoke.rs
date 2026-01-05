@@ -2,8 +2,10 @@ use assets::{
     compute_asset_bundle_digest, compute_asset_chunk_digest, compute_asset_manifest_digest,
 };
 use keys::KeyStore;
-use proposal_activations::{ActivationStatus, ProposalActivationEvidence};
-use proposals::{ProposalEvidence, ProposalKind};
+use proposal_activations::{
+    compute_proposal_activation_digest, ActivationStatus, ProposalActivationEvidence,
+};
+use proposals::{compute_proposal_evidence_digest, ProposalEvidence, ProposalKind};
 use prost::Message;
 use pvgs::{
     verify_and_commit, CommitBindings, CommitType, PvgsCommitRequest, PvgsStore, RequiredCheck,
@@ -11,7 +13,7 @@ use pvgs::{
 };
 use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
 use std::collections::HashSet;
-use trace_runs::{TraceRunEvidence, TraceVerdict};
+use trace_runs::{compute_trace_run_digest, TraceRunEvidence, TraceVerdict};
 use ucf_protocol::ucf::v1::{
     AssetBundle, AssetChunk, AssetDigest, AssetKind, AssetManifest, CompressionMode, ReasonCodes,
     ReceiptStatus, Ref, ReplayFidelity, ReplayRunEvidence, ReplayTargetKind,
@@ -212,35 +214,35 @@ fn trace_run_evidence(
 ) -> TraceRunEvidence {
     let mut evidence = TraceRunEvidence {
         trace_id: "trace-1".to_string(),
-        trace_digest: run_digest,
-        active_cfg_digest,
-        shadow_cfg_digest,
-        active_feedback_digest,
-        shadow_feedback_digest,
+        trace_digest: run_digest.to_vec(),
+        active_cfg_digest: active_cfg_digest.to_vec(),
+        shadow_cfg_digest: shadow_cfg_digest.to_vec(),
+        active_feedback_digest: active_feedback_digest.to_vec(),
+        shadow_feedback_digest: shadow_feedback_digest.to_vec(),
         score_active: 10,
         score_shadow: 12,
         delta: 2,
-        verdict,
+        verdict: verdict.into(),
         created_at_ms,
         reason_codes: vec!["RC.GV.OK".to_string()],
     };
-    evidence.trace_digest = evidence.compute_digest().expect("digest");
+    let digest = compute_trace_run_digest(&evidence).expect("digest");
+    evidence.trace_digest = digest.to_vec();
     evidence
 }
 
 fn proposal_evidence(
-    proposal_digest: [u8; 32],
     base_evidence_digest: [u8; 32],
     payload_digest: [u8; 32],
     created_at_ms: u64,
-    verdict: u8,
+    verdict: i32,
 ) -> ProposalEvidence {
-    ProposalEvidence {
+    let mut evidence = ProposalEvidence {
         proposal_id: "proposal-1".to_string(),
-        proposal_digest,
-        kind: ProposalKind::MappingUpdate,
-        base_evidence_digest,
-        payload_digest,
+        proposal_digest: vec![0u8; 32],
+        kind: ProposalKind::MappingUpdate as i32,
+        base_evidence_digest: base_evidence_digest.to_vec(),
+        payload_digest: payload_digest.to_vec(),
         created_at_ms,
         score: 0,
         verdict,
@@ -248,11 +250,13 @@ fn proposal_evidence(
             "RC.GV.OK".to_string(),
             ReasonCodes::GV_PROPOSAL_APPENDED.to_string(),
         ],
-    }
+    };
+    let digest = compute_proposal_evidence_digest(&evidence).expect("proposal digest");
+    evidence.proposal_digest = digest.to_vec();
+    evidence
 }
 
 fn proposal_activation_evidence(
-    activation_digest: [u8; 32],
     proposal_digest: [u8; 32],
     approval_digest: [u8; 32],
     created_at_ms: u64,
@@ -261,20 +265,24 @@ fn proposal_activation_evidence(
     let reason_code = match status {
         ActivationStatus::Applied => ReasonCodes::GV_PROPOSAL_ACTIVATED,
         ActivationStatus::Rejected => ReasonCodes::GV_PROPOSAL_REJECTED,
+        ActivationStatus::Unspecified => ReasonCodes::GE_VALIDATION_SCHEMA_INVALID,
     };
-    ProposalActivationEvidence {
+    let mut evidence = ProposalActivationEvidence {
         activation_id: "activation-1".to_string(),
-        activation_digest,
-        proposal_digest,
-        approval_digest,
-        status,
-        active_mapping_digest: Some([7u8; 32]),
+        activation_digest: vec![0u8; 32],
+        proposal_digest: proposal_digest.to_vec(),
+        approval_digest: approval_digest.to_vec(),
+        status: status as i32,
+        active_mapping_digest: Some([7u8; 32].to_vec()),
         active_sae_pack_digest: None,
         active_liquid_params_digest: None,
-        active_limits_digest: Some([8u8; 32]),
+        active_limits_digest: Some([8u8; 32].to_vec()),
         created_at_ms,
         reason_codes: vec!["RC.GV.OK".to_string(), reason_code.to_string()],
-    }
+    };
+    let digest = compute_proposal_activation_digest(&evidence).expect("activation digest");
+    evidence.activation_digest = digest.to_vec();
+    evidence
 }
 
 fn proposal_evidence_request(
@@ -489,7 +497,11 @@ fn evidence_smoke_snapshot_is_deterministic() {
         2345,
         TraceVerdict::Promising,
     );
-    let trace_run_digest = trace_evidence.trace_digest;
+    let trace_run_digest: [u8; 32] = trace_evidence
+        .trace_digest
+        .as_slice()
+        .try_into()
+        .expect("trace digest");
     let trace_req = PvgsCommitRequest {
         commit_id: "trace-run-evidence".to_string(),
         commit_type: CommitType::TraceRunEvidenceAppend,
@@ -511,7 +523,7 @@ fn evidence_smoke_snapshot_is_deterministic() {
         key_epoch: None,
         experience_record_payload: None,
         replay_run_evidence_payload: None,
-        trace_run_evidence_payload: Some(trace_evidence.encode().expect("encode trace run")),
+        trace_run_evidence_payload: Some(trace_evidence.encode_to_vec()),
         proposal_evidence_payload: None,
         proposal_activation_payload: None,
         macro_milestone: None,
@@ -570,9 +582,13 @@ fn proposal_evidence_append_is_accepted_and_idempotent() {
     let keystore = KeyStore::new_dev_keystore(1);
     let vrf_engine = VrfEngine::new_dev(1);
 
-    let proposal_digest = [11u8; 32];
-    let evidence = proposal_evidence(proposal_digest, [3u8; 32], [4u8; 32], 12, 1);
-    let payload = evidence.encode().expect("encode proposal evidence");
+    let evidence = proposal_evidence([3u8; 32], [4u8; 32], 12, 1);
+    let proposal_digest: [u8; 32] = evidence
+        .proposal_digest
+        .as_slice()
+        .try_into()
+        .expect("proposal digest");
+    let payload = evidence.encode_to_vec();
     let req = proposal_evidence_request(&store, payload, "proposal-evidence-1");
 
     let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -580,7 +596,7 @@ fn proposal_evidence_append_is_accepted_and_idempotent() {
     assert!(proof.is_some());
     assert_eq!(store.proposal_store.by_digest.len(), 1);
 
-    let second_payload = evidence.encode().expect("encode proposal evidence");
+    let second_payload = evidence.encode_to_vec();
     let second_req = proposal_evidence_request(&store, second_payload, "proposal-evidence-2");
     let (second_receipt, _) = verify_and_commit(second_req, &mut store, &keystore, &vrf_engine);
     assert_eq!(second_receipt.status, ReceiptStatus::Accepted);
@@ -604,15 +620,14 @@ fn proposal_activation_append_is_accepted_and_idempotent() {
     let keystore = KeyStore::new_dev_keystore(1);
     let vrf_engine = VrfEngine::new_dev(1);
 
-    let activation_digest = [21u8; 32];
-    let evidence = proposal_activation_evidence(
-        activation_digest,
-        [11u8; 32],
-        [12u8; 32],
-        22,
-        ActivationStatus::Applied,
-    );
-    let payload = evidence.encode().expect("encode activation evidence");
+    let evidence =
+        proposal_activation_evidence([11u8; 32], [12u8; 32], 22, ActivationStatus::Applied);
+    let activation_digest: [u8; 32] = evidence
+        .activation_digest
+        .as_slice()
+        .try_into()
+        .expect("activation digest");
+    let payload = evidence.encode_to_vec();
     let req = proposal_activation_request(&store, payload, "proposal-activation-1");
 
     let (receipt, proof) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
@@ -620,7 +635,7 @@ fn proposal_activation_append_is_accepted_and_idempotent() {
     assert!(proof.is_some());
     assert_eq!(store.proposal_activation_store.by_digest.len(), 1);
 
-    let second_payload = evidence.encode().expect("encode activation evidence");
+    let second_payload = evidence.encode_to_vec();
     let second_req = proposal_activation_request(&store, second_payload, "proposal-activation-2");
     let (second_receipt, _) = verify_and_commit(second_req, &mut store, &keystore, &vrf_engine);
     assert_eq!(second_receipt.status, ReceiptStatus::Accepted);
@@ -641,9 +656,17 @@ fn proposal_activation_append_is_accepted_and_idempotent() {
 #[test]
 fn list_proposals_is_deterministic() {
     let mut store = base_store([3u8; 32]);
-    let first = proposal_evidence([1u8; 32], [5u8; 32], [6u8; 32], 10, 0);
-    let second = proposal_evidence([2u8; 32], [5u8; 32], [6u8; 32], 9, 2);
-    let third = proposal_evidence([3u8; 32], [5u8; 32], [6u8; 32], 10, 1);
+    let first = proposal_evidence([5u8; 32], [6u8; 32], 10, 0);
+    let second = proposal_evidence([6u8; 32], [7u8; 32], 9, 2);
+    let third = proposal_evidence([7u8; 32], [8u8; 32], 10, 1);
+
+    let first_digest: [u8; 32] = first.proposal_digest.as_slice().try_into().expect("digest");
+    let second_digest: [u8; 32] = second
+        .proposal_digest
+        .as_slice()
+        .try_into()
+        .expect("digest");
+    let third_digest: [u8; 32] = third.proposal_digest.as_slice().try_into().expect("digest");
 
     store.proposal_store.insert(first).expect("insert proposal");
     store
@@ -655,35 +678,44 @@ fn list_proposals_is_deterministic() {
     let ordered = query::list_proposals(&store, 10);
     let ordered_digests: Vec<[u8; 32]> = ordered
         .iter()
-        .map(|proposal| proposal.proposal_digest)
+        .map(|proposal| {
+            proposal
+                .proposal_digest
+                .as_slice()
+                .try_into()
+                .expect("digest")
+        })
         .collect();
-    assert_eq!(ordered_digests, vec![[2u8; 32], [1u8; 32], [3u8; 32]]);
+    let mut same_time = [first_digest, third_digest];
+    same_time.sort();
+    assert_eq!(
+        ordered_digests,
+        vec![second_digest, same_time[0], same_time[1]]
+    );
 }
 
 #[test]
 fn list_proposal_activations_is_deterministic() {
     let mut store = base_store([3u8; 32]);
-    let first = proposal_activation_evidence(
-        [1u8; 32],
-        [5u8; 32],
-        [6u8; 32],
-        10,
-        ActivationStatus::Applied,
-    );
-    let second = proposal_activation_evidence(
-        [2u8; 32],
-        [5u8; 32],
-        [6u8; 32],
-        9,
-        ActivationStatus::Rejected,
-    );
-    let third = proposal_activation_evidence(
-        [3u8; 32],
-        [5u8; 32],
-        [6u8; 32],
-        10,
-        ActivationStatus::Applied,
-    );
+    let first = proposal_activation_evidence([5u8; 32], [6u8; 32], 10, ActivationStatus::Applied);
+    let second = proposal_activation_evidence([5u8; 32], [7u8; 32], 9, ActivationStatus::Rejected);
+    let third = proposal_activation_evidence([5u8; 32], [8u8; 32], 10, ActivationStatus::Applied);
+
+    let first_digest: [u8; 32] = first
+        .activation_digest
+        .as_slice()
+        .try_into()
+        .expect("digest");
+    let second_digest: [u8; 32] = second
+        .activation_digest
+        .as_slice()
+        .try_into()
+        .expect("digest");
+    let third_digest: [u8; 32] = third
+        .activation_digest
+        .as_slice()
+        .try_into()
+        .expect("digest");
 
     store
         .proposal_activation_store
@@ -701,36 +733,41 @@ fn list_proposal_activations_is_deterministic() {
     let ordered = query::list_proposal_activations(&store, 10);
     let ordered_digests: Vec<[u8; 32]> = ordered
         .iter()
-        .map(|activation| activation.activation_digest)
+        .map(|activation| {
+            activation
+                .activation_digest
+                .as_slice()
+                .try_into()
+                .expect("digest")
+        })
         .collect();
-    assert_eq!(ordered_digests, vec![[2u8; 32], [1u8; 32], [3u8; 32]]);
+    let mut same_time = [first_digest, third_digest];
+    same_time.sort();
+    assert_eq!(
+        ordered_digests,
+        vec![second_digest, same_time[0], same_time[1]]
+    );
 }
 
 #[test]
 fn latest_activation_for_proposal_is_deterministic() {
     let mut store = base_store([3u8; 32]);
     let proposal_digest = [7u8; 32];
-    let first = proposal_activation_evidence(
-        [1u8; 32],
-        proposal_digest,
-        [6u8; 32],
-        10,
-        ActivationStatus::Applied,
-    );
-    let second = proposal_activation_evidence(
-        [2u8; 32],
-        proposal_digest,
-        [6u8; 32],
-        10,
-        ActivationStatus::Rejected,
-    );
-    let other = proposal_activation_evidence(
-        [3u8; 32],
-        [8u8; 32],
-        [9u8; 32],
-        11,
-        ActivationStatus::Applied,
-    );
+    let first =
+        proposal_activation_evidence(proposal_digest, [6u8; 32], 10, ActivationStatus::Applied);
+    let second =
+        proposal_activation_evidence(proposal_digest, [6u8; 32], 10, ActivationStatus::Rejected);
+    let other = proposal_activation_evidence([8u8; 32], [9u8; 32], 11, ActivationStatus::Applied);
+    let first_digest: [u8; 32] = first
+        .activation_digest
+        .as_slice()
+        .try_into()
+        .expect("digest");
+    let second_digest: [u8; 32] = second
+        .activation_digest
+        .as_slice()
+        .try_into()
+        .expect("digest");
 
     store
         .proposal_activation_store
@@ -747,14 +784,29 @@ fn latest_activation_for_proposal_is_deterministic() {
 
     let latest =
         query::latest_activation_for_proposal(&store, proposal_digest).expect("latest activation");
-    assert_eq!(latest.activation_digest, second.activation_digest);
+    let expected = if second_digest > first_digest {
+        second_digest
+    } else {
+        first_digest
+    };
+    let latest_digest: [u8; 32] = latest
+        .activation_digest
+        .as_slice()
+        .try_into()
+        .expect("digest");
+    assert_eq!(latest_digest, expected);
 }
 
 #[test]
 fn proposals_scorecard_includes_latest() {
     let mut store = base_store([4u8; 32]);
-    let older = proposal_evidence([1u8; 32], [5u8; 32], [6u8; 32], 3, 0);
-    let latest = proposal_evidence([9u8; 32], [5u8; 32], [6u8; 32], 7, 2);
+    let older = proposal_evidence([5u8; 32], [6u8; 32], 3, 0);
+    let latest = proposal_evidence([7u8; 32], [8u8; 32], 7, 2);
+    let latest_digest: [u8; 32] = latest
+        .proposal_digest
+        .as_slice()
+        .try_into()
+        .expect("latest digest");
 
     store.proposal_store.insert(older).expect("insert proposal");
     store
@@ -762,13 +814,8 @@ fn proposals_scorecard_includes_latest() {
         .insert(latest)
         .expect("insert proposal");
 
-    let activation = proposal_activation_evidence(
-        [10u8; 32],
-        [9u8; 32],
-        [11u8; 32],
-        12,
-        ActivationStatus::Rejected,
-    );
+    let activation =
+        proposal_activation_evidence([9u8; 32], [11u8; 32], 12, ActivationStatus::Rejected);
     store
         .proposal_activation_store
         .insert(activation)
@@ -777,7 +824,7 @@ fn proposals_scorecard_includes_latest() {
     let snapshot = query::snapshot(&store, None);
     assert_eq!(
         snapshot.proposals_card.latest_proposal_digest,
-        Some([9u8; 32])
+        Some(latest_digest)
     );
     assert!(snapshot.proposals_card.risky_present);
     assert_eq!(

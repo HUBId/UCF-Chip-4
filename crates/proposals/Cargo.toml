@@ -6,6 +6,9 @@ edition.workspace = true
 [dependencies]
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
+blake3.workspace = true
+prost.workspace = true
+ucf-protocol = { path = "../../ucf-protocol" }
 
 [features]
 default = []

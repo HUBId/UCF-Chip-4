@@ -1145,16 +1145,21 @@ name = "proposal_activations"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "prost",
  "serde",
  "thiserror 1.0.69",
+ "ucf-protocol",
 ]
 
 [[package]]
 name = "proposals"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "prost",
  "serde",
  "thiserror 1.0.69",
+ "ucf-protocol",
 ]
 
 [[package]]
@@ -1913,8 +1918,10 @@ name = "trace_runs"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "prost",
  "serde",
  "thiserror 1.0.69",
+ "ucf-protocol",
 ]
 
 [[package]]

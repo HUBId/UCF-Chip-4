@@ -20,8 +20,13 @@ use milestones::{
     MicroMilestoneStore,
 };
 use pev::{pev_digest as extract_pev_digest, PevStore, PolicyEcologyVector};
-use proposal_activations::{ActivationStatus, ProposalActivationEvidence, ProposalActivationStore};
-use proposals::{ProposalEvidence, ProposalStore};
+use proposal_activations::{
+    compute_proposal_activation_digest, validate_proposal_activation_evidence, ActivationStatus,
+    ProposalActivationEvidence, ProposalActivationStore,
+};
+use proposals::{
+    compute_proposal_evidence_digest, validate_proposal_evidence, ProposalEvidence, ProposalStore,
+};
 use prost::Message;
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
 use recovery::{RecoveryCase, RecoveryCheck, RecoveryState, RecoveryStore, RecoveryStoreError};
@@ -44,7 +49,10 @@ use tool_events::{
     compute_event_digest as compute_tool_event_digest, ToolEventError, ToolEventStore,
 };
 use tool_registry_state::{ToolRegistryError, ToolRegistryState};
-use trace_runs::{TraceRunEvidence, TraceRunStore, TraceVerdict};
+use trace_runs::{
+    compute_trace_run_digest, validate_trace_run_evidence, TraceRunEvidence, TraceRunStore,
+    TraceVerdict,
+};
 use ucf_protocol::ucf::v1::{
     self as protocol, AssetBundle, AssetChunk, AssetKind, AssetManifest, ChannelParamsSetPayload,
     CharacterBaselineVector, ConnectivityGraphPayload, ConsistencyFeedback, Digest32, DlpDecision,
@@ -5311,6 +5319,8 @@ fn verify_replay_run_evidence_append(
         });
     }
 
+    let run_digest = run_digest.expect("validated run digest");
+
     let verified_fields_digest =
         compute_verified_fields_digest(&req.bindings, req.required_receipt_kind);
     let mut proof_receipt = issue_proof_receipt(
@@ -5328,7 +5338,6 @@ fn verify_replay_run_evidence_append(
     proof_receipt.receipt_digest = receipt.receipt_digest.clone();
 
     store.add_receipt_edges(&receipt);
-    let run_digest = run_digest.expect("validated run digest");
     if store.replay_run_store.insert(evidence.clone()).is_err() {
         return finalize_receipt(FinalizeReceiptArgs {
             req: &req,
@@ -5411,23 +5420,32 @@ fn verify_trace_run_evidence_append(
         }
     };
 
-    let run_digest = evidence.trace_digest;
+    let run_digest = digest_from_bytes(&evidence.trace_digest);
     if req.payload_digests.is_empty() {
-        req.payload_digests = vec![run_digest];
+        if let Some(digest) = run_digest {
+            req.payload_digests = vec![digest];
+        }
     }
 
     let receipt_input = to_receipt_input(&req);
     let mut reject_reason_codes = Vec::new();
 
-    if req.payload_digests.len() != 1 || req.payload_digests[0] != run_digest {
+    if run_digest.is_none() {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
-    if evidence.validate().is_err() {
+    if let Some(digest) = run_digest {
+        if req.payload_digests.len() != 1 || req.payload_digests[0] != digest {
+            reject_reason_codes
+                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+        }
+    }
+
+    if validate_trace_run_evidence(&evidence).is_err() {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
-    if evidence.compute_digest().ok() != Some(run_digest) {
+    if verify_trace_run_evidence_digest(&evidence).is_err() {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
@@ -5470,10 +5488,12 @@ fn verify_trace_run_evidence_append(
             store,
             keystore,
             frame_kind: None,
-            event_object_digest: Some(run_digest),
+            event_object_digest: run_digest,
             event_reason_codes: None,
         });
     }
+
+    let run_digest = run_digest.expect("validated run digest");
 
     let verified_fields_digest =
         compute_verified_fields_digest(&req.bindings, req.required_receipt_kind);
@@ -5509,33 +5529,31 @@ fn verify_trace_run_evidence_append(
     }
     store.committed_payload_digests.insert(run_digest);
 
-    store.add_graph_edge(
-        run_digest,
-        EdgeType::References,
-        evidence.active_cfg_digest,
-        None,
-    );
-    store.add_graph_edge(
-        run_digest,
-        EdgeType::References,
-        evidence.shadow_cfg_digest,
-        None,
-    );
-    store.add_graph_edge(
-        run_digest,
-        EdgeType::References,
-        evidence.active_feedback_digest,
-        None,
-    );
-    store.add_graph_edge(
-        run_digest,
-        EdgeType::References,
-        evidence.shadow_feedback_digest,
-        None,
-    );
+    if let Some(active_cfg_digest) = digest_from_bytes(&evidence.active_cfg_digest) {
+        store.add_graph_edge(run_digest, EdgeType::References, active_cfg_digest, None);
+    }
+    if let Some(shadow_cfg_digest) = digest_from_bytes(&evidence.shadow_cfg_digest) {
+        store.add_graph_edge(run_digest, EdgeType::References, shadow_cfg_digest, None);
+    }
+    if let Some(active_feedback_digest) = digest_from_bytes(&evidence.active_feedback_digest) {
+        store.add_graph_edge(
+            run_digest,
+            EdgeType::References,
+            active_feedback_digest,
+            None,
+        );
+    }
+    if let Some(shadow_feedback_digest) = digest_from_bytes(&evidence.shadow_feedback_digest) {
+        store.add_graph_edge(
+            run_digest,
+            EdgeType::References,
+            shadow_feedback_digest,
+            None,
+        );
+    }
 
     let mut reason_codes = vec![protocol::ReasonCodes::GV_TRACE_APPENDED.to_string()];
-    match evidence.verdict {
+    match TraceVerdict::try_from(evidence.verdict).unwrap_or(TraceVerdict::Unspecified) {
         TraceVerdict::Promising => {
             reason_codes.push(protocol::ReasonCodes::GV_TRACE_PROMISING.to_string());
         }
@@ -5545,6 +5563,7 @@ fn verify_trace_run_evidence_append(
         TraceVerdict::Risky => {
             reason_codes.push(protocol::ReasonCodes::GV_TRACE_RISKY.to_string());
         }
+        TraceVerdict::Unspecified => {}
     }
     let event_type = SepEventType::EvReplay;
 
@@ -5598,19 +5617,32 @@ fn verify_proposal_evidence_append(
         }
     };
 
-    let proposal_digest = evidence.proposal_digest;
+    let proposal_digest = digest_from_bytes(&evidence.proposal_digest);
     if req.payload_digests.is_empty() {
-        req.payload_digests = vec![proposal_digest];
+        if let Some(digest) = proposal_digest {
+            req.payload_digests = vec![digest];
+        }
     }
 
     let receipt_input = to_receipt_input(&req);
     let mut reject_reason_codes = Vec::new();
 
-    if req.payload_digests.len() != 1 || req.payload_digests[0] != proposal_digest {
+    if proposal_digest.is_none() {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
-    if evidence.validate().is_err() {
+    if let Some(digest) = proposal_digest {
+        if req.payload_digests.len() != 1 || req.payload_digests[0] != digest {
+            reject_reason_codes
+                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+        }
+    }
+
+    if validate_proposal_evidence(&evidence).is_err() {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if verify_proposal_evidence_digest(&evidence).is_err() {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
@@ -5653,10 +5685,12 @@ fn verify_proposal_evidence_append(
             store,
             keystore,
             frame_kind: None,
-            event_object_digest: Some(proposal_digest),
+            event_object_digest: proposal_digest,
             event_reason_codes: None,
         });
     }
+
+    let proposal_digest = proposal_digest.expect("validated proposal digest");
 
     let verified_fields_digest =
         compute_verified_fields_digest(&req.bindings, req.required_receipt_kind);
@@ -5679,18 +5713,17 @@ fn verify_proposal_evidence_append(
         Ok(inserted) => {
             store.committed_payload_digests.insert(proposal_digest);
             if inserted {
-                store.add_graph_edge(
-                    proposal_digest,
-                    EdgeType::References,
-                    evidence.base_evidence_digest,
-                    None,
-                );
-                store.add_graph_edge(
-                    proposal_digest,
-                    EdgeType::References,
-                    evidence.payload_digest,
-                    None,
-                );
+                if let Some(base_digest) = digest_from_bytes(&evidence.base_evidence_digest) {
+                    store.add_graph_edge(proposal_digest, EdgeType::References, base_digest, None);
+                }
+                if let Some(payload_digest) = digest_from_bytes(&evidence.payload_digest) {
+                    store.add_graph_edge(
+                        proposal_digest,
+                        EdgeType::References,
+                        payload_digest,
+                        None,
+                    );
+                }
                 let _ = store.record_sep_event(
                     &req.commit_id,
                     SepEventType::EvAgentStep,
@@ -5764,19 +5797,32 @@ fn verify_proposal_activation_append(
         }
     };
 
-    let activation_digest = evidence.activation_digest;
+    let activation_digest = digest_from_bytes(&evidence.activation_digest);
     if req.payload_digests.is_empty() {
-        req.payload_digests = vec![activation_digest];
+        if let Some(digest) = activation_digest {
+            req.payload_digests = vec![digest];
+        }
     }
 
     let receipt_input = to_receipt_input(&req);
     let mut reject_reason_codes = Vec::new();
 
-    if req.payload_digests.len() != 1 || req.payload_digests[0] != activation_digest {
+    if activation_digest.is_none() {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
-    if evidence.validate().is_err() {
+    if let Some(digest) = activation_digest {
+        if req.payload_digests.len() != 1 || req.payload_digests[0] != digest {
+            reject_reason_codes
+                .push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+        }
+    }
+
+    if validate_proposal_activation_evidence(&evidence).is_err() {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if verify_proposal_activation_digest(&evidence).is_err() {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
@@ -5819,10 +5865,12 @@ fn verify_proposal_activation_append(
             store,
             keystore,
             frame_kind: None,
-            event_object_digest: Some(activation_digest),
+            event_object_digest: activation_digest,
             event_reason_codes: None,
         });
     }
+
+    let activation_digest = activation_digest.expect("validated activation digest");
 
     let verified_fields_digest =
         compute_verified_fields_digest(&req.bindings, req.required_receipt_kind);
@@ -5845,36 +5893,61 @@ fn verify_proposal_activation_append(
         Ok(inserted) => {
             store.committed_payload_digests.insert(activation_digest);
             if inserted {
-                store.add_graph_edge(
-                    activation_digest,
-                    EdgeType::References,
-                    evidence.proposal_digest,
-                    None,
-                );
-                store.add_graph_edge(
-                    activation_digest,
-                    EdgeType::References,
-                    evidence.approval_digest,
-                    None,
-                );
-                if let Some(digest) = evidence.active_mapping_digest {
+                if let Some(proposal_digest) = digest_from_bytes(&evidence.proposal_digest) {
+                    store.add_graph_edge(
+                        activation_digest,
+                        EdgeType::References,
+                        proposal_digest,
+                        None,
+                    );
+                }
+                if let Some(approval_digest) = digest_from_bytes(&evidence.approval_digest) {
+                    store.add_graph_edge(
+                        activation_digest,
+                        EdgeType::References,
+                        approval_digest,
+                        None,
+                    );
+                }
+                if let Some(digest) = evidence
+                    .active_mapping_digest
+                    .as_ref()
+                    .and_then(|value| digest_from_bytes(value))
+                {
                     store.add_graph_edge(activation_digest, EdgeType::References, digest, None);
                 }
-                if let Some(digest) = evidence.active_sae_pack_digest {
+                if let Some(digest) = evidence
+                    .active_sae_pack_digest
+                    .as_ref()
+                    .and_then(|value| digest_from_bytes(value))
+                {
                     store.add_graph_edge(activation_digest, EdgeType::References, digest, None);
                 }
-                if let Some(digest) = evidence.active_liquid_params_digest {
+                if let Some(digest) = evidence
+                    .active_liquid_params_digest
+                    .as_ref()
+                    .and_then(|value| digest_from_bytes(value))
+                {
                     store.add_graph_edge(activation_digest, EdgeType::References, digest, None);
                 }
-                if let Some(digest) = evidence.active_limits_digest {
+                if let Some(digest) = evidence
+                    .active_limits_digest
+                    .as_ref()
+                    .and_then(|value| digest_from_bytes(value))
+                {
                     store.add_graph_edge(activation_digest, EdgeType::References, digest, None);
                 }
-                let reason_code = match evidence.status {
+                let reason_code = match ActivationStatus::try_from(evidence.status)
+                    .unwrap_or(ActivationStatus::Unspecified)
+                {
                     ActivationStatus::Applied => {
                         protocol::ReasonCodes::GV_PROPOSAL_ACTIVATED.to_string()
                     }
                     ActivationStatus::Rejected => {
                         protocol::ReasonCodes::GV_PROPOSAL_REJECTED.to_string()
+                    }
+                    ActivationStatus::Unspecified => {
+                        protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
                     }
                 };
                 let _ = store.record_sep_event(
@@ -5903,6 +5976,33 @@ fn verify_proposal_activation_append(
     }
 
     (receipt, Some(proof_receipt))
+}
+
+fn verify_proposal_evidence_digest(evidence: &ProposalEvidence) -> Result<(), ()> {
+    let digest = digest_from_bytes(&evidence.proposal_digest).ok_or(())?;
+    let expected = compute_proposal_evidence_digest(evidence).map_err(|_| ())?;
+    if digest != expected {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn verify_proposal_activation_digest(evidence: &ProposalActivationEvidence) -> Result<(), ()> {
+    let digest = digest_from_bytes(&evidence.activation_digest).ok_or(())?;
+    let expected = compute_proposal_activation_digest(evidence).map_err(|_| ())?;
+    if digest != expected {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn verify_trace_run_evidence_digest(evidence: &TraceRunEvidence) -> Result<(), ()> {
+    let digest = digest_from_bytes(&evidence.trace_digest).ok_or(())?;
+    let expected = compute_trace_run_digest(evidence).map_err(|_| ())?;
+    if digest != expected {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn verify_tool_event_append(
@@ -7107,6 +7207,7 @@ mod tests {
         derive_micro_from_experience_window, ExperienceRange, MicroMilestone, MicroMilestoneState,
         PriorityClass,
     };
+    use proposals::ProposalKind;
     use prost::Message;
     use protocol::ReasonCodes;
     use receipts::verify_pvgs_receipt_attestation;
@@ -8746,19 +8847,20 @@ mod tests {
     fn trace_run_evidence(input: TraceRunEvidenceInput) -> TraceRunEvidence {
         let mut evidence = TraceRunEvidence {
             trace_id: "trace-1".to_string(),
-            trace_digest: input.run_digest,
-            active_cfg_digest: input.active_cfg_digest,
-            shadow_cfg_digest: input.shadow_cfg_digest,
-            active_feedback_digest: input.active_feedback_digest,
-            shadow_feedback_digest: input.shadow_feedback_digest,
+            trace_digest: input.run_digest.to_vec(),
+            active_cfg_digest: input.active_cfg_digest.to_vec(),
+            shadow_cfg_digest: input.shadow_cfg_digest.to_vec(),
+            active_feedback_digest: input.active_feedback_digest.to_vec(),
+            shadow_feedback_digest: input.shadow_feedback_digest.to_vec(),
             score_active: 10,
             score_shadow: 12,
             delta: input.delta,
-            verdict: input.verdict,
+            verdict: input.verdict as i32,
             created_at_ms: input.created_at_ms,
             reason_codes: vec!["RC.GV.OK".to_string()],
         };
-        evidence.trace_digest = evidence.compute_digest().expect("digest");
+        let digest = compute_trace_run_digest(&evidence).expect("digest");
+        evidence.trace_digest = digest.to_vec();
         evidence
     }
 
@@ -9384,7 +9486,7 @@ mod tests {
             verdict: TraceVerdict::Promising,
             delta: 2,
         });
-        let run_digest = evidence.trace_digest;
+        let run_digest: [u8; 32] = evidence.trace_digest.as_slice().try_into().expect("digest");
 
         let req = PvgsCommitRequest {
             commit_id: "trace-run-evidence-1".to_string(),
@@ -9409,7 +9511,7 @@ mod tests {
             replay_run_evidence_payload: None,
             proposal_evidence_payload: None,
             proposal_activation_payload: None,
-            trace_run_evidence_payload: Some(evidence.encode().expect("encode trace run")),
+            trace_run_evidence_payload: Some(evidence.encode_to_vec()),
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9465,8 +9567,7 @@ mod tests {
                     verdict: TraceVerdict::Promising,
                     delta: 2,
                 })
-                .encode()
-                .expect("encode trace run"),
+                .encode_to_vec(),
             ),
             macro_milestone: None,
             meso_milestone: None,
@@ -9523,7 +9624,7 @@ mod tests {
             verdict: TraceVerdict::Promising,
             delta: 2,
         });
-        let run_digest = evidence.trace_digest;
+        let run_digest: [u8; 32] = evidence.trace_digest.as_slice().try_into().expect("digest");
         evidence.delta = evidence.delta.saturating_add(5);
 
         let req = PvgsCommitRequest {
@@ -9549,7 +9650,7 @@ mod tests {
             replay_run_evidence_payload: None,
             proposal_evidence_payload: None,
             proposal_activation_payload: None,
-            trace_run_evidence_payload: Some(evidence.encode().expect("encode trace run")),
+            trace_run_evidence_payload: Some(evidence.encode_to_vec()),
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9568,6 +9669,141 @@ mod tests {
         let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
         assert_eq!(receipt.status, ReceiptStatus::Rejected);
         assert!(store.trace_run_store.get(run_digest).is_none());
+    }
+
+    #[test]
+    fn proposal_evidence_append_rejects_tampered_digest() {
+        let prev = [41u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let mut evidence = ProposalEvidence {
+            proposal_id: "proposal-1".to_string(),
+            proposal_digest: vec![0u8; 32],
+            kind: ProposalKind::MappingUpdate as i32,
+            base_evidence_digest: [8u8; 32].to_vec(),
+            payload_digest: [9u8; 32].to_vec(),
+            created_at_ms: 10,
+            score: 0,
+            verdict: 1,
+            reason_codes: vec!["RC.GV.OK".to_string()],
+        };
+        let digest = compute_proposal_evidence_digest(&evidence).expect("proposal digest");
+        evidence.proposal_digest = digest.to_vec();
+        evidence.score = 5;
+
+        let req = PvgsCommitRequest {
+            commit_id: "proposal-evidence-tampered".to_string(),
+            commit_type: CommitType::ProposalEvidenceAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            replay_run_evidence_payload: None,
+            proposal_evidence_payload: Some(evidence.encode_to_vec()),
+            proposal_activation_payload: None,
+            trace_run_evidence_payload: None,
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: None,
+            microcircuit_config_payload: None,
+            asset_manifest_payload: None,
+            asset_bundle_payload: None,
+        };
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+    }
+
+    #[test]
+    fn proposal_evidence_append_rejects_unsorted_reason_codes() {
+        let prev = [42u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let mut evidence = ProposalEvidence {
+            proposal_id: "proposal-1".to_string(),
+            proposal_digest: vec![0u8; 32],
+            kind: ProposalKind::MappingUpdate as i32,
+            base_evidence_digest: [8u8; 32].to_vec(),
+            payload_digest: [9u8; 32].to_vec(),
+            created_at_ms: 10,
+            score: 0,
+            verdict: 1,
+            reason_codes: vec!["RC.GV.OK".to_string(), "RC.GV.AA".to_string()],
+        };
+        let mut canonical = evidence.clone();
+        canonical.proposal_digest = vec![0u8; 32];
+        let payload = canonical.encode_to_vec();
+        let mut input =
+            Vec::with_capacity(proposals::PROPOSAL_EVIDENCE_DOMAIN.len() + payload.len());
+        input.extend_from_slice(proposals::PROPOSAL_EVIDENCE_DOMAIN.as_bytes());
+        input.extend_from_slice(&payload);
+        evidence.proposal_digest = blake3::hash(&input).as_bytes().to_vec();
+
+        let req = PvgsCommitRequest {
+            commit_id: "proposal-evidence-unsorted".to_string(),
+            commit_type: CommitType::ProposalEvidenceAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Read,
+            required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            replay_run_evidence_payload: None,
+            proposal_evidence_payload: Some(evidence.encode_to_vec()),
+            proposal_activation_payload: None,
+            trace_run_evidence_payload: None,
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: None,
+            microcircuit_config_payload: None,
+            asset_manifest_payload: None,
+            asset_bundle_payload: None,
+        };
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
     }
 
     #[test]
