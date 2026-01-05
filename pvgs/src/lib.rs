@@ -20,6 +20,7 @@ use milestones::{
     MicroMilestoneStore,
 };
 use pev::{pev_digest as extract_pev_digest, PevStore, PolicyEcologyVector};
+use proposal_activations::{ActivationStatus, ProposalActivationEvidence, ProposalActivationStore};
 use proposals::{ProposalEvidence, ProposalStore};
 use prost::Message;
 use receipts::{issue_proof_receipt, issue_receipt, ReceiptInput};
@@ -91,6 +92,7 @@ pub enum CommitType {
     AssetManifestAppend,
     AssetBundleAppend,
     ProposalEvidenceAppend,
+    ProposalActivationAppend,
 }
 
 /// Required checks requested by the caller.
@@ -321,6 +323,7 @@ pub struct PvgsCommitRequest {
     pub replay_run_evidence_payload: Option<Vec<u8>>,
     pub trace_run_evidence_payload: Option<Vec<u8>>,
     pub proposal_evidence_payload: Option<Vec<u8>>,
+    pub proposal_activation_payload: Option<Vec<u8>>,
     pub macro_milestone: Option<MacroMilestone>,
     pub meso_milestone: Option<MesoMilestone>,
     pub dlp_decision_payload: Option<Vec<u8>>,
@@ -649,6 +652,7 @@ pub struct PvgsStore {
     pub replay_run_store: ReplayRunStore,
     pub trace_run_store: TraceRunStore,
     pub proposal_store: ProposalStore,
+    pub proposal_activation_store: ProposalActivationStore,
     pub committed_payload_digests: HashSet<[u8; 32]>,
     pub recovery_store: RecoveryStore,
     pub unlock_permits: HashMap<String, UnlockPermit>,
@@ -762,6 +766,7 @@ impl<'a> PvgsPlanner<'a> {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -883,6 +888,7 @@ impl PvgsStore {
             replay_run_store: ReplayRunStore::default(),
             trace_run_store: TraceRunStore::default(),
             proposal_store: ProposalStore::default(),
+            proposal_activation_store: ProposalActivationStore::default(),
             committed_payload_digests: HashSet::new(),
             recovery_store: RecoveryStore::default(),
             unlock_permits: HashMap::new(),
@@ -1743,6 +1749,7 @@ impl PvgsStore {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: Some(meso),
             dlp_decision_payload: None,
@@ -1807,6 +1814,7 @@ impl PvgsStore {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: Some(proposal.clone()),
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -1888,6 +1896,7 @@ impl PvgsStore {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: Some(macro_milestone),
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -2388,6 +2397,7 @@ fn event_type_for_commit(
         CommitType::ReplayRunEvidenceAppend => SepEventType::EvReplay,
         CommitType::TraceRunEvidenceAppend => SepEventType::EvReplay,
         CommitType::ProposalEvidenceAppend => SepEventType::EvAgentStep,
+        CommitType::ProposalActivationAppend => SepEventType::EvAgentStep,
         CommitType::RecoveryCaseCreate => SepEventType::EvRecoveryGov,
         CommitType::RecoveryCaseAdvance => SepEventType::EvRecoveryGov,
         CommitType::RecoveryApproval => SepEventType::EvRecoveryGov,
@@ -2656,6 +2666,10 @@ pub fn verify_and_commit(
 
     if req.commit_type == CommitType::ProposalEvidenceAppend {
         return verify_proposal_evidence_append(req, store, keystore);
+    }
+
+    if req.commit_type == CommitType::ProposalActivationAppend {
+        return verify_proposal_activation_append(req, store, keystore);
     }
 
     if req.commit_type == CommitType::RecoveryCaseCreate {
@@ -5683,6 +5697,192 @@ fn verify_proposal_evidence_append(
     (receipt, Some(proof_receipt))
 }
 
+fn verify_proposal_activation_append(
+    mut req: PvgsCommitRequest,
+    store: &mut PvgsStore,
+    keystore: &KeyStore,
+) -> (PVGSReceipt, Option<ProofReceipt>) {
+    let payload = match req.proposal_activation_payload.take() {
+        Some(payload) => payload,
+        None => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let evidence = match ProposalActivationEvidence::decode(payload.as_slice()) {
+        Ok(evidence) => evidence,
+        Err(_) => {
+            let receipt_input = to_receipt_input(&req);
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: None,
+                event_reason_codes: None,
+            });
+        }
+    };
+
+    let activation_digest = evidence.activation_digest;
+    if req.payload_digests.is_empty() {
+        req.payload_digests = vec![activation_digest];
+    }
+
+    let receipt_input = to_receipt_input(&req);
+    let mut reject_reason_codes = Vec::new();
+
+    if req.payload_digests.len() != 1 || req.payload_digests[0] != activation_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if evidence.validate().is_err() {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if req.epoch_id != keystore.current_epoch() {
+        reject_reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
+    }
+
+    if req.bindings.prev_record_digest != store.current_head_record_digest {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_EXEC_DISPATCH_BLOCKED.to_string());
+    }
+
+    if !req
+        .required_checks
+        .iter()
+        .any(|check| matches!(check, RequiredCheck::SchemaOk))
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if !store
+        .known_charter_versions
+        .contains(&req.bindings.charter_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_CHARTER_SCOPE.to_string());
+    }
+
+    if !store
+        .known_policy_versions
+        .contains(&req.bindings.policy_version_digest)
+    {
+        reject_reason_codes.push(protocol::ReasonCodes::PB_DENY_INTEGRITY_REQUIRED.to_string());
+    }
+
+    if !reject_reason_codes.is_empty() {
+        return finalize_receipt(FinalizeReceiptArgs {
+            req: &req,
+            receipt_input: &receipt_input,
+            status: ReceiptStatus::Rejected,
+            reject_reason_codes,
+            store,
+            keystore,
+            frame_kind: None,
+            event_object_digest: Some(activation_digest),
+            event_reason_codes: None,
+        });
+    }
+
+    let verified_fields_digest =
+        compute_verified_fields_digest(&req.bindings, req.required_receipt_kind);
+    let mut proof_receipt = issue_proof_receipt(
+        store.ruleset_state.ruleset_digest,
+        verified_fields_digest,
+        [0u8; 32],
+        keystore,
+    );
+    let receipt = issue_receipt(
+        &receipt_input,
+        ReceiptStatus::Accepted,
+        Vec::new(),
+        keystore,
+    );
+    proof_receipt.receipt_digest = receipt.receipt_digest.clone();
+
+    store.add_receipt_edges(&receipt);
+    match store.proposal_activation_store.insert(evidence.clone()) {
+        Ok(inserted) => {
+            store.committed_payload_digests.insert(activation_digest);
+            if inserted {
+                store.add_graph_edge(
+                    activation_digest,
+                    EdgeType::References,
+                    evidence.proposal_digest,
+                    None,
+                );
+                store.add_graph_edge(
+                    activation_digest,
+                    EdgeType::References,
+                    evidence.approval_digest,
+                    None,
+                );
+                if let Some(digest) = evidence.active_mapping_digest {
+                    store.add_graph_edge(activation_digest, EdgeType::References, digest, None);
+                }
+                if let Some(digest) = evidence.active_sae_pack_digest {
+                    store.add_graph_edge(activation_digest, EdgeType::References, digest, None);
+                }
+                if let Some(digest) = evidence.active_liquid_params_digest {
+                    store.add_graph_edge(activation_digest, EdgeType::References, digest, None);
+                }
+                if let Some(digest) = evidence.active_limits_digest {
+                    store.add_graph_edge(activation_digest, EdgeType::References, digest, None);
+                }
+                let reason_code = match evidence.status {
+                    ActivationStatus::Applied => {
+                        protocol::ReasonCodes::GV_PROPOSAL_ACTIVATED.to_string()
+                    }
+                    ActivationStatus::Rejected => {
+                        protocol::ReasonCodes::GV_PROPOSAL_REJECTED.to_string()
+                    }
+                };
+                let _ = store.record_sep_event(
+                    &req.commit_id,
+                    SepEventType::EvAgentStep,
+                    activation_digest,
+                    vec![reason_code],
+                );
+            }
+        }
+        Err(_) => {
+            return finalize_receipt(FinalizeReceiptArgs {
+                req: &req,
+                receipt_input: &receipt_input,
+                status: ReceiptStatus::Rejected,
+                reject_reason_codes: vec![
+                    protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string()
+                ],
+                store,
+                keystore,
+                frame_kind: None,
+                event_object_digest: Some(activation_digest),
+                event_reason_codes: None,
+            });
+        }
+    }
+
+    (receipt, Some(proof_receipt))
+}
+
 fn verify_tool_event_append(
     mut req: PvgsCommitRequest,
     store: &mut PvgsStore,
@@ -6841,6 +7041,7 @@ impl From<CommitType> for protocol::CommitType {
             CommitType::AssetManifestAppend => protocol::CommitType::AssetManifestAppend,
             CommitType::AssetBundleAppend => protocol::CommitType::AssetBundleAppend,
             CommitType::ProposalEvidenceAppend => protocol::CommitType::ProposalEvidenceAppend,
+            CommitType::ProposalActivationAppend => protocol::CommitType::ProposalActivationAppend,
         }
     }
 }
@@ -6945,6 +7146,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -7006,6 +7208,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -7061,6 +7264,7 @@ mod tests {
                 replay_run_evidence_payload: None,
                 trace_run_evidence_payload: None,
                 proposal_evidence_payload: None,
+                proposal_activation_payload: None,
                 macro_milestone: None,
                 meso_milestone: None,
                 dlp_decision_payload: None,
@@ -7225,6 +7429,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: Some(macro_milestone.clone()),
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -7317,6 +7522,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -7450,6 +7656,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -7497,6 +7704,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -8169,6 +8377,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -8241,6 +8450,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: Some(macro_milestone),
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -8548,6 +8758,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9038,6 +9249,7 @@ mod tests {
             replay_run_evidence_payload: Some(evidence.encode_to_vec()),
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9085,6 +9297,7 @@ mod tests {
             ),
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9157,6 +9370,7 @@ mod tests {
             experience_record_payload: None,
             replay_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             trace_run_evidence_payload: Some(evidence.encode().expect("encode trace run")),
             macro_milestone: None,
             meso_milestone: None,
@@ -9201,6 +9415,7 @@ mod tests {
             experience_record_payload: None,
             replay_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             trace_run_evidence_payload: Some(
                 trace_run_evidence(
                     run_digest,
@@ -9681,6 +9896,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9756,6 +9972,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9807,6 +10024,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -9874,6 +10092,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: Some(decision.encode_to_vec()),
@@ -9941,6 +10160,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -10033,6 +10253,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -10119,6 +10340,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -10204,6 +10426,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,

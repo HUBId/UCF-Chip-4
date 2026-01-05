@@ -22,6 +22,7 @@ replay_plan = { path = "../replay_plan" }
 replay_runs = { path = "../crates/replay_runs" }
 trace_runs = { path = "../crates/trace_runs" }
 proposals = { path = "../crates/proposals" }
+proposal_activations = { path = "../crates/proposal_activations" }
 hex = "0.4"
 prost = { workspace = true }
 recovery = { path = "../crates/recovery" }
@@ -42,4 +43,5 @@ serde = [
     "replay_runs/serde",
     "trace_runs/serde",
     "proposals/serde",
+    "proposal_activations/serde",
 ]
