@@ -245,7 +245,7 @@ fn proposal_evidence(
         payload_digest: payload_digest.to_vec(),
         created_at_ms,
         score: 0,
-        verdict: verdict as i32,
+        verdict,
         reason_codes: vec![
             "RC.GV.OK".to_string(),
             ReasonCodes::GV_PROPOSAL_APPENDED.to_string(),
