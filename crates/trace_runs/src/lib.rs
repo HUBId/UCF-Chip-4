@@ -6,31 +6,33 @@ use thiserror::Error;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-pub const TRACE_RUN_EVIDENCE_DOMAIN: &str = "UCF:TRACE:RUN_EVIDENCE";
-const MAX_TRACE_ID_LEN: usize = 128;
-const MAX_REASON_CODES: usize = 16;
+pub const TRACE_RUN_EVIDENCE_DOMAIN: &str = "UCF:LNSS:TRACE_RUN";
+const MAX_TRACE_ID_LEN: usize = 64;
+const MAX_REASON_CODES: usize = 32;
 const MAX_REASON_CODE_LEN: usize = 64;
-const MAX_STEPS: u32 = 1_000_000;
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TraceStatus {
-    Pass,
-    Fail,
+pub enum TraceVerdict {
+    Promising = 1,
+    Neutral = 2,
+    Risky = 3,
 }
 
-impl TraceStatus {
+impl TraceVerdict {
     fn to_u8(self) -> u8 {
         match self {
-            TraceStatus::Pass => 1,
-            TraceStatus::Fail => 2,
+            TraceVerdict::Promising => 1,
+            TraceVerdict::Neutral => 2,
+            TraceVerdict::Risky => 3,
         }
     }
 
     fn from_u8(value: u8) -> Option<Self> {
         match value {
-            1 => Some(TraceStatus::Pass),
-            2 => Some(TraceStatus::Fail),
+            1 => Some(TraceVerdict::Promising),
+            2 => Some(TraceVerdict::Neutral),
+            3 => Some(TraceVerdict::Risky),
             _ => None,
         }
     }
@@ -40,12 +42,16 @@ impl TraceStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceRunEvidence {
     pub trace_id: String,
-    pub trace_run_digest: [u8; 32],
-    pub asset_manifest_digest: [u8; 32],
-    pub circuit_config_digest: [u8; 32],
-    pub steps: u32,
+    pub trace_digest: [u8; 32],
+    pub active_cfg_digest: [u8; 32],
+    pub shadow_cfg_digest: [u8; 32],
+    pub active_feedback_digest: [u8; 32],
+    pub shadow_feedback_digest: [u8; 32],
+    pub score_active: i32,
+    pub score_shadow: i32,
+    pub delta: i32,
+    pub verdict: TraceVerdict,
     pub created_at_ms: u64,
-    pub status: TraceStatus,
     pub reason_codes: Vec<String>,
 }
 
@@ -56,14 +62,16 @@ pub enum TraceRunEvidenceError {
     MissingTraceId,
     #[error("trace id too long")]
     TraceIdTooLong,
-    #[error("invalid steps")]
-    InvalidSteps,
+    #[error("invalid trace digest")]
+    InvalidTraceDigest,
     #[error("too many reason codes")]
     TooManyReasonCodes,
     #[error("reason code too long")]
     ReasonCodeTooLong,
-    #[error("invalid status")]
-    InvalidStatus,
+    #[error("reason codes not sorted")]
+    ReasonCodesNotSorted,
+    #[error("invalid verdict")]
+    InvalidVerdict,
     #[error("payload truncated")]
     PayloadTruncated,
     #[error("payload trailing bytes")]
@@ -71,15 +79,24 @@ pub enum TraceRunEvidenceError {
 }
 
 impl TraceRunEvidence {
+    pub fn normalize(&mut self) {
+        self.reason_codes.sort();
+        self.reason_codes.dedup();
+    }
+
     pub fn validate(&self) -> Result<(), TraceRunEvidenceError> {
+        self.validate_internal(true)
+    }
+
+    fn validate_internal(&self, check_trace_digest: bool) -> Result<(), TraceRunEvidenceError> {
         if self.trace_id.is_empty() {
             return Err(TraceRunEvidenceError::MissingTraceId);
         }
         if self.trace_id.len() > MAX_TRACE_ID_LEN {
             return Err(TraceRunEvidenceError::TraceIdTooLong);
         }
-        if self.steps == 0 || self.steps > MAX_STEPS {
-            return Err(TraceRunEvidenceError::InvalidSteps);
+        if check_trace_digest && self.trace_digest == [0u8; 32] {
+            return Err(TraceRunEvidenceError::InvalidTraceDigest);
         }
         if self.reason_codes.len() > MAX_REASON_CODES {
             return Err(TraceRunEvidenceError::TooManyReasonCodes);
@@ -91,19 +108,30 @@ impl TraceRunEvidence {
         {
             return Err(TraceRunEvidenceError::ReasonCodeTooLong);
         }
+        if !is_sorted_unique(&self.reason_codes) {
+            return Err(TraceRunEvidenceError::ReasonCodesNotSorted);
+        }
         Ok(())
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, TraceRunEvidenceError> {
-        self.validate()?;
+        self.encode_internal(true)
+    }
+
+    fn encode_internal(&self, check_trace_digest: bool) -> Result<Vec<u8>, TraceRunEvidenceError> {
+        self.validate_internal(check_trace_digest)?;
         let mut out = Vec::new();
         write_len_prefixed_string(&mut out, &self.trace_id)?;
-        out.extend_from_slice(&self.trace_run_digest);
-        out.extend_from_slice(&self.asset_manifest_digest);
-        out.extend_from_slice(&self.circuit_config_digest);
-        out.extend_from_slice(&self.steps.to_be_bytes());
+        out.extend_from_slice(&self.trace_digest);
+        out.extend_from_slice(&self.active_cfg_digest);
+        out.extend_from_slice(&self.shadow_cfg_digest);
+        out.extend_from_slice(&self.active_feedback_digest);
+        out.extend_from_slice(&self.shadow_feedback_digest);
+        out.extend_from_slice(&self.score_active.to_be_bytes());
+        out.extend_from_slice(&self.score_shadow.to_be_bytes());
+        out.extend_from_slice(&self.delta.to_be_bytes());
+        out.push(self.verdict.to_u8());
         out.extend_from_slice(&self.created_at_ms.to_be_bytes());
-        out.push(self.status.to_u8());
         write_u16(&mut out, self.reason_codes.len() as u16);
         for reason in &self.reason_codes {
             write_len_prefixed_string(&mut out, reason)?;
@@ -114,13 +142,18 @@ impl TraceRunEvidence {
     pub fn decode(bytes: &[u8]) -> Result<Self, TraceRunEvidenceError> {
         let mut cursor = 0usize;
         let trace_id = read_len_prefixed_string(bytes, &mut cursor)?;
-        let trace_run_digest = read_digest(bytes, &mut cursor)?;
-        let asset_manifest_digest = read_digest(bytes, &mut cursor)?;
-        let circuit_config_digest = read_digest(bytes, &mut cursor)?;
-        let steps = read_u32(bytes, &mut cursor)?;
+        let trace_digest = read_digest(bytes, &mut cursor)?;
+        let active_cfg_digest = read_digest(bytes, &mut cursor)?;
+        let shadow_cfg_digest = read_digest(bytes, &mut cursor)?;
+        let active_feedback_digest = read_digest(bytes, &mut cursor)?;
+        let shadow_feedback_digest = read_digest(bytes, &mut cursor)?;
+        let score_active = read_i32(bytes, &mut cursor)?;
+        let score_shadow = read_i32(bytes, &mut cursor)?;
+        let delta = read_i32(bytes, &mut cursor)?;
+        let verdict = read_u8(bytes, &mut cursor)?;
+        let verdict =
+            TraceVerdict::from_u8(verdict).ok_or(TraceRunEvidenceError::InvalidVerdict)?;
         let created_at_ms = read_u64(bytes, &mut cursor)?;
-        let status = read_u8(bytes, &mut cursor)?;
-        let status = TraceStatus::from_u8(status).ok_or(TraceRunEvidenceError::InvalidStatus)?;
         let reason_count = read_u16(bytes, &mut cursor)? as usize;
         if reason_count > MAX_REASON_CODES {
             return Err(TraceRunEvidenceError::TooManyReasonCodes);
@@ -134,12 +167,16 @@ impl TraceRunEvidence {
         }
         let evidence = Self {
             trace_id,
-            trace_run_digest,
-            asset_manifest_digest,
-            circuit_config_digest,
-            steps,
+            trace_digest,
+            active_cfg_digest,
+            shadow_cfg_digest,
+            active_feedback_digest,
+            shadow_feedback_digest,
+            score_active,
+            score_shadow,
+            delta,
+            verdict,
             created_at_ms,
-            status,
             reason_codes,
         };
         evidence.validate()?;
@@ -147,7 +184,10 @@ impl TraceRunEvidence {
     }
 
     pub fn compute_digest(&self) -> Result<[u8; 32], TraceRunEvidenceError> {
-        let mut payload = self.encode()?;
+        let mut canonical = self.clone();
+        canonical.trace_digest = [0u8; 32];
+        canonical.normalize();
+        let mut payload = canonical.encode_internal(false)?;
         let mut input = Vec::with_capacity(TRACE_RUN_EVIDENCE_DOMAIN.len() + payload.len());
         input.extend_from_slice(TRACE_RUN_EVIDENCE_DOMAIN.as_bytes());
         input.append(&mut payload);
@@ -166,24 +206,24 @@ pub enum TraceRunStoreError {
 #[derive(Debug, Clone, Default)]
 pub struct TraceRunStore {
     pub runs: Vec<TraceRunEvidence>,
-    pub by_run_digest: HashMap<[u8; 32], usize>,
+    pub by_trace_digest: HashMap<[u8; 32], usize>,
 }
 
 impl TraceRunStore {
     pub fn insert(&mut self, evidence: TraceRunEvidence) -> Result<bool, TraceRunStoreError> {
         evidence.validate()?;
-        if self.by_run_digest.contains_key(&evidence.trace_run_digest) {
+        if self.by_trace_digest.contains_key(&evidence.trace_digest) {
             return Ok(false);
         }
-        self.by_run_digest
-            .insert(evidence.trace_run_digest, self.runs.len());
+        self.by_trace_digest
+            .insert(evidence.trace_digest, self.runs.len());
         self.runs.push(evidence);
         Ok(true)
     }
 
-    pub fn get(&self, run_digest: [u8; 32]) -> Option<&TraceRunEvidence> {
-        self.by_run_digest
-            .get(&run_digest)
+    pub fn get(&self, trace_digest: [u8; 32]) -> Option<&TraceRunEvidence> {
+        self.by_trace_digest
+            .get(&trace_digest)
             .and_then(|idx| self.runs.get(*idx))
     }
 
@@ -210,14 +250,14 @@ fn read_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, TraceRunEvidenceErr
     Ok(u16::from_be_bytes(buf))
 }
 
-fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, TraceRunEvidenceError> {
+fn read_i32(bytes: &[u8], cursor: &mut usize) -> Result<i32, TraceRunEvidenceError> {
     if *cursor + 4 > bytes.len() {
         return Err(TraceRunEvidenceError::PayloadTruncated);
     }
     let mut buf = [0u8; 4];
     buf.copy_from_slice(&bytes[*cursor..*cursor + 4]);
     *cursor += 4;
-    Ok(u32::from_be_bytes(buf))
+    Ok(i32::from_be_bytes(buf))
 }
 
 fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, TraceRunEvidenceError> {
@@ -269,22 +309,32 @@ fn read_len_prefixed_string(
     Ok(value)
 }
 
+fn is_sorted_unique(values: &[String]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn round_trip_trace_run_evidence() {
-        let evidence = TraceRunEvidence {
+        let mut evidence = TraceRunEvidence {
             trace_id: "trace-1".to_string(),
-            trace_run_digest: [1u8; 32],
-            asset_manifest_digest: [2u8; 32],
-            circuit_config_digest: [3u8; 32],
-            steps: 12,
+            trace_digest: [0u8; 32],
+            active_cfg_digest: [1u8; 32],
+            shadow_cfg_digest: [2u8; 32],
+            active_feedback_digest: [3u8; 32],
+            shadow_feedback_digest: [4u8; 32],
+            score_active: 10,
+            score_shadow: 12,
+            delta: 2,
+            verdict: TraceVerdict::Promising,
             created_at_ms: 999,
-            status: TraceStatus::Pass,
-            reason_codes: vec!["RC.GV.OK".to_string()],
+            reason_codes: vec!["RC.GV.OK".to_string(), "RC.GV.OK.2".to_string()],
         };
+        let digest = evidence.compute_digest().expect("digest");
+        evidence.trace_digest = digest;
         let encoded = evidence.encode().expect("encode");
         let decoded = TraceRunEvidence::decode(&encoded).expect("decode");
         assert_eq!(decoded, evidence);

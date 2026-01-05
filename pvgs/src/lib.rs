@@ -44,7 +44,7 @@ use tool_events::{
     compute_event_digest as compute_tool_event_digest, ToolEventError, ToolEventStore,
 };
 use tool_registry_state::{ToolRegistryError, ToolRegistryState};
-use trace_runs::{TraceRunEvidence, TraceRunStore, TraceStatus};
+use trace_runs::{TraceRunEvidence, TraceRunStore, TraceVerdict};
 use ucf_protocol::ucf::v1::{
     self as protocol, AssetBundle, AssetChunk, AssetKind, AssetManifest, ChannelParamsSetPayload,
     CharacterBaselineVector, ConnectivityGraphPayload, ConsistencyFeedback, Digest32, DlpDecision,
@@ -5411,7 +5411,7 @@ fn verify_trace_run_evidence_append(
         }
     };
 
-    let run_digest = evidence.trace_run_digest;
+    let run_digest = evidence.trace_digest;
     if req.payload_digests.is_empty() {
         req.payload_digests = vec![run_digest];
     }
@@ -5424,6 +5424,10 @@ fn verify_trace_run_evidence_append(
     }
 
     if evidence.validate().is_err() {
+        reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
+    }
+
+    if evidence.compute_digest().ok() != Some(run_digest) {
         reject_reason_codes.push(protocol::ReasonCodes::GE_VALIDATION_SCHEMA_INVALID.to_string());
     }
 
@@ -5508,23 +5512,41 @@ fn verify_trace_run_evidence_append(
     store.add_graph_edge(
         run_digest,
         EdgeType::References,
-        evidence.asset_manifest_digest,
+        evidence.active_cfg_digest,
         None,
     );
     store.add_graph_edge(
         run_digest,
         EdgeType::References,
-        evidence.circuit_config_digest,
+        evidence.shadow_cfg_digest,
+        None,
+    );
+    store.add_graph_edge(
+        run_digest,
+        EdgeType::References,
+        evidence.active_feedback_digest,
+        None,
+    );
+    store.add_graph_edge(
+        run_digest,
+        EdgeType::References,
+        evidence.shadow_feedback_digest,
         None,
     );
 
-    let mut reason_codes = vec![protocol::ReasonCodes::GV_TRACE_RUN_APPENDED.to_string()];
-    let event_type = if matches!(evidence.status, TraceStatus::Fail) {
-        reason_codes.push(protocol::ReasonCodes::RE_INTEGRITY_DEGRADED.to_string());
-        SepEventType::EvRecovery
-    } else {
-        SepEventType::EvReplay
-    };
+    let mut reason_codes = vec![protocol::ReasonCodes::GV_TRACE_APPENDED.to_string()];
+    match evidence.verdict {
+        TraceVerdict::Promising => {
+            reason_codes.push(protocol::ReasonCodes::GV_TRACE_PROMISING.to_string());
+        }
+        TraceVerdict::Neutral => {
+            reason_codes.push(protocol::ReasonCodes::GV_TRACE_NEUTRAL.to_string());
+        }
+        TraceVerdict::Risky => {
+            reason_codes.push(protocol::ReasonCodes::GV_TRACE_RISKY.to_string());
+        }
+    }
+    let event_type = SepEventType::EvReplay;
 
     let _ = store.record_sep_event(&req.commit_id, event_type, run_digest, reason_codes);
 
@@ -8710,23 +8732,34 @@ mod tests {
         }
     }
 
-    fn trace_run_evidence(
+    struct TraceRunEvidenceInput {
         run_digest: [u8; 32],
-        asset_manifest_digest: [u8; 32],
-        circuit_config_digest: [u8; 32],
+        active_cfg_digest: [u8; 32],
+        shadow_cfg_digest: [u8; 32],
+        active_feedback_digest: [u8; 32],
+        shadow_feedback_digest: [u8; 32],
         created_at_ms: u64,
-        status: TraceStatus,
-    ) -> TraceRunEvidence {
-        TraceRunEvidence {
+        verdict: TraceVerdict,
+        delta: i32,
+    }
+
+    fn trace_run_evidence(input: TraceRunEvidenceInput) -> TraceRunEvidence {
+        let mut evidence = TraceRunEvidence {
             trace_id: "trace-1".to_string(),
-            trace_run_digest: run_digest,
-            asset_manifest_digest,
-            circuit_config_digest,
-            steps: 42,
-            created_at_ms,
-            status,
+            trace_digest: input.run_digest,
+            active_cfg_digest: input.active_cfg_digest,
+            shadow_cfg_digest: input.shadow_cfg_digest,
+            active_feedback_digest: input.active_feedback_digest,
+            shadow_feedback_digest: input.shadow_feedback_digest,
+            score_active: 10,
+            score_shadow: 12,
+            delta: input.delta,
+            verdict: input.verdict,
+            created_at_ms: input.created_at_ms,
             reason_codes: vec!["RC.GV.OK".to_string()],
-        }
+        };
+        evidence.trace_digest = evidence.compute_digest().expect("digest");
+        evidence
     }
 
     fn make_experience_request_with_id(
@@ -9337,16 +9370,21 @@ mod tests {
         let keystore = KeyStore::new_dev_keystore(1);
         let vrf_engine = VrfEngine::new_dev(1);
 
-        let run_digest = [11u8; 32];
-        let asset_manifest_digest = [12u8; 32];
-        let circuit_config_digest = [13u8; 32];
-        let evidence = trace_run_evidence(
-            run_digest,
-            asset_manifest_digest,
-            circuit_config_digest,
-            10,
-            TraceStatus::Pass,
-        );
+        let active_cfg_digest = [12u8; 32];
+        let shadow_cfg_digest = [13u8; 32];
+        let active_feedback_digest = [14u8; 32];
+        let shadow_feedback_digest = [15u8; 32];
+        let evidence = trace_run_evidence(TraceRunEvidenceInput {
+            run_digest: [11u8; 32],
+            active_cfg_digest,
+            shadow_cfg_digest,
+            active_feedback_digest,
+            shadow_feedback_digest,
+            created_at_ms: 10,
+            verdict: TraceVerdict::Promising,
+            delta: 2,
+        });
+        let run_digest = evidence.trace_digest;
 
         let req = PvgsCommitRequest {
             commit_id: "trace-run-evidence-1".to_string(),
@@ -9417,13 +9455,16 @@ mod tests {
             proposal_evidence_payload: None,
             proposal_activation_payload: None,
             trace_run_evidence_payload: Some(
-                trace_run_evidence(
-                    run_digest,
-                    asset_manifest_digest,
-                    circuit_config_digest,
-                    11,
-                    TraceStatus::Pass,
-                )
+                trace_run_evidence(TraceRunEvidenceInput {
+                    run_digest: [22u8; 32],
+                    active_cfg_digest,
+                    shadow_cfg_digest,
+                    active_feedback_digest,
+                    shadow_feedback_digest,
+                    created_at_ms: 10,
+                    verdict: TraceVerdict::Promising,
+                    delta: 2,
+                })
                 .encode()
                 .expect("encode trace run"),
             ),
@@ -9450,13 +9491,83 @@ mod tests {
             event.object_digest == run_digest
                 && event
                     .reason_codes
-                    .contains(&ReasonCodes::GV_TRACE_RUN_APPENDED.to_string())
+                    .contains(&ReasonCodes::GV_TRACE_APPENDED.to_string())
         });
         assert!(logged);
 
         let neighbors = store.causal_graph.neighbors(run_digest);
-        assert!(neighbors.contains(&(EdgeType::References, asset_manifest_digest)));
-        assert!(neighbors.contains(&(EdgeType::References, circuit_config_digest)));
+        assert!(neighbors.contains(&(EdgeType::References, active_cfg_digest)));
+        assert!(neighbors.contains(&(EdgeType::References, shadow_cfg_digest)));
+        assert!(neighbors.contains(&(EdgeType::References, active_feedback_digest)));
+        assert!(neighbors.contains(&(EdgeType::References, shadow_feedback_digest)));
+    }
+
+    #[test]
+    fn trace_run_evidence_append_rejects_tampered_digest() {
+        let prev = [31u8; 32];
+        let mut store = base_store(prev);
+        let keystore = KeyStore::new_dev_keystore(1);
+        let vrf_engine = VrfEngine::new_dev(1);
+
+        let active_cfg_digest = [12u8; 32];
+        let shadow_cfg_digest = [13u8; 32];
+        let active_feedback_digest = [14u8; 32];
+        let shadow_feedback_digest = [15u8; 32];
+        let mut evidence = trace_run_evidence(TraceRunEvidenceInput {
+            run_digest: [11u8; 32],
+            active_cfg_digest,
+            shadow_cfg_digest,
+            active_feedback_digest,
+            shadow_feedback_digest,
+            created_at_ms: 10,
+            verdict: TraceVerdict::Promising,
+            delta: 2,
+        });
+        let run_digest = evidence.trace_digest;
+        evidence.delta = evidence.delta.saturating_add(5);
+
+        let req = PvgsCommitRequest {
+            commit_id: "trace-run-evidence-tampered".to_string(),
+            commit_type: CommitType::TraceRunEvidenceAppend,
+            bindings: CommitBindings {
+                action_digest: None,
+                decision_digest: None,
+                grant_id: None,
+                charter_version_digest: "charter".to_string(),
+                policy_version_digest: "policy".to_string(),
+                prev_record_digest: store.current_head_record_digest,
+                profile_digest: None,
+                tool_profile_digest: None,
+                pev_digest: None,
+            },
+            required_receipt_kind: RequiredReceiptKind::Write,
+            required_checks: vec![RequiredCheck::SchemaOk, RequiredCheck::BindingOk],
+            payload_digests: Vec::new(),
+            epoch_id: keystore.current_epoch(),
+            key_epoch: None,
+            experience_record_payload: None,
+            replay_run_evidence_payload: None,
+            proposal_evidence_payload: None,
+            proposal_activation_payload: None,
+            trace_run_evidence_payload: Some(evidence.encode().expect("encode trace run")),
+            macro_milestone: None,
+            meso_milestone: None,
+            dlp_decision_payload: None,
+            tool_registry_container: None,
+            pev: None,
+            consistency_feedback_payload: None,
+            macro_consistency_digest: None,
+            recovery_case: None,
+            unlock_permit: None,
+            tool_onboarding_event: None,
+            microcircuit_config_payload: None,
+            asset_manifest_payload: None,
+            asset_bundle_payload: None,
+        };
+
+        let (receipt, _) = verify_and_commit(req, &mut store, &keystore, &vrf_engine);
+        assert_eq!(receipt.status, ReceiptStatus::Rejected);
+        assert!(store.trace_run_store.get(run_digest).is_none());
     }
 
     #[test]
