@@ -1141,6 +1141,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "proposal_activations"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "proposals"
 version = "0.1.0"
 dependencies = [
@@ -1208,6 +1217,7 @@ dependencies = [
  "micro_evidence",
  "milestones",
  "pev",
+ "proposal_activations",
  "proposals",
  "prost",
  "receipts",
@@ -1247,6 +1257,7 @@ dependencies = [
  "micro_evidence",
  "milestones",
  "pev",
+ "proposal_activations",
  "proposals",
  "prost",
  "pvgs",

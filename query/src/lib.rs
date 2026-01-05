@@ -6,6 +6,7 @@ use cbv::{
 use dlp_store::DlpDecisionStore;
 use milestones::{MesoMilestone, MicroMilestone};
 use pev::{pev_digest, PolicyEcologyVector};
+use proposal_activations::{ActivationStatus, ProposalActivationEvidence};
 use proposals::{ProposalEvidence, ProposalKind};
 use prost::Message;
 use pvgs::{compute_experience_record_digest, CompletenessStatus, PvgsCommitRequest, PvgsStore};
@@ -230,8 +231,19 @@ pub struct ProposalsCard {
     pub latest_proposal_digest: Option<[u8; 32]>,
     pub latest_proposal_kind: Option<ProposalKind>,
     pub latest_proposal_verdict: Option<u8>,
+    pub latest_activation_status: Option<ActivationStatus>,
+    pub activation_counts_last_n: ActivationStatusCounts,
+    pub activation_rejects_present: bool,
+    pub risky_activations_present: bool,
     pub counts_last_n: ProposalVerdictCounts,
     pub risky_present: bool,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ActivationStatusCounts {
+    pub applied: u64,
+    pub rejected: u64,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -302,6 +314,7 @@ const MAX_PLASTICITY_SCORECARD_DIGESTS: usize = 128;
 const MAX_PLASTICITY_SCORECARD_LIST: usize = 5;
 const PLASTICITY_SCORECARD_WINDOW: usize = 1000;
 const PROPOSAL_SCORECARD_WINDOW: usize = 128;
+const PROPOSAL_ACTIVATION_SCORECARD_WINDOW: usize = 128;
 
 pub trait QueryInspector {
     fn fetch(&self, request: QueryRequest) -> Result<QueryResult, QueryError>;
@@ -943,10 +956,19 @@ fn trace_card_from_store(store: &PvgsStore) -> TraceCard {
 fn proposals_card_from_store(store: &PvgsStore) -> ProposalsCard {
     let latest = latest_proposal(store);
     let counts = proposal_counts_last_n(store, PROPOSAL_SCORECARD_WINDOW);
+    let activation_counts = activation_counts_last_n(store, PROPOSAL_ACTIVATION_SCORECARD_WINDOW);
+    let activation_rejects_present = activation_counts.rejected > 0;
+    let risky_activations =
+        risky_activation_count_last_n(store, PROPOSAL_ACTIVATION_SCORECARD_WINDOW);
+    let latest_activation = latest_proposal_activation(store);
     ProposalsCard {
         latest_proposal_digest: latest.as_ref().map(|proposal| proposal.proposal_digest),
         latest_proposal_kind: latest.as_ref().map(|proposal| proposal.kind),
         latest_proposal_verdict: latest.as_ref().map(|proposal| proposal.verdict),
+        latest_activation_status: latest_activation.map(|activation| activation.status),
+        activation_counts_last_n: activation_counts,
+        activation_rejects_present,
+        risky_activations_present: risky_activations > 0,
         risky_present: counts.risky > 0,
         counts_last_n: counts,
     }
@@ -1820,9 +1842,61 @@ pub fn list_proposals(store: &PvgsStore, limit: usize) -> Vec<ProposalEvidence> 
     proposals
 }
 
+/// List proposal activation evidence entries in deterministic order.
+pub fn list_proposal_activations(
+    store: &PvgsStore,
+    limit: usize,
+) -> Vec<ProposalActivationEvidence> {
+    let mut activations: Vec<ProposalActivationEvidence> = store
+        .proposal_activation_store
+        .by_digest
+        .values()
+        .cloned()
+        .collect();
+    activations.sort_by(|a, b| {
+        a.created_at_ms
+            .cmp(&b.created_at_ms)
+            .then_with(|| a.activation_digest.cmp(&b.activation_digest))
+    });
+    activations.truncate(limit);
+    activations
+}
+
 /// Fetch a proposal evidence record by digest.
 pub fn get_proposal(store: &PvgsStore, digest: [u8; 32]) -> Option<ProposalEvidence> {
     store.proposal_store.get(digest).cloned()
+}
+
+/// Fetch the latest proposal activation evidence record in deterministic order.
+pub fn latest_proposal_activation(store: &PvgsStore) -> Option<ProposalActivationEvidence> {
+    store
+        .proposal_activation_store
+        .by_digest
+        .values()
+        .cloned()
+        .max_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.activation_digest.cmp(&b.activation_digest))
+        })
+}
+
+/// Fetch the latest activation for a proposal digest.
+pub fn latest_activation_for_proposal(
+    store: &PvgsStore,
+    proposal_digest: [u8; 32],
+) -> Option<ProposalActivationEvidence> {
+    store
+        .proposal_activation_store
+        .by_digest
+        .values()
+        .filter(|activation| activation.proposal_digest == proposal_digest)
+        .cloned()
+        .max_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.activation_digest.cmp(&b.activation_digest))
+        })
 }
 
 /// Fetch the latest proposal evidence record in deterministic order.
@@ -1857,6 +1931,47 @@ pub fn proposal_counts_last_n(store: &PvgsStore, n: usize) -> ProposalVerdictCou
         }
     }
     counts
+}
+
+/// Count activation statuses within the last N activations.
+pub fn activation_counts_last_n(store: &PvgsStore, n: usize) -> ActivationStatusCounts {
+    if n == 0 {
+        return ActivationStatusCounts::default();
+    }
+    let mut activations = list_proposal_activations(store, usize::MAX);
+    if activations.len() > n {
+        activations = activations.split_off(activations.len() - n);
+    }
+    let mut counts = ActivationStatusCounts::default();
+    for activation in activations {
+        match activation.status {
+            ActivationStatus::Applied => counts.applied = counts.applied.saturating_add(1),
+            ActivationStatus::Rejected => counts.rejected = counts.rejected.saturating_add(1),
+        }
+    }
+    counts
+}
+
+fn risky_activation_count_last_n(store: &PvgsStore, n: usize) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let mut activations = list_proposal_activations(store, usize::MAX);
+    if activations.len() > n {
+        activations = activations.split_off(activations.len() - n);
+    }
+    let mut count = 0u64;
+    for activation in activations {
+        if !matches!(activation.status, ActivationStatus::Applied) {
+            continue;
+        }
+        if let Some(proposal) = store.proposal_store.get(activation.proposal_digest) {
+            if proposal.verdict == 2 {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    count
 }
 
 /// Return the latest trace run evidence by created time.
@@ -2689,6 +2804,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -2848,6 +2964,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -2909,6 +3026,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -2978,6 +3096,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -3598,6 +3717,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -4461,6 +4581,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
@@ -4551,6 +4672,7 @@ mod tests {
             replay_run_evidence_payload: None,
             trace_run_evidence_payload: None,
             proposal_evidence_payload: None,
+            proposal_activation_payload: None,
             macro_milestone: None,
             meso_milestone: None,
             dlp_decision_payload: None,
