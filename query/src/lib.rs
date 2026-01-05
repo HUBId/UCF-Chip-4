@@ -18,7 +18,7 @@ use sep::{EdgeType, NodeKey, SepEventInternal, SepEventType, SepLog};
 use std::collections::{BTreeSet, VecDeque};
 use std::convert::TryFrom;
 use thiserror::Error;
-use trace_runs::{TraceRunEvidence, TraceStatus};
+use trace_runs::{TraceRunEvidence, TraceVerdict};
 use ucf_protocol::ucf::v1::{
     AssetBundle, AssetChunk, AssetKind, AssetManifest, ChannelParamsSetPayload, CompressionMode,
     ConnectivityGraphPayload, ConsistencyFeedback, DlpDecisionForm, ExperienceRecord, MicroModule,
@@ -219,10 +219,9 @@ pub struct ReplayCard {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TraceCard {
     pub latest_trace_run_digest: Option<[u8; 32]>,
-    pub latest_trace_run_status: Option<TraceStatus>,
-    pub trace_run_pass_count_last_n: u64,
-    pub trace_run_fail_count_last_n: u64,
-    pub trace_run_failures_present: bool,
+    pub latest_trace_verdict: Option<TraceVerdict>,
+    pub latest_trace_delta: Option<i32>,
+    pub counts_last_n: TraceVerdictCounts,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -256,9 +255,18 @@ pub struct ProposalVerdictCounts {
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TraceVerdictCounts {
+    pub promising: u64,
+    pub neutral: u64,
+    pub risky: u64,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TraceRunSummaryCounts {
-    pub pass_count: u64,
-    pub fail_count: u64,
+    pub promising: u64,
+    pub neutral: u64,
+    pub risky: u64,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -309,6 +317,7 @@ const REPLAY_SCORECARD_WINDOW: usize = 1000;
 const REPLAY_RUN_EVIDENCE_WINDOW: usize = 1000;
 const TRACE_RUN_EVIDENCE_WINDOW: usize = 1000;
 const MAX_TRACE_RUNS: usize = 128;
+const TRACE_DELTA_BOUND: i32 = 1_000_000;
 const MAX_PLASTICITY_EVIDENCE: usize = 128;
 const MAX_PLASTICITY_SCORECARD_DIGESTS: usize = 128;
 const MAX_PLASTICITY_SCORECARD_LIST: usize = 5;
@@ -918,38 +927,39 @@ fn trace_card_from_store(store: &PvgsStore) -> TraceCard {
         .len()
         .saturating_sub(TRACE_RUN_EVIDENCE_WINDOW);
     let recent_runs = store.trace_run_store.runs.iter().skip(run_start);
-    let mut pass_count = 0u64;
-    let mut fail_count = 0u64;
+    let mut counts = TraceVerdictCounts::default();
     let mut latest_digest = None;
-    let mut latest_status = None;
+    let mut latest_verdict = None;
+    let mut latest_delta = None;
     let mut latest_created_at = 0u64;
 
     for run in recent_runs {
-        match run.status {
-            TraceStatus::Pass => pass_count = pass_count.saturating_add(1),
-            TraceStatus::Fail => fail_count = fail_count.saturating_add(1),
+        match run.verdict {
+            TraceVerdict::Promising => counts.promising = counts.promising.saturating_add(1),
+            TraceVerdict::Neutral => counts.neutral = counts.neutral.saturating_add(1),
+            TraceVerdict::Risky => counts.risky = counts.risky.saturating_add(1),
         }
 
         let is_newer = match latest_digest {
             Some(digest) => {
                 run.created_at_ms > latest_created_at
-                    || (run.created_at_ms == latest_created_at && run.trace_run_digest > digest)
+                    || (run.created_at_ms == latest_created_at && run.trace_digest > digest)
             }
             None => true,
         };
         if is_newer {
             latest_created_at = run.created_at_ms;
-            latest_digest = Some(run.trace_run_digest);
-            latest_status = Some(run.status);
+            latest_digest = Some(run.trace_digest);
+            latest_verdict = Some(run.verdict);
+            latest_delta = Some(run.delta.clamp(-TRACE_DELTA_BOUND, TRACE_DELTA_BOUND));
         }
     }
 
     TraceCard {
         latest_trace_run_digest: latest_digest,
-        latest_trace_run_status: latest_status,
-        trace_run_pass_count_last_n: pass_count,
-        trace_run_fail_count_last_n: fail_count,
-        trace_run_failures_present: fail_count > 0,
+        latest_trace_verdict: latest_verdict,
+        latest_trace_delta: latest_delta,
+        counts_last_n: counts,
     }
 }
 
@@ -1823,7 +1833,7 @@ pub fn list_trace_runs(store: &PvgsStore, limit: usize) -> Vec<TraceRunEvidence>
     runs.sort_by(|a, b| {
         a.created_at_ms
             .cmp(&b.created_at_ms)
-            .then_with(|| a.trace_run_digest.cmp(&b.trace_run_digest))
+            .then_with(|| a.trace_digest.cmp(&b.trace_digest))
     });
     runs.truncate(limit.min(MAX_TRACE_RUNS));
     runs
@@ -1983,22 +1993,44 @@ pub fn latest_trace_run(store: &PvgsStore) -> Option<TraceRunEvidence> {
         .max_by(|a, b| {
             a.created_at_ms
                 .cmp(&b.created_at_ms)
-                .then_with(|| a.trace_run_digest.cmp(&b.trace_run_digest))
+                .then_with(|| a.trace_digest.cmp(&b.trace_digest))
         })
         .cloned()
 }
 
-/// Summarize pass/fail counts for the last N trace runs.
+/// Summarize verdict counts for the last N trace runs.
 pub fn trace_run_summary_counts(store: &PvgsStore, last_n: usize) -> TraceRunSummaryCounts {
     let mut counts = TraceRunSummaryCounts::default();
     let start = store.trace_run_store.runs.len().saturating_sub(last_n);
     for run in store.trace_run_store.runs.iter().skip(start) {
-        match run.status {
-            TraceStatus::Pass => counts.pass_count = counts.pass_count.saturating_add(1),
-            TraceStatus::Fail => counts.fail_count = counts.fail_count.saturating_add(1),
+        match run.verdict {
+            TraceVerdict::Promising => counts.promising = counts.promising.saturating_add(1),
+            TraceVerdict::Neutral => counts.neutral = counts.neutral.saturating_add(1),
+            TraceVerdict::Risky => counts.risky = counts.risky.saturating_add(1),
         }
     }
     counts
+}
+
+/// Fetch the latest trace run evidence for a configuration pair.
+pub fn latest_trace_run_for_configs(
+    store: &PvgsStore,
+    active_cfg_digest: [u8; 32],
+    shadow_cfg_digest: [u8; 32],
+) -> Option<TraceRunEvidence> {
+    store
+        .trace_run_store
+        .runs
+        .iter()
+        .filter(|run| {
+            run.active_cfg_digest == active_cfg_digest && run.shadow_cfg_digest == shadow_cfg_digest
+        })
+        .max_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.trace_digest.cmp(&b.trace_digest))
+        })
+        .cloned()
 }
 
 /// Return the latest replay run digest by created time.
@@ -2585,7 +2617,7 @@ mod tests {
     use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
     use sep::{EdgeType, FrameEventKind, SepLog};
     use std::collections::HashSet;
-    use trace_runs::{TraceRunEvidence, TraceStatus};
+    use trace_runs::{TraceRunEvidence, TraceVerdict};
     use ucf_protocol::ucf::v1::{
         AssetBundle, AssetChunk, AssetDigest, AssetKind, AssetManifest, CompressionMode,
         ConnectivityEdge, ConnectivityGraphPayload, ConsistencyFeedback, Digest32, DlpDecision,
@@ -2656,18 +2688,24 @@ mod tests {
     fn trace_run_evidence(
         run_digest: [u8; 32],
         created_at_ms: u64,
-        status: TraceStatus,
+        verdict: TraceVerdict,
     ) -> TraceRunEvidence {
-        TraceRunEvidence {
+        let mut evidence = TraceRunEvidence {
             trace_id: "trace-1".to_string(),
-            trace_run_digest: run_digest,
-            asset_manifest_digest: [2u8; 32],
-            circuit_config_digest: [3u8; 32],
-            steps: 100,
+            trace_digest: run_digest,
+            active_cfg_digest: [2u8; 32],
+            shadow_cfg_digest: [3u8; 32],
+            active_feedback_digest: [4u8; 32],
+            shadow_feedback_digest: [5u8; 32],
+            score_active: 10,
+            score_shadow: 12,
+            delta: 2,
+            verdict,
             created_at_ms,
-            status,
             reason_codes: vec!["RC.GV.OK".to_string()],
-        }
+        };
+        evidence.trace_digest = evidence.compute_digest().expect("digest");
+        evidence
     }
 
     fn asset_bundle_payload(
@@ -4410,34 +4448,73 @@ mod tests {
     #[test]
     fn trace_scorecard_tracks_latest_and_counts() {
         let mut store = minimal_store();
+        let first = trace_run_evidence([4u8; 32], 10, TraceVerdict::Promising);
+        let second = trace_run_evidence([6u8; 32], 12, TraceVerdict::Risky);
+        let third = trace_run_evidence([5u8; 32], 12, TraceVerdict::Neutral);
         store
             .trace_run_store
-            .insert(trace_run_evidence([4u8; 32], 10, TraceStatus::Pass))
+            .insert(first.clone())
             .expect("valid trace run");
         store
             .trace_run_store
-            .insert(trace_run_evidence([6u8; 32], 12, TraceStatus::Fail))
+            .insert(second.clone())
             .expect("valid trace run");
         store
             .trace_run_store
-            .insert(trace_run_evidence([5u8; 32], 12, TraceStatus::Pass))
+            .insert(third.clone())
             .expect("valid trace run");
 
         let runs = list_trace_runs(&store, 10);
         assert_eq!(runs.len(), 3);
-        assert_eq!(runs[0].trace_run_digest, [4u8; 32]);
+        assert_eq!(runs[0].created_at_ms, 10);
+        let mut expected = vec![second.trace_digest, third.trace_digest];
+        expected.sort();
+        assert_eq!(runs[1].trace_digest, expected[0]);
+        assert_eq!(runs[2].trace_digest, expected[1]);
 
         let latest = latest_trace_run(&store).expect("latest trace run");
-        assert_eq!(latest.trace_run_digest, [6u8; 32]);
-        assert_eq!(latest.status, TraceStatus::Fail);
+        assert_eq!(latest.trace_digest, expected[1]);
+        let expected_verdict = if expected[1] == second.trace_digest {
+            TraceVerdict::Risky
+        } else {
+            TraceVerdict::Neutral
+        };
+        assert_eq!(latest.verdict, expected_verdict);
 
         let snapshot = snapshot(&store, None);
         let card = snapshot.trace_card;
-        assert_eq!(card.latest_trace_run_digest, Some([6u8; 32]));
-        assert_eq!(card.latest_trace_run_status, Some(TraceStatus::Fail));
-        assert_eq!(card.trace_run_pass_count_last_n, 2);
-        assert_eq!(card.trace_run_fail_count_last_n, 1);
-        assert!(card.trace_run_failures_present);
+        assert_eq!(card.latest_trace_run_digest, Some(expected[1]));
+        assert_eq!(card.latest_trace_verdict, Some(expected_verdict));
+        assert_eq!(card.counts_last_n.promising, 1);
+        assert_eq!(card.counts_last_n.neutral, 1);
+        assert_eq!(card.counts_last_n.risky, 1);
+    }
+
+    #[test]
+    fn latest_trace_run_for_configs_is_deterministic() {
+        let mut store = minimal_store();
+        let mut first = trace_run_evidence([2u8; 32], 10, TraceVerdict::Promising);
+        first.active_cfg_digest = [9u8; 32];
+        first.shadow_cfg_digest = [8u8; 32];
+        first.trace_digest = first.compute_digest().expect("digest");
+
+        let mut second = trace_run_evidence([3u8; 32], 12, TraceVerdict::Risky);
+        second.active_cfg_digest = [9u8; 32];
+        second.shadow_cfg_digest = [8u8; 32];
+        second.trace_digest = second.compute_digest().expect("digest");
+
+        store
+            .trace_run_store
+            .insert(first.clone())
+            .expect("valid trace run");
+        store
+            .trace_run_store
+            .insert(second.clone())
+            .expect("valid trace run");
+
+        let latest =
+            latest_trace_run_for_configs(&store, [9u8; 32], [8u8; 32]).expect("latest trace run");
+        assert_eq!(latest.trace_digest, second.trace_digest);
     }
 
     #[test]

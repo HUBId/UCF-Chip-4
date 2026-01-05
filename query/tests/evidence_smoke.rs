@@ -11,7 +11,7 @@ use pvgs::{
 };
 use replay_plan::{build_replay_plan, BuildReplayPlanArgs};
 use std::collections::HashSet;
-use trace_runs::{TraceRunEvidence, TraceStatus};
+use trace_runs::{TraceRunEvidence, TraceVerdict};
 use ucf_protocol::ucf::v1::{
     AssetBundle, AssetChunk, AssetDigest, AssetKind, AssetManifest, CompressionMode, ReasonCodes,
     ReceiptStatus, Ref, ReplayFidelity, ReplayRunEvidence, ReplayTargetKind,
@@ -203,21 +203,29 @@ fn replay_run_evidence(
 
 fn trace_run_evidence(
     run_digest: [u8; 32],
-    asset_manifest_digest: [u8; 32],
-    circuit_config_digest: [u8; 32],
+    active_cfg_digest: [u8; 32],
+    shadow_cfg_digest: [u8; 32],
+    active_feedback_digest: [u8; 32],
+    shadow_feedback_digest: [u8; 32],
     created_at_ms: u64,
-    status: TraceStatus,
+    verdict: TraceVerdict,
 ) -> TraceRunEvidence {
-    TraceRunEvidence {
+    let mut evidence = TraceRunEvidence {
         trace_id: "trace-1".to_string(),
-        trace_run_digest: run_digest,
-        asset_manifest_digest,
-        circuit_config_digest,
-        steps: 42,
+        trace_digest: run_digest,
+        active_cfg_digest,
+        shadow_cfg_digest,
+        active_feedback_digest,
+        shadow_feedback_digest,
+        score_active: 10,
+        score_shadow: 12,
+        delta: 2,
+        verdict,
         created_at_ms,
-        status,
         reason_codes: vec!["RC.GV.OK".to_string()],
-    }
+    };
+    evidence.trace_digest = evidence.compute_digest().expect("digest");
+    evidence
 }
 
 fn proposal_evidence(
@@ -468,14 +476,20 @@ fn evidence_smoke_snapshot_is_deterministic() {
     assert_eq!(replay_receipt.status, ReceiptStatus::Accepted);
 
     let trace_run_digest = [11u8; 32];
-    let circuit_config_digest = [12u8; 32];
+    let active_cfg_digest = [12u8; 32];
+    let shadow_cfg_digest = [13u8; 32];
+    let active_feedback_digest = [14u8; 32];
+    let shadow_feedback_digest = [15u8; 32];
     let trace_evidence = trace_run_evidence(
         trace_run_digest,
-        manifest_digest,
-        circuit_config_digest,
+        active_cfg_digest,
+        shadow_cfg_digest,
+        active_feedback_digest,
+        shadow_feedback_digest,
         2345,
-        TraceStatus::Pass,
+        TraceVerdict::Promising,
     );
+    let trace_run_digest = trace_evidence.trace_digest;
     let trace_req = PvgsCommitRequest {
         commit_id: "trace-run-evidence".to_string(),
         commit_type: CommitType::TraceRunEvidenceAppend,
@@ -544,9 +558,10 @@ fn evidence_smoke_snapshot_is_deterministic() {
         Some(trace_run_digest)
     );
     assert_eq!(
-        snapshot_one.trace_card.latest_trace_run_status,
-        Some(TraceStatus::Pass)
+        snapshot_one.trace_card.latest_trace_verdict,
+        Some(TraceVerdict::Promising)
     );
+    assert_eq!(snapshot_one.trace_card.latest_trace_delta, Some(2));
 }
 
 #[test]
