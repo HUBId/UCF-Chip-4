@@ -189,23 +189,18 @@ fn run_sequence() -> (String, Vec<String>) {
     let proposal_digest = [7u8; 32];
     let base_evidence_digest = [5u8; 32];
     let payload_digest = [6u8; 32];
-    let proposal_payload = proposal_evidence_payload(
-        proposal_digest,
-        base_evidence_digest,
-        payload_digest,
-        10,
-    );
+    let proposal_payload =
+        proposal_evidence_payload(proposal_digest, base_evidence_digest, payload_digest, 10);
     let proposal_req = proposal_evidence_request(&store, proposal_payload);
     let (proposal_receipt, _) = verify_and_commit(proposal_req, &mut store, &keystore, &vrf_engine);
-    assert_eq!(proposal_receipt.status, ucf_protocol::ucf::v1::ReceiptStatus::Accepted);
+    assert_eq!(
+        proposal_receipt.status,
+        ucf_protocol::ucf::v1::ReceiptStatus::Accepted
+    );
 
     let approval_digest = [11u8; 32];
-    let (activation_evidence, activation_payload) = proposal_activation_payload(
-        "activation-1",
-        proposal_digest,
-        approval_digest,
-        12,
-    );
+    let (activation_evidence, activation_payload) =
+        proposal_activation_payload("activation-1", proposal_digest, approval_digest, 12);
     let activation_req = proposal_activation_request(&store, activation_payload);
     let (activation_receipt, _) =
         verify_and_commit(activation_req, &mut store, &keystore, &vrf_engine);
@@ -215,12 +210,10 @@ fn run_sequence() -> (String, Vec<String>) {
     );
 
     assert!(store.proposal_store.get(proposal_digest).is_some());
-    assert!(
-        store
-            .proposal_activation_store
-            .get(activation_evidence.activation_digest)
-            .is_some()
-    );
+    assert!(store
+        .proposal_activation_store
+        .get(activation_evidence.activation_digest)
+        .is_some());
 
     let latest_proposal = latest_proposal(&store).expect("latest proposal");
     assert_eq!(latest_proposal.proposal_digest, proposal_digest);
@@ -231,7 +224,10 @@ fn run_sequence() -> (String, Vec<String>) {
 
     let snapshot = snapshot(&store, None);
     let proposals_card = snapshot.proposals_card.clone();
-    assert_eq!(proposals_card.latest_activation_status, Some(ActivationStatus::Applied));
+    assert_eq!(
+        proposals_card.latest_activation_status,
+        Some(ActivationStatus::Applied)
+    );
     assert_eq!(proposals_card.activation_counts_last_n.applied, 1);
     assert_eq!(proposals_card.activation_counts_last_n.rejected, 0);
 
@@ -265,7 +261,10 @@ fn run_sequence() -> (String, Vec<String>) {
         latest_proposal_kind: Some(ProposalKind::MappingUpdate),
         latest_proposal_verdict: Some(1),
         latest_activation_status: Some(ActivationStatus::Applied),
-        activation_counts_last_n: ActivationStatusCounts { applied: 1, rejected: 0 },
+        activation_counts_last_n: ActivationStatusCounts {
+            applied: 1,
+            rejected: 0,
+        },
         activation_rejects_present: false,
         risky_activations_present: false,
         counts_last_n: ProposalVerdictCounts {
