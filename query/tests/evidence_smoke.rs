@@ -222,7 +222,7 @@ fn trace_run_evidence(
         score_active: 10,
         score_shadow: 12,
         delta: 2,
-        verdict,
+        verdict: verdict.into(),
         created_at_ms,
         reason_codes: vec!["RC.GV.OK".to_string()],
     };
